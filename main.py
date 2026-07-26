@@ -32,6 +32,17 @@ def run_health_server():
     except Exception as e:
         pass
 
+def self_ping_keep_alive():
+    time.sleep(15)
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", f"http://127.0.0.1:{PORT}")
+    while True:
+        try:
+            time.sleep(240)  # Ping every 4 minutes to prevent Render sleep
+            urllib.request.urlopen(render_url)
+            print("[KEEP-ALIVE] Pinged self successfully to keep Render awake 24/7.")
+        except Exception as e:
+            pass
+
 def send_telegram_msg(chat_id, text):
     url = TELEGRAM_API_BASE + "sendMessage"
     payload = {
@@ -114,6 +125,13 @@ def start_bot():
             time.sleep(1)
 
 if __name__ == "__main__":
-    t = threading.Thread(target=run_health_server, daemon=True)
-    t.start()
+    # Start Health Server
+    t_health = threading.Thread(target=run_health_server, daemon=True)
+    t_health.start()
+
+    # Start Self Keep-Alive Loop (Prevents Render sleep!)
+    t_ping = threading.Thread(target=self_ping_keep_alive, daemon=True)
+    t_ping.start()
+
+    # Start Main Telegram Polling Engine
     start_bot()
