@@ -39,7 +39,7 @@ def self_ping_keep_alive():
         try:
             time.sleep(240)  # Ping every 4 minutes to prevent Render sleep
             urllib.request.urlopen(render_url)
-            print("[KEEP-ALIVE] Pinged self successfully to keep Render awake 24/7.")
+            print("[KEEP-ALIVE] Pinged self successfully.")
         except Exception as e:
             pass
 
@@ -89,16 +89,14 @@ def handle_update(update):
             reply = "⚠️ <b>Missing Admission Number!</b>\n\n<b>Usage:</b> <code>/register &lt;Admission Number&gt;</code>\n<i>Example:</i> <code>/register 1234</code>"
             send_telegram_msg(chat_id, reply)
         else:
-            admission_no = parts[1].strip()
-            reply = f"✅ <b>Registration Successful!</b>\n\nLinked to Admission Number: <b>{admission_no}</b>\n\nDear <b>{first_name}</b>, you will now receive real-time attendance alerts for <b>{SCHOOL_NAME}</b>."
-            send_telegram_msg(chat_id, reply)
-
+            # Forward update to Apps Script (Apps Script verifies database and sends strictly 1 message!)
             try:
                 payload = {"update_id": update["update_id"], "message": msg}
                 req = urllib.request.Request(APPS_SCRIPT_URL, data=json.dumps(payload).encode('utf-8'), headers={'Content-Type': 'application/json'})
                 urllib.request.urlopen(req)
+                print(f"  -> Forwarded registration for Admission {parts[1]} to Apps Script")
             except Exception as e:
-                pass
+                print(f"  -> Forwarding error: {e}")
     else:
         reply = f"Unrecognized command. Type <code>/help</code> or <code>/register &lt;Admission Number&gt;</code> to register with <b>{SCHOOL_NAME}</b>."
         send_telegram_msg(chat_id, reply)
@@ -125,13 +123,10 @@ def start_bot():
             time.sleep(1)
 
 if __name__ == "__main__":
-    # Start Health Server
     t_health = threading.Thread(target=run_health_server, daemon=True)
     t_health.start()
 
-    # Start Self Keep-Alive Loop (Prevents Render sleep!)
     t_ping = threading.Thread(target=self_ping_keep_alive, daemon=True)
     t_ping.start()
 
-    # Start Main Telegram Polling Engine
     start_bot()
