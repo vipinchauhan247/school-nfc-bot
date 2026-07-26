@@ -31,7 +31,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
 def run_health_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
-    print(f"[HEALTH SERVER] Listening on port {PORT}")
+    print(f"[HEALTH SERVER] Active on port {PORT}")
     server.serve_forever()
 
 def send_telegram_msg(chat_id, text):
@@ -104,7 +104,7 @@ def start_bot():
     print("=========================================================================")
 
     try:
-        urllib.request.urlopen(TELEGRAM_API_BASE + "deleteWebhook?drop_pending_updates=true")
+        urllib.request.urlopen(TELEGRAM_API_BASE + "deleteWebhook")
         print("Webhook Status: Disabled successfully.")
     except Exception as e:
         print(f"Webhook reset notice: {e}")
@@ -124,6 +124,9 @@ def start_bot():
             time.sleep(1)
 
 if __name__ == "__main__":
-    t = threading.Thread(target=run_health_server, daemon=True)
+    # Start Telegram Polling Engine in background thread
+    t = threading.Thread(target=start_bot, daemon=True)
     t.start()
-    start_bot()
+
+    # Run Health Server on Main Thread (Required for Render health checks!)
+    run_health_server()
