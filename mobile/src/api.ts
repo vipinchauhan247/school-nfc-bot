@@ -27,6 +27,33 @@ export interface AttendanceRecord {
   status: string;
 }
 
+export interface Notice {
+  id: number;
+  title: string;
+  body: string;
+  audience: string;
+  created_at: string;
+}
+
+export interface Homework {
+  id: number;
+  class_name: string;
+  subject: string;
+  title: string;
+  description: string;
+  due_date: string;
+}
+
+export interface DashboardData {
+  success: boolean;
+  student: Student;
+  today: { present: boolean; time_in: string | null };
+  history: AttendanceRecord[];
+  summary: { present_days: number; period_days: number; percentage: number };
+  notices: Notice[];
+  homework: Homework[];
+}
+
 export const api = {
   getSchoolInfo: () => request<{ school_name: string; stats: { total: number; present: number; absent: number } }>("/api/mobile/school"),
 
@@ -36,13 +63,15 @@ export const api = {
       { method: "POST", body: JSON.stringify({ admission_no }) }
     ),
 
-  parentStatus: (admission_no: string) =>
-    request<{
-      success: boolean;
-      student: Student;
-      today: { present: boolean; time_in: string | null };
-      history: AttendanceRecord[];
-    }>(`/api/mobile/parent/${admission_no}/status`),
+  studentLogin: (admission_no: string) =>
+    request<{ success: boolean; student: Student; today: { present: boolean; time_in: string | null } }>(
+      "/api/mobile/student/login",
+      { method: "POST", body: JSON.stringify({ admission_no }) }
+    ),
+
+  parentDashboard: (admission_no: string) => request<DashboardData>(`/api/mobile/parent/${admission_no}/status`),
+
+  studentDashboard: (admission_no: string) => request<DashboardData>(`/api/mobile/student/${admission_no}/dashboard`),
 
   adminLogin: (password: string) =>
     request<{ success: boolean }>("/api/mobile/admin/login", {

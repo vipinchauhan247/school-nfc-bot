@@ -43,6 +43,24 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date);
             CREATE INDEX IF NOT EXISTS idx_students_admission ON students(admission_no);
             CREATE INDEX IF NOT EXISTS idx_students_nfc ON students(nfc_card_id);
+
+            CREATE TABLE IF NOT EXISTS notices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                audience TEXT DEFAULT 'all',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS homework (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                class_name TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT,
+                due_date TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
         """)
 
         count = conn.execute("SELECT COUNT(*) FROM students").fetchone()[0]
@@ -57,6 +75,34 @@ def init_db():
             conn.executemany(
                 "INSERT INTO students (admission_no, name, class_name, parent_name, parent_phone) VALUES (?, ?, ?, ?, ?)",
                 sample,
+            )
+
+        notice_count = conn.execute("SELECT COUNT(*) FROM notices").fetchone()[0]
+        if notice_count == 0:
+            notices = [
+                ("School Reopens Monday", "School will reopen on Monday after the holiday. All students must arrive by 8:00 AM.", "all"),
+                ("Parent-Teacher Meeting", "PTM for Class 5-7 on Saturday, 10 AM. Parents are requested to attend.", "parents"),
+                ("Science Fair Registration", "Register for the annual science fair by Friday. See your class teacher for details.", "students"),
+                ("Annual Sports Day", "Sports Day is on 15th August. Students should wear house colour uniforms.", "all"),
+            ]
+            conn.executemany(
+                "INSERT INTO notices (title, body, audience) VALUES (?, ?, ?)",
+                notices,
+            )
+
+        hw_count = conn.execute("SELECT COUNT(*) FROM homework").fetchone()[0]
+        if hw_count == 0:
+            homework = [
+                ("Class 5", "Mathematics", "Chapter 5 Exercises", "Complete exercises 5.1 to 5.5 from textbook", "2026-08-10"),
+                ("Class 5", "Hindi", "कविता याद करें", "Learn the poem 'बसंत पंचमी' and write meaning of difficult words", "2026-08-09"),
+                ("Class 5", "Science", "Plant Diagram", "Draw and label parts of a flowering plant", "2026-08-11"),
+                ("Class 6", "English", "Essay Writing", "Write 200 words on 'My Favourite Festival'", "2026-08-10"),
+                ("Class 6", "Mathematics", "Fractions Worksheet", "Solve the worksheet given in class", "2026-08-09"),
+                ("Class 7", "Science", "Lab Report", "Write lab report on 'Acids and Bases' experiment", "2026-08-12"),
+            ]
+            conn.executemany(
+                "INSERT INTO homework (class_name, subject, title, description, due_date) VALUES (?, ?, ?, ?, ?)",
+                homework,
             )
 
 
@@ -218,3 +264,37 @@ def row_to_dict(row):
     if row is None:
         return None
     return dict(row)
+
+
+def get_notices(audience="all"):
+    with get_db() as conn:
+        return conn.execute("""
+            SELECT * FROM notices
+            WHERE audience IN ('all', ?)
+            ORDER BY created_at DESC
+            LIMIT 20
+        """, (audience,)).fetchall()
+
+
+def get_homework(class_name):
+    with get_db() as conn:
+        return conn.execute("""
+            SELECT * FROM homework
+            WHERE class_name = ?
+            ORDER BY due_date ASC
+            LIMIT 20
+        """, (class_name,)).fetchall()
+
+
+def get_student_attendance_summary(admission_no, days=30):
+    with get_db() as conn:
+        student = conn.execute(
+            "SELECT id FROM students WHERE admission_no = ?", (admission_no,)
+        ).fetchone()
+        if not student:
+            return None
+        present = conn.execute("""
+            SELECT COUNT(*) FROM attendance
+            WHERE student_id = ? AND date >= date('now', ?)
+        """, (student["id"], f"-{days} days")).fetchone()[0]
+        return {"present_days": present, "period_days": days, "percentage": round((present / days) * 100, 1) if days else 0}

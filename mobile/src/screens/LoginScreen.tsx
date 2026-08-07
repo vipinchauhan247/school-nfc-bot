@@ -6,21 +6,28 @@ import { colors, spacing } from "../theme";
 import { Button } from "../components/UI";
 import { api } from "../api";
 import { RootStackParamList } from "../types";
+import { UserRole } from "../context/PortalContext";
 
-type Props = { navigation: NativeStackNavigationProp<RootStackParamList, "ParentLogin"> };
+type Props = {
+  navigation: NativeStackNavigationProp<RootStackParamList, "StudentLogin" | "ParentLogin">;
+  role: UserRole;
+};
 
-async function saveAdmissionNo(admissionNo: string) {
+async function saveAdmissionNo(role: UserRole, admissionNo: string) {
+  const key = role === "student" ? "student_admission_no" : "parent_admission_no";
   if (Platform.OS === "web") {
-    localStorage.setItem("admission_no", admissionNo);
+    localStorage.setItem(key, admissionNo);
     return;
   }
   const SecureStore = await import("expo-secure-store");
-  await SecureStore.setItemAsync("admission_no", admissionNo);
+  await SecureStore.setItemAsync(key, admissionNo);
 }
 
-export default function ParentLoginScreen({ navigation }: Props) {
+export default function LoginScreen({ navigation, role }: Props) {
   const [admissionNo, setAdmissionNo] = useState("");
   const [loading, setLoading] = useState(false);
+
+  const isStudent = role === "student";
 
   const handleLogin = async () => {
     if (!admissionNo.trim()) {
@@ -29,9 +36,10 @@ export default function ParentLoginScreen({ navigation }: Props) {
     }
     setLoading(true);
     try {
-      const data = await api.parentLogin(admissionNo.trim());
-      await saveAdmissionNo(admissionNo.trim());
-      navigation.replace("ParentHome", { student: data.student });
+      const loginFn = isStudent ? api.studentLogin : api.parentLogin;
+      const data = await loginFn(admissionNo.trim());
+      await saveAdmissionNo(role, admissionNo.trim());
+      navigation.replace(isStudent ? "StudentPortal" : "ParentPortal", { student: data.student });
     } catch (e: any) {
       Alert.alert("Not Found", e.message || "Student not found. Check admission number.");
     } finally {
@@ -45,9 +53,11 @@ export default function ParentLoginScreen({ navigation }: Props) {
         <Text style={styles.back} onPress={() => navigation.goBack()}>← Back</Text>
 
         <View style={styles.header}>
-          <Text style={styles.emoji}>👨‍👩‍👧</Text>
-          <Text style={styles.title}>Parent Login</Text>
-          <Text style={styles.subtitle}>Enter your child's admission number</Text>
+          <Text style={styles.emoji}>{isStudent ? "🎒" : "👨‍👩‍👧"}</Text>
+          <Text style={styles.title}>{isStudent ? "Student Login" : "Parent Login"}</Text>
+          <Text style={styles.subtitle}>
+            {isStudent ? "Enter your admission number" : "Enter your child's admission number"}
+          </Text>
         </View>
 
         <View style={styles.form}>
@@ -77,18 +87,12 @@ const styles = StyleSheet.create({
   header: { alignItems: "center", marginBottom: spacing.xl },
   emoji: { fontSize: 48, marginBottom: spacing.sm },
   title: { fontSize: 24, fontWeight: "700", color: colors.gray900 },
-  subtitle: { fontSize: 14, color: colors.gray500, marginTop: spacing.xs },
+  subtitle: { fontSize: 14, color: colors.gray500, marginTop: spacing.xs, textAlign: "center" },
   form: { backgroundColor: colors.white, borderRadius: 16, padding: spacing.lg, gap: spacing.md },
   label: { fontSize: 13, fontWeight: "600", color: colors.gray700 },
   input: {
-    borderWidth: 1.5,
-    borderColor: colors.gray200,
-    borderRadius: 12,
-    padding: 14,
-    fontSize: 18,
-    fontWeight: "600",
-    color: colors.gray900,
-    letterSpacing: 1,
+    borderWidth: 1.5, borderColor: colors.gray200, borderRadius: 12,
+    padding: 14, fontSize: 18, fontWeight: "600", color: colors.gray900, letterSpacing: 1,
   },
   hint: { textAlign: "center", color: colors.gray400, fontSize: 13, marginTop: spacing.lg },
 });

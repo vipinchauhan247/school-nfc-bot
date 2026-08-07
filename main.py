@@ -178,6 +178,9 @@ def mobile_parent_status(admission_no):
         return jsonify({"success": False, "message": "Student not found"}), 404
 
     history = db.get_student_attendance_history(admission_no, 30)
+    summary = db.get_student_attendance_summary(admission_no, 30)
+    notices = db.get_notices("parents")
+    homework = db.get_homework(student["class_name"])
     return jsonify({
         "success": True,
         "student": db.row_to_dict(student),
@@ -186,7 +189,71 @@ def mobile_parent_status(admission_no):
             "time_in": record["time_in"] if record else None,
         },
         "history": [db.row_to_dict(h) for h in history],
+        "summary": summary,
+        "notices": [db.row_to_dict(n) for n in notices],
+        "homework": [db.row_to_dict(h) for h in homework],
     })
+
+
+@app.route("/api/mobile/student/login", methods=["POST"])
+def mobile_student_login():
+    data = request.get_json(silent=True) or {}
+    admission_no = (data.get("admission_no") or "").strip()
+    if not admission_no:
+        return jsonify({"success": False, "message": "Admission number required"}), 400
+
+    student, record = db.get_student_today_status(admission_no)
+    if not student:
+        return jsonify({"success": False, "message": "Student not found"}), 404
+
+    return jsonify({
+        "success": True,
+        "student": db.row_to_dict(student),
+        "today": {
+            "present": record is not None,
+            "time_in": record["time_in"] if record else None,
+        },
+    })
+
+
+@app.route("/api/mobile/student/<admission_no>/dashboard")
+def mobile_student_dashboard(admission_no):
+    student, record = db.get_student_today_status(admission_no)
+    if not student:
+        return jsonify({"success": False, "message": "Student not found"}), 404
+
+    history = db.get_student_attendance_history(admission_no, 30)
+    summary = db.get_student_attendance_summary(admission_no, 30)
+    notices = db.get_notices("students")
+    homework = db.get_homework(student["class_name"])
+    return jsonify({
+        "success": True,
+        "student": db.row_to_dict(student),
+        "today": {
+            "present": record is not None,
+            "time_in": record["time_in"] if record else None,
+        },
+        "history": [db.row_to_dict(h) for h in history],
+        "summary": summary,
+        "notices": [db.row_to_dict(n) for n in notices],
+        "homework": [db.row_to_dict(h) for h in homework],
+    })
+
+
+@app.route("/api/mobile/notices")
+def mobile_notices():
+    audience = request.args.get("audience", "all")
+    notices = db.get_notices(audience)
+    return jsonify({"success": True, "notices": [db.row_to_dict(n) for n in notices]})
+
+
+@app.route("/api/mobile/homework")
+def mobile_homework():
+    class_name = request.args.get("class_name", "")
+    if not class_name:
+        return jsonify({"success": False, "message": "class_name required"}), 400
+    homework = db.get_homework(class_name)
+    return jsonify({"success": True, "homework": [db.row_to_dict(h) for h in homework]})
 
 
 @app.route("/api/mobile/admin/login", methods=["POST"])
