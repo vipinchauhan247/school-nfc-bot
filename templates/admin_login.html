@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+
+{% block title %}Admin Login — {{ school_name }}{% endblock %}
+
+{% block content %}
+<div class="login-container">
+    <div class="login-card">
+        <div class="login-header">
+            <span class="login-icon">🔐</span>
+            <h1>Admin Login</h1>
+            <p>{{ school_name }}</p>
+        </div>
+        {% if error %}
+        <div class="alert alert-error">{{ error }}</div>
+        {% endif %}
+        <form method="POST" class="login-form">
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required placeholder="Enter admin password" autofocus>
+            </div>
+            <button type="submit" class="btn btn-primary btn-full">Sign In</button>
+        </form>
+        <a href="/" class="back-link">&larr; Back to Dashboard</a>
+    </div>
+</div>
+{% endblock %}

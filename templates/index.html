@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard — {{ school_name }}{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Today's Attendance</h1>
+    <p class="subtitle">{{ school_name }}</p>
+</div>
+
+<div class="stats-grid">
+    <div class="stat-card stat-total">
+        <div class="stat-icon">👨‍🎓</div>
+        <div class="stat-info">
+            <span class="stat-value">{{ stats.total }}</span>
+            <span class="stat-label">Total Students</span>
+        </div>
+    </div>
+    <div class="stat-card stat-present">
+        <div class="stat-icon">✅</div>
+        <div class="stat-info">
+            <span class="stat-value">{{ stats.present }}</span>
+            <span class="stat-label">Present Today</span>
+        </div>
+    </div>
+    <div class="stat-card stat-absent">
+        <div class="stat-icon">❌</div>
+        <div class="stat-info">
+            <span class="stat-value">{{ stats.absent }}</span>
+            <span class="stat-label">Absent Today</span>
+        </div>
+    </div>
+    <div class="stat-card stat-rate">
+        <div class="stat-icon">📊</div>
+        <div class="stat-info">
+            <span class="stat-value">
+                {% if stats.total > 0 %}{{ ((stats.present / stats.total) * 100) | round(1) }}%{% else %}0%{% endif %}
+            </span>
+            <span class="stat-label">Attendance Rate</span>
+        </div>
+    </div>
+</div>
+
+<div class="content-grid">
+    <section class="card">
+        <div class="card-header">
+            <h2>Present Students</h2>
+            <span class="badge badge-green">{{ today_records | length }} checked in</span>
+        </div>
+        {% if today_records %}
+        <div class="table-wrapper">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Name</th>
+                        <th>Admission No</th>
+                        <th>Class</th>
+                        <th>Time In</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for record in today_records %}
+                    <tr>
+                        <td>{{ loop.index }}</td>
+                        <td><strong>{{ record.name }}</strong></td>
+                        <td><code>{{ record.admission_no }}</code></td>
+                        <td><span class="badge badge-blue">{{ record.class_name }}</span></td>
+                        <td>{{ record.time_in }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="empty-state">
+            <span class="empty-icon">📋</span>
+            <p>No students have checked in yet today.</p>
+        </div>
+        {% endif %}
+    </section>
+
+    <section class="card">
+        <div class="card-header">
+            <h2>7-Day History</h2>
+        </div>
+        {% if history %}
+        <div class="history-list">
+            {% for day in history %}
+            <div class="history-item">
+                <span class="history-date">{{ day.date }}</span>
+                <div class="history-bar-wrap">
+                    <div class="history-bar" style="width: {{ (day.count / stats.total * 100) if stats.total > 0 else 0 }}%"></div>
+                </div>
+                <span class="history-count">{{ day.count }} present</span>
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty-state">
+            <p>No attendance history yet.</p>
+        </div>
+        {% endif %}
+    </section>
+</div>
+
+<section class="card telegram-info">
+    <div class="card-header">
+        <h2>📱 Parent Notifications</h2>
+    </div>
+    <p>Parents can register on Telegram to receive instant attendance alerts when their child arrives at school.</p>
+    <div class="telegram-steps">
+        <div class="step">
+            <span class="step-num">1</span>
+            <span>Open Telegram and search for the school bot</span>
+        </div>
+        <div class="step">
+            <span class="step-num">2</span>
+            <span>Send <code>/register &lt;Admission No&gt;</code></span>
+        </div>
+        <div class="step">
+            <span class="step-num">3</span>
+            <span>Receive instant alerts on every check-in</span>
+        </div>
+    </div>
+</section>
+{% endblock %}

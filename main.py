@@ -1,158 +1,171 @@
 import os
-import time
-import requests
-import urllib.request
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.request
+import time
+from functools import wraps
+from flask import Flask, render_template, request, jsonify, redirect, url_for, session
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+import database as db
+import bot
+from config import SCHOOL_NAME, PORT, ADMIN_PASSWORD
 
-BOT_TOKEN = "8990505731:AAHjAD0Mhc83BuuqKqaRkpFJBHdGVL9OC34"
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyE5iWnZO4YxhHQt9I0VP31ArQaflndxL2G9Tr43rJUHVWPyn0geiMZJo9D_EfdC6CGnw/exec"
-SCHOOL_NAME = "Madan Mohan Malviya Junior High School"
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "school-attendance-secret-key-change-me")
 
-PORT = int(os.environ.get("PORT", 8080))
 
-# ============================================================================
-# DUMMY DOCKER HEALTH CHECK SERVER
-# ============================================================================
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("admin"):
+            return redirect(url_for("admin_login"))
+        return f(*args, **kwargs)
+    return decorated
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK - School NFC Attendance Bot Engine Active")
 
-    def log_message(self, format, *args):
-        return
+@app.route("/")
+def index():
+    stats = db.get_attendance_stats()
+    today_records = db.get_today_attendance()
+    history = db.get_attendance_history(7)
+    return render_template(
+        "index.html",
+        school_name=SCHOOL_NAME,
+        stats=stats,
+        today_records=today_records,
+        history=history,
+    )
 
-def run_dummy_server():
-    server_address = ("", PORT)
-    httpd = HTTPServer(server_address, HealthCheckHandler)
-    print(f"[HEALTH-CHECK] HTTP Server listening on port {PORT}...")
-    httpd.serve_forever()
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    error = None
+    if request.method == "POST":
+        if request.form.get("password") == ADMIN_PASSWORD:
+            session["admin"] = True
+            return redirect(url_for("admin_dashboard"))
+        error = "Invalid password"
+    return render_template("admin_login.html", school_name=SCHOOL_NAME, error=error)
+
+
+@app.route("/admin/logout")
+def admin_logout():
+    session.pop("admin", None)
+    return redirect(url_for("index"))
+
+
+@app.route("/admin")
+@login_required
+def admin_dashboard():
+    students = db.get_all_students()
+    stats = db.get_attendance_stats()
+    class_counts = db.get_students_by_class()
+    return render_template(
+        "admin.html",
+        school_name=SCHOOL_NAME,
+        students=students,
+        stats=stats,
+        class_counts=class_counts,
+    )
+
+
+@app.route("/admin/students/add", methods=["POST"])
+@login_required
+def add_student():
+    try:
+        db.add_student(
+            request.form["admission_no"],
+            request.form["name"],
+            request.form["class_name"],
+            request.form.get("parent_name", ""),
+            request.form.get("parent_phone", ""),
+        )
+        return jsonify({"success": True, "message": "Student added successfully"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 400
+
+
+@app.route("/admin/students/<int:student_id>/mark", methods=["POST"])
+@login_required
+def manual_mark(student_id):
+    success, message, student = db.mark_attendance(student_id)
+    if success and student:
+        bot.notify_parent_attendance(student)
+    return jsonify({"success": success, "message": message})
+
+
+@app.route("/admin/students/<admission_no>/link-card", methods=["POST"])
+@login_required
+def link_card(admission_no):
+    data = request.get_json()
+    nfc_id = data.get("nfc_card_id", "").strip()
+    if not nfc_id:
+        return jsonify({"success": False, "message": "NFC card ID required"}), 400
+    success, message = db.link_nfc_card(admission_no, nfc_id)
+    return jsonify({"success": success, "message": message})
+
+
+@app.route("/api/nfc-scan", methods=["POST"])
+def nfc_scan():
+    data = request.get_json(silent=True) or {}
+    card_id = data.get("card_id") or data.get("nfc_card_id") or request.form.get("card_id")
+    if not card_id:
+        return jsonify({"success": False, "message": "card_id required"}), 400
+
+    student = db.get_student_by_nfc(card_id)
+    if not student:
+        return jsonify({"success": False, "message": "Card not registered"}), 404
+
+    success, message, updated_student = db.mark_attendance(student["id"])
+    if success and updated_student:
+        bot.notify_parent_attendance(updated_student)
+        return jsonify({
+            "success": True,
+            "message": message,
+            "student": {
+                "name": updated_student["name"],
+                "admission_no": updated_student["admission_no"],
+                "class_name": updated_student["class_name"],
+            },
+        })
+    return jsonify({"success": False, "message": message})
+
+
+@app.route("/health")
+def health():
+    return "OK - School Attendance System Active", 200
+
 
 def self_ping_keep_alive():
     time.sleep(15)
     render_url = os.environ.get("RENDER_EXTERNAL_URL", f"http://127.0.0.1:{PORT}")
-    print(f"[KEEP-ALIVE] Initialized self-ping targeting {render_url}")
-    
+    print(f"[KEEP-ALIVE] Self-ping targeting {render_url}")
     while True:
         try:
-            time.sleep(240) # Ping every 4 minutes to prevent Render free-tier sleep
-            req = urllib.request.Request(render_url, headers={"User-Agent": "Mozilla/5.0"})
+            time.sleep(240)
+            req = urllib.request.Request(
+                f"{render_url}/health",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
             with urllib.request.urlopen(req) as resp:
-                print(f"[KEEP-ALIVE] Ping sent successfully. Response code: {resp.status}")
+                print(f"[KEEP-ALIVE] Ping OK — status {resp.status}")
         except Exception as e:
             print(f"[KEEP-ALIVE] Ping warning: {e}")
 
-# ============================================================================
-# TELEGRAM BOT ENGINE
-# ============================================================================
 
-def send_telegram_message(chat_id, text, parse_mode="HTML"):
-    url = f"{TELEGRAM_API}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": parse_mode
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=5)
-        return resp.json()
-    except Exception as e:
-        print(f"[ERROR] Failed to send Telegram message: {e}")
-        return None
+def start_bot_thread():
+    t = threading.Thread(target=bot.start_polling, daemon=True)
+    t.start()
 
-def handle_update(update):
-    if "message" not in update:
-        return
-        
-    msg = update["message"]
-    chat_id = msg.get("chat", {}).get("id")
-    text = msg.get("text", "").strip()
-    from_user = msg.get("from", {})
-    user_first_name = from_user.get("first_name", "Parent")
 
-    if not text or not chat_id:
-        return
+def start_keep_alive():
+    if os.environ.get("RENDER_EXTERNAL_URL"):
+        t = threading.Thread(target=self_ping_keep_alive, daemon=True)
+        t.start()
 
-    print(f"[MESSAGE] From {user_first_name} ({chat_id}): {text}")
-
-    if text.startswith("/start") or text == "/help":
-        welcome_msg = (
-            f"🏫 <b>Welcome to {SCHOOL_NAME}!</b>\n\n"
-            f"👋 Hello <b>{user_first_name}</b>!\n"
-            f"This is the official Student Attendance Notification System.\n\n"
-            f"📌 <b>How to Register Your Phone:</b>\n"
-            f"To receive instant attendance alerts when your child arrives at school, please send:\n\n"
-            f"👉 <code>/register &lt;Admission No&gt;</code>\n\n"
-            f"<i>Example:</i> <code>/register 2211</code>"
-        )
-        send_telegram_message(chat_id, welcome_msg)
-
-    elif text.startswith("/register") or text.lower().startswith("register"):
-        parts = text.split()
-        if len(parts) < 2:
-            send_telegram_message(
-                chat_id, 
-                "⚠️ <b>Please include your child's Admission Number!</b>\n\n"
-                "<i>Usage:</i> <code>/register &lt;Admission No&gt;</code>\n"
-                "<i>Example:</i> <code>/register 2211</code>"
-            )
-        else:
-            # Forward registration command to Apps Script for single verified message
-            try:
-                print(f"[REGISTRATION] Forwarding update for admission '{parts[1]}' to Apps Script...")
-                requests.post(APPS_SCRIPT_URL, json=update, timeout=10)
-            except Exception as e:
-                print(f"[ERROR] Failed to forward registration to Apps Script: {e}")
-                send_telegram_message(chat_id, "⚠️ Server error. Please try again in a few moments.")
-
-    elif text.startswith("/link") or text.lower().startswith("link"):
-        # Forward card linking command to Apps Script
-        try:
-            print(f"[CARD LINKING] Forwarding /link command to Apps Script...")
-            requests.post(APPS_SCRIPT_URL, json=update, timeout=10)
-        except Exception as e:
-            print(f"[ERROR] Failed to forward link command to Apps Script: {e}")
-            send_telegram_message(chat_id, "⚠️ Server error while linking card.")
-
-def start_polling():
-    offset = 0
-    print("[BOT] Telegram Polling Engine Started Successfully!")
-    
-    while True:
-        try:
-            url = f"{TELEGRAM_API}/getUpdates?offset={offset}&timeout=20"
-            resp = requests.get(url, timeout=25)
-            data = resp.json()
-
-            if data.get("ok"):
-                for update in data.get("result", []):
-                    offset = update["update_id"] + 1
-                    handle_update(update)
-            else:
-                print(f"[BOT-WARNING] Telegram API response not OK: {data}")
-                time.sleep(3)
-
-        except Exception as e:
-            print(f"[BOT-ERROR] Exception in polling loop: {e}")
-            time.sleep(3)
-
-# ============================================================================
-# MAIN ENTRYPOINT
-# ============================================================================
 
 if __name__ == "__main__":
-    t_server = threading.Thread(target=run_dummy_server, daemon=True)
-    t_server.start()
-
-    t_ping = threading.Thread(target=self_ping_keep_alive, daemon=True)
-    t_ping.start()
-
-    start_polling()
+    db.init_db()
+    start_bot_thread()
+    start_keep_alive()
+    print(f"[APP] Starting {SCHOOL_NAME} Attendance System on port {PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False)

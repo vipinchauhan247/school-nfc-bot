@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+
+{% block title %}Admin Panel — {{ school_name }}{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Admin Panel</h1>
+    <p class="subtitle">Manage students, attendance, and NFC cards</p>
+</div>
+
+<div class="stats-grid stats-grid-sm">
+    <div class="stat-card stat-total">
+        <div class="stat-info">
+            <span class="stat-value">{{ stats.total }}</span>
+            <span class="stat-label">Students</span>
+        </div>
+    </div>
+    <div class="stat-card stat-present">
+        <div class="stat-info">
+            <span class="stat-value">{{ stats.present }}</span>
+            <span class="stat-label">Present</span>
+        </div>
+    </div>
+    <div class="stat-card stat-absent">
+        <div class="stat-info">
+            <span class="stat-value">{{ stats.absent }}</span>
+            <span class="stat-label">Absent</span>
+        </div>
+    </div>
+</div>
+
+<div class="admin-grid">
+    <section class="card">
+        <div class="card-header">
+            <h2>Add New Student</h2>
+        </div>
+        <form id="addStudentForm" class="admin-form">
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="admission_no">Admission No</label>
+                    <input type="text" id="admission_no" name="admission_no" required placeholder="e.g. 2216">
+                </div>
+                <div class="form-group">
+                    <label for="name">Student Name</label>
+                    <input type="text" id="name" name="name" required placeholder="Full name">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="class_name">Class</label>
+                    <input type="text" id="class_name" name="class_name" required placeholder="e.g. Class 5">
+                </div>
+                <div class="form-group">
+                    <label for="parent_name">Parent Name</label>
+                    <input type="text" id="parent_name" name="parent_name" placeholder="Parent/Guardian">
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="parent_phone">Parent Phone</label>
+                <input type="tel" id="parent_phone" name="parent_phone" placeholder="10-digit mobile">
+            </div>
+            <button type="submit" class="btn btn-primary">Add Student</button>
+            <div id="addMessage" class="form-message"></div>
+        </form>
+    </section>
+
+    <section class="card">
+        <div class="card-header">
+            <h2>Class Distribution</h2>
+        </div>
+        <div class="class-list">
+            {% for cls in class_counts %}
+            <div class="class-item">
+                <span>{{ cls.class_name }}</span>
+                <span class="badge badge-blue">{{ cls.count }} students</span>
+            </div>
+            {% endfor %}
+        </div>
+    </section>
+</div>
+
+<section class="card">
+    <div class="card-header">
+        <h2>All Students</h2>
+        <span class="badge">{{ students | length }} total</span>
+    </div>
+    <div class="table-wrapper">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Admission No</th>
+                    <th>Name</th>
+                    <th>Class</th>
+                    <th>Parent</th>
+                    <th>NFC Card</th>
+                    <th>Telegram</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for student in students %}
+                <tr>
+                    <td><code>{{ student.admission_no }}</code></td>
+                    <td><strong>{{ student.name }}</strong></td>
+                    <td><span class="badge badge-blue">{{ student.class_name }}</span></td>
+                    <td>{{ student.parent_name or '—' }}</td>
+                    <td>
+                        {% if student.nfc_card_id %}
+                        <code class="nfc-linked">{{ student.nfc_card_id }}</code>
+                        {% else %}
+                        <button class="btn btn-sm btn-outline" onclick="linkCard('{{ student.admission_no }}')">Link Card</button>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if student.telegram_chat_id %}
+                        <span class="badge badge-green">Registered</span>
+                        {% else %}
+                        <span class="badge badge-gray">Not linked</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <button class="btn btn-sm btn-success" onclick="markPresent({{ student.id }}, '{{ student.name }}')">Mark Present</button>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<div id="toast" class="toast"></div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/admin.js') }}"></script>
+{% endblock %}
