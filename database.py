@@ -185,3 +185,36 @@ def get_students_by_class():
             GROUP BY class_name
             ORDER BY class_name
         """).fetchall()
+
+
+def get_student_attendance_history(admission_no, days=30):
+    with get_db() as conn:
+        return conn.execute("""
+            SELECT a.date, a.time_in, a.status
+            FROM attendance a
+            JOIN students s ON s.id = a.student_id
+            WHERE s.admission_no = ?
+            ORDER BY a.date DESC
+            LIMIT ?
+        """, (admission_no, days)).fetchall()
+
+
+def get_student_today_status(admission_no):
+    today = date.today().isoformat()
+    with get_db() as conn:
+        student = conn.execute(
+            "SELECT * FROM students WHERE admission_no = ?", (admission_no,)
+        ).fetchone()
+        if not student:
+            return None, None
+        record = conn.execute(
+            "SELECT time_in, status FROM attendance WHERE student_id = ? AND date = ?",
+            (student["id"], today),
+        ).fetchone()
+        return student, record
+
+
+def row_to_dict(row):
+    if row is None:
+        return None
+    return dict(row)

@@ -4,6 +4,7 @@ import urllib.request
 import time
 from functools import wraps
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session
+from flask_cors import CORS
 
 import database as db
 import bot
@@ -11,6 +12,7 @@ from config import SCHOOL_NAME, PORT, ADMIN_PASSWORD
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "school-attendance-secret-key-change-me")
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 
 def login_required(f):
@@ -133,6 +135,91 @@ def nfc_scan():
 @app.route("/health")
 def health():
     return "OK - School Attendance System Active", 200
+
+
+# ============================================================================
+# MOBILE API
+# ============================================================================
+
+@app.route("/api/mobile/school")
+def mobile_school_info():
+    stats = db.get_attendance_stats()
+    return jsonify({
+        "school_name": SCHOOL_NAME,
+        "stats": stats,
+    })
+
+
+@app.route("/api/mobile/parent/login", methods=["POST"])
+def mobile_parent_login():
+    data = request.get_json(silent=True) or {}
+    admission_no = (data.get("admission_no") or "").strip()
+    if not admission_no:
+        return jsonify({"success": False, "message": "Admission number required"}), 400
+
+    student, record = db.get_student_today_status(admission_no)
+    if not student:
+        return jsonify({"success": False, "message": "Student not found"}), 404
+
+    return jsonify({
+        "success": True,
+        "student": db.row_to_dict(student),
+        "today": {
+            "present": record is not None,
+            "time_in": record["time_in"] if record else None,
+        },
+    })
+
+
+@app.route("/api/mobile/parent/<admission_no>/status")
+def mobile_parent_status(admission_no):
+    student, record = db.get_student_today_status(admission_no)
+    if not student:
+        return jsonify({"success": False, "message": "Student not found"}), 404
+
+    history = db.get_student_attendance_history(admission_no, 30)
+    return jsonify({
+        "success": True,
+        "student": db.row_to_dict(student),
+        "today": {
+            "present": record is not None,
+            "time_in": record["time_in"] if record else None,
+        },
+        "history": [db.row_to_dict(h) for h in history],
+    })
+
+
+@app.route("/api/mobile/admin/login", methods=["POST"])
+def mobile_admin_login():
+    data = request.get_json(silent=True) or {}
+    if data.get("password") == ADMIN_PASSWORD:
+        return jsonify({"success": True, "message": "Login successful"})
+    return jsonify({"success": False, "message": "Invalid password"}), 401
+
+
+@app.route("/api/mobile/admin/dashboard")
+def mobile_admin_dashboard():
+    students = [db.row_to_dict(s) for s in db.get_all_students()]
+    stats = db.get_attendance_stats()
+    today = [db.row_to_dict(r) for r in db.get_today_attendance()]
+    return jsonify({
+        "success": True,
+        "stats": stats,
+        "students": students,
+        "today_attendance": today,
+    })
+
+
+@app.route("/api/mobile/admin/mark/<int:student_id>", methods=["POST"])
+def mobile_admin_mark(student_id):
+    success, message, student = db.mark_attendance(student_id)
+    if success and student:
+        bot.notify_parent_attendance(student)
+    return jsonify({
+        "success": success,
+        "message": message,
+        "student": db.row_to_dict(student) if student else None,
+    })
 
 
 def self_ping_keep_alive():

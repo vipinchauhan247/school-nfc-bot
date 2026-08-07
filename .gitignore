@@ -2,3 +2,6 @@ school.db
 __pycache__/
 *.pyc
 .env
+mobile/node_modules/
+mobile/.expo/
+capture_screenshots.py
