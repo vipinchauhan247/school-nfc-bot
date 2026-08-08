@@ -105,6 +105,29 @@ def link_telegram(admission_no, chat_id):
         return result.rowcount > 0
 
 
+def upsert_telegram_registration(admission_no, chat_id, name=None, class_name=None):
+    """Link chat ID locally; create a minimal row if student only exists on Google Sheet."""
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT id FROM students WHERE admission_no = ?", (admission_no,)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE students SET telegram_chat_id = ? WHERE admission_no = ?",
+                (str(chat_id), admission_no),
+            )
+            return
+        conn.execute(
+            "INSERT INTO students (admission_no, name, class_name, telegram_chat_id) VALUES (?, ?, ?, ?)",
+            (
+                admission_no,
+                name or f"Student {admission_no}",
+                class_name or "—",
+                str(chat_id),
+            ),
+        )
+
+
 def link_nfc_card(admission_no, nfc_card_id):
     with get_db() as conn:
         existing = conn.execute(
