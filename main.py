@@ -163,9 +163,24 @@ def start_keep_alive():
         t.start()
 
 
+_bootstrap_lock = threading.Lock()
+_bootstrapped = False
+
+
+def bootstrap():
+    """Initialize DB, Telegram poller, and keep-alive once per process."""
+    global _bootstrapped
+    with _bootstrap_lock:
+        if _bootstrapped:
+            return
+        _bootstrapped = True
+        db.init_db()
+        start_bot_thread()
+        start_keep_alive()
+        print(f"[APP] Bootstrapped {SCHOOL_NAME} Attendance System")
+
+
 if __name__ == "__main__":
-    db.init_db()
-    start_bot_thread()
-    start_keep_alive()
+    bootstrap()
     print(f"[APP] Starting {SCHOOL_NAME} Attendance System on port {PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=False)

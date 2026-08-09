@@ -48,6 +48,9 @@ def apps_script_get(params, timeout=20):
 
 def save_chat_id_to_sheet(admission_no, chat_id):
     """Instant sheet upload for parent Chat ID (column F)."""
+    if not APPS_SCRIPT_URL:
+        print("[SHEET] APPS_SCRIPT_URL not configured — cannot reach Google Sheet")
+        return None
     result = apps_script_get(
         {
             "action": "save_chat_id",
@@ -138,6 +141,25 @@ def handle_update(update):
         admission_no = parts[1].strip()
         student = db.get_student_by_admission(admission_no)
 
+        if not APPS_SCRIPT_URL:
+            if student:
+                db.link_telegram(admission_no, chat_id)
+                send_telegram_message(
+                    chat_id,
+                    f"✅ <b>Registered locally</b> (Google Sheet not configured on server).\n\n"
+                    f"👤 Student: {student['name']}\n"
+                    f"📚 Class: {student['class_name']}\n"
+                    f"🔢 Admission No: {student['admission_no']}",
+                )
+            else:
+                send_telegram_message(
+                    chat_id,
+                    "❌ Google Sheet is not connected on the server.\n\n"
+                    "Ask the school admin to set <code>APPS_SCRIPT_URL</code> on Render, "
+                    "then try <code>/register</code> again with your admission number.",
+                )
+            return
+
         # Instant sheet write (Google Sheet Students column F)
         sheet_ok = save_chat_id_to_sheet(admission_no, chat_id)
 
@@ -156,6 +178,7 @@ def handle_update(update):
 
         # Not in Render SQLite — sheet is source of truth for school register
         if sheet_ok:
+            db.upsert_telegram_registration(admission_no, chat_id)
             send_telegram_message(
                 chat_id,
                 f"✅ <b>Registration Successful!</b>\n\n"
