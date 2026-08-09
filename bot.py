@@ -1,57 +1,78 @@
 """
-@Vipinbellbot — Render poller (instant reply + Google Sheet sync).
-
-Rules:
-- ERP must NOT poll this bot.
-- Telegram webhook must be EMPTY (Render owns getUpdates).
-- Env on Render:
-    BOT_TOKEN=<Vipinbell token>
-    APPS_SCRIPT_URL=https://script.google.com/macros/s/.../exec
+@Vipinbellbot — instant reply + Google Sheet (via Apps Script).
+Used by Render webhook at POST /bot_webhook (24/7, no PC).
 """
 
 import time
 import requests
-import database as db
-from config import TELEGRAM_API, SCHOOL_NAME, APPS_SCRIPT_URL
+from config import TELEGRAM_API, SCHOOL_NAME, APPS_SCRIPT_URL, BOT_TOKEN
 
 
 def send_telegram_message(chat_id, text, parse_mode="HTML"):
     if not TELEGRAM_API:
-        print("[BOT] No BOT_TOKEN configured, skipping message")
+        print("[BOT] BOT_TOKEN missing — cannot send message")
         return None
-    url = f"{TELEGRAM_API}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
     try:
-        resp = requests.post(url, json=payload, timeout=8)
+        resp = requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode},
+            timeout=10,
+        )
         return resp.json()
     except Exception as e:
-        print(f"[ERROR] Failed to send Telegram message: {e}")
+        print(f"[BOT] sendMessage error: {e}")
         return None
 
 
-def apps_script_get(params, timeout=20):
-    """Call Apps Script doGet (sheet save / card link)."""
+def apps_script_get(params, timeout=25):
     if not APPS_SCRIPT_URL:
+        print("[BOT] APPS_SCRIPT_URL missing")
         return None
     try:
         resp = requests.get(APPS_SCRIPT_URL, params=params, timeout=timeout)
-        # Follow redirects; try parse JSON if possible
-        text = (resp.text or "").strip()
         try:
             return resp.json()
         except Exception:
-            return {"raw": text, "ok": resp.ok}
+            return {"raw": (resp.text or "").strip(), "ok": resp.ok}
     except Exception as e:
-        print(f"[ERROR] Apps Script GET failed: {e}")
+        print(f"[BOT] Apps Script error: {e}")
         return None
 
 
+def escape_html(text):
+    return (
+        str(text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def normalize_admission(value):
+    s = str(value or "").strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    return s
+
+
+def find_student_on_sheet(admission_no):
+    adm = normalize_admission(admission_no).lower()
+    if not adm:
+        return None
+    data = apps_script_get({"action": "get_all_uids"})
+    if not isinstance(data, list):
+        return None
+    for row in data:
+        if normalize_admission(row.get("admissionNo", "")).lower() == adm:
+            return row
+    return None
+
+
 def save_chat_id_to_sheet(admission_no, chat_id):
-    """Instant sheet upload for parent Chat ID (column F)."""
     result = apps_script_get(
         {
             "action": "save_chat_id",
-            "admission": str(admission_no).strip(),
+            "admission": normalize_admission(admission_no),
             "chatId": str(chat_id).strip(),
         }
     )
@@ -60,219 +81,172 @@ def save_chat_id_to_sheet(admission_no, chat_id):
         return False
     if isinstance(result, dict) and result.get("ok") is True:
         return True
-    # Some deployments return plain text
     raw = str(result.get("raw", result)).upper()
     return "TRUE" in raw or '"OK":TRUE' in raw.replace(" ", "")
 
 
 def link_card_on_sheet(admission_no, uid):
+    clean_uid = str(uid or "").replace(" ", "").replace(":", "").replace("-", "").upper()
     result = apps_script_get(
         {
             "action": "register_card",
-            "admission": str(admission_no).strip(),
-            "uid": str(uid).strip(),
+            "admission": normalize_admission(admission_no),
+            "uid": clean_uid,
         }
     )
-    print(f"[SHEET] register_card {admission_no} {uid} -> {result}")
-    text = str(result)
-    if isinstance(result, dict) and result.get("raw") is not None:
-        text = str(result.get("raw"))
+    print(f"[SHEET] register_card {admission_no} {clean_uid} -> {result}")
+    text = str(result.get("raw", result) if isinstance(result, dict) else result)
     return "SUCCESS" in text.upper() or "REGISTERED" in text.upper()
 
 
-def notify_parent_attendance(student):
-    if not student["telegram_chat_id"]:
-        return
-    msg = (
-        f"✅ <b>Attendance Confirmed!</b>\n\n"
-        f"👤 Student: {student['name']}\n"
-        f"🔢 Admission No: {student['admission_no']}\n"
-        f"📚 Class: {student['class_name']}\n"
-        f"🕐 Time: {time.strftime('%I:%M %p')}\n"
-        f"📅 Date: {time.strftime('%d %b %Y')}\n\n"
-        f"Your child has arrived at {SCHOOL_NAME}."
-    )
-    send_telegram_message(student["telegram_chat_id"], msg)
+def looks_like_nfc_uid(value):
+    raw = str(value or "").strip().replace(" ", "").replace(":", "").replace("-", "")
+    if not raw:
+        return False
+    if raw.isdigit() and len(raw) <= 6:
+        return False
+    return len(raw) >= 8 and all(c in "0123456789ABCDEFabcdef" for c in raw)
 
 
-def handle_update(update):
-    if "message" not in update:
+def handle_telegram_update(update):
+    if not update or "message" not in update:
         return
 
     msg = update["message"]
     chat_id = msg.get("chat", {}).get("id")
     text = (msg.get("text") or "").strip()
-    from_user = msg.get("from", {})
-    user_first_name = from_user.get("first_name", "Parent")
+    first_name = (msg.get("from") or {}).get("first_name", "Parent")
 
-    if not text or not chat_id:
+    if not chat_id or not text:
         return
 
-    print(f"[MESSAGE] From {user_first_name} ({chat_id}): {text}")
+    print(f"[BOT] {chat_id}: {text}")
+    parts = text.split()
+    cmd = parts[0].lower().lstrip("/").split("@")[0]
+    arg1 = parts[1].strip() if len(parts) > 1 else ""
+    arg2 = parts[2].strip() if len(parts) > 2 else ""
 
-    if text.startswith("/start") or text == "/help":
+    if cmd in ("start", "help") and not arg1:
         send_telegram_message(
             chat_id,
-            f"🏫 Welcome to {SCHOOL_NAME}!\n\n"
-            f"👋 Hello {user_first_name}!\n"
-            f"Official Student Attendance Notification System.\n\n"
-            f"📌 Commands:\n"
-            f"• /register &lt;Admission No&gt; — link phone for alerts\n"
-            f"• /status &lt;Admission No&gt; — today's attendance\n"
-            f"• /help — this message\n\n"
-            f"Example: /register 2211",
+            f"🏫 <b>{escape_html(SCHOOL_NAME)}</b>\n\n"
+            f"Hello {escape_html(first_name)}!\n\n"
+            f"<b>Parents — link for attendance alerts:</b>\n"
+            f"<code>/register &lt;Admission No&gt;</code>\n"
+            f"Example: <code>/register 1658</code>\n\n"
+            f"<b>Admin — link new NFC card:</b>\n"
+            f"<code>/link &lt;Card UID&gt; &lt;Admission No&gt;</code>\n"
+            f"Example: <code>/link D7FE3B63 1658</code>",
         )
         return
 
-    if text.startswith("/register") or text.lower().startswith("register"):
-        parts = text.split()
-        if len(parts) < 2:
+    if cmd == "register" or (cmd == "start" and arg1):
+        if not arg1:
             send_telegram_message(
                 chat_id,
-                "⚠️ Please include Admission Number!\n\n"
-                "Usage: /register &lt;Admission No&gt;\n"
-                "Example: /register 2211",
+                "⚠️ Usage: <code>/register 1658</code>",
+            )
+            return
+        if looks_like_nfc_uid(arg1):
+            send_telegram_message(
+                chat_id,
+                "⚠️ That looks like a Card UID.\nUse <code>/register &lt;Admission No&gt;</code>",
             )
             return
 
-        admission_no = parts[1].strip()
-        student = db.get_student_by_admission(admission_no)
-
-        # Instant sheet write (Google Sheet Students column F)
-        sheet_ok = save_chat_id_to_sheet(admission_no, chat_id)
-
-        if student:
-            db.link_telegram(admission_no, chat_id)
+        student = find_student_on_sheet(arg1)
+        if not student:
             send_telegram_message(
                 chat_id,
-                f"✅ <b>Registration Successful!</b>\n\n"
-                f"👤 Student: {student['name']}\n"
-                f"📚 Class: {student['class_name']}\n"
-                f"🔢 Admission No: {student['admission_no']}\n"
-                f"📄 Sheet: {'saved' if sheet_ok else 'check sheet / Apps Script'}\n\n"
-                f"You will receive attendance alerts on this chat.",
+                f"❌ Admission <code>{escape_html(arg1)}</code> not found on school sheet.",
             )
             return
 
-        # Not in Render SQLite — sheet is source of truth for school register
-        if sheet_ok:
+        ok = save_chat_id_to_sheet(arg1, chat_id)
+        name = escape_html(student.get("name") or "Student")
+        if ok:
             send_telegram_message(
                 chat_id,
                 f"✅ <b>Registration Successful!</b>\n\n"
-                f"🔢 Admission No: <code>{admission_no}</code>\n"
-                f"Chat ID saved to school Google Sheet.\n\n"
+                f"Linked to: <b>{name}</b>\n"
+                f"Admission: <code>{escape_html(arg1)}</code>\n\n"
                 f"You will receive NFC gate attendance alerts on this chat.",
             )
         else:
             send_telegram_message(
                 chat_id,
-                f"❌ Admission number <code>{admission_no}</code> was not found "
-                f"in the school register, or sheet save failed.\n\n"
-                f"Check the number on the ID card / fee receipt, then try again.",
+                f"⚠️ Found {name} but sheet save failed. Try again in 10 seconds.",
             )
         return
 
-    if text.startswith("/status"):
-        parts = text.split()
-        if len(parts) < 2:
-            send_telegram_message(chat_id, "⚠️ Usage: /status &lt;Admission No&gt;")
-            return
-
-        student = db.get_student_by_admission(parts[1])
-        if not student:
-            send_telegram_message(chat_id, f"❌ Student {parts[1]} not found on Render app DB.")
-            return
-
-        from datetime import date
-
-        today = date.today().isoformat()
-        with db.get_db() as conn:
-            record = conn.execute(
-                "SELECT time_in FROM attendance WHERE student_id = ? AND date = ?",
-                (student["id"], today),
-            ).fetchone()
-
-        if record:
-            send_telegram_message(
-                chat_id,
-                f"✅ {student['name']} is PRESENT today.\n🕐 Arrival: {record['time_in']}",
-            )
-        else:
-            send_telegram_message(chat_id, f"⏳ {student['name']} has not checked in yet today.")
-        return
-
-    if text.startswith("/link") or text.lower().startswith("link"):
-        parts = text.split()
-        if len(parts) < 3:
-            send_telegram_message(
-                chat_id,
-                "⚠️ Usage: /link &lt;Card UID&gt; &lt;Admission No&gt;\n"
-                "Example: /link D7FE3B63 1658",
-            )
-            return
-
-        uid = parts[1].strip()
-        admission_no = parts[2].strip()
-        ok = link_card_on_sheet(admission_no, uid)
-        if ok:
-            # Best-effort local DB too
-            try:
-                db.link_nfc_card(admission_no, uid.replace(":", "").replace("-", "").upper())
-            except Exception:
-                pass
-            send_telegram_message(
-                chat_id,
-                f"✅ <b>NFC Card Linked!</b>\n\n"
-                f"Admission: <code>{admission_no}</code>\n"
-                f"Card UID: <code>{uid}</code>\n"
-                f"Saved to Google Sheet.",
-            )
-        else:
-            send_telegram_message(
-                chat_id,
-                f"❌ Card link failed for admission <code>{admission_no}</code>.\n"
-                f"Check admission exists on the Students sheet.",
-            )
-        return
-
-
-def start_polling():
-    if not TELEGRAM_API:
-        print("[BOT] No BOT_TOKEN set — Telegram bot disabled")
-        return
-
-    # Ensure webhook is clear so polling works
-    try:
-        requests.get(f"{TELEGRAM_API}/deleteWebhook", timeout=15)
-        print("[BOT] Webhook cleared for Render polling")
-    except Exception as e:
-        print(f"[BOT] deleteWebhook warning: {e}")
-
-    offset = 0
-    print("[BOT] Telegram Polling Engine Started (instant replies)!")
-
-    while True:
-        try:
-            url = f"{TELEGRAM_API}/getUpdates?offset={offset}&timeout=20"
-            resp = requests.get(url, timeout=25)
-            data = resp.json()
-
-            if data.get("ok"):
-                for update in data.get("result", []):
-                    offset = update["update_id"] + 1
-                    handle_update(update)
+    if cmd == "link":
+        if arg1 and arg2 and looks_like_nfc_uid(arg1):
+            ok = link_card_on_sheet(arg2, arg1)
+            if ok:
+                send_telegram_message(
+                    chat_id,
+                    f"✅ <b>NFC Card Linked!</b>\n\n"
+                    f"Admission: <code>{escape_html(arg2)}</code>\n"
+                    f"Card UID: <code>{escape_html(arg1.upper())}</code>",
+                )
             else:
-                desc = str(data)
-                print(f"[BOT-WARNING] {data}")
-                if "Conflict" in desc or "webhook" in desc.lower():
-                    print("[BOT] Conflict — another webhook/poller is active. Clear webhook.")
-                    try:
-                        requests.get(f"{TELEGRAM_API}/deleteWebhook", timeout=15)
-                    except Exception:
-                        pass
-                    time.sleep(10)
-                else:
-                    time.sleep(3)
-        except Exception as e:
-            print(f"[BOT-ERROR] {e}")
-            time.sleep(3)
+                send_telegram_message(
+                    chat_id,
+                    f"❌ Card link failed for admission <code>{escape_html(arg2)}</code>.",
+                )
+            return
+        send_telegram_message(
+            chat_id,
+            "⚠️ Usage: <code>/link &lt;Card UID&gt; &lt;Admission No&gt;</code>",
+        )
+        return
+
+    if cmd == "status":
+        if not arg1:
+            send_telegram_message(chat_id, "⚠️ Usage: <code>/status 1658</code>")
+            return
+        student = find_student_on_sheet(arg1)
+        if not student:
+            send_telegram_message(chat_id, f"❌ Admission <code>{escape_html(arg1)}</code> not found.")
+            return
+        has_card = "✅" if student.get("nfcUid") else "❌"
+        has_chat = "✅" if student.get("telegramChatId") else "❌"
+        send_telegram_message(
+            chat_id,
+            f"📊 <b>Student Status</b>\n\n"
+            f"Name: {escape_html(student.get('name', 'N/A'))}\n"
+            f"Admission: <code>{escape_html(arg1)}</code>\n"
+            f"NFC Card: {has_card}\n"
+            f"Telegram: {has_chat}",
+        )
+        return
+
+    send_telegram_message(
+        chat_id,
+        "Commands:\n"
+        "<code>/register &lt;Admission No&gt;</code>\n"
+        "<code>/link &lt;UID&gt; &lt;Admission No&gt;</code>\n"
+        "<code>/status &lt;Admission No&gt;</code>",
+    )
+
+
+def register_webhook(public_base_url):
+    """Point Telegram to this Render service (instant push, no polling)."""
+    if not BOT_TOKEN or not public_base_url:
+        print("[BOT] Skip webhook — BOT_TOKEN or RENDER URL missing")
+        return False
+    webhook_url = public_base_url.rstrip("/") + "/bot_webhook"
+    try:
+        # Clear old webhook first
+        requests.get(f"{TELEGRAM_API}/deleteWebhook", params={"drop_pending_updates": True}, timeout=15)
+        resp = requests.get(
+            f"{TELEGRAM_API}/setWebhook",
+            params={"url": webhook_url, "drop_pending_updates": True},
+            timeout=15,
+        )
+        data = resp.json()
+        print(f"[BOT] setWebhook -> {webhook_url} => {data}")
+        return bool(data.get("ok"))
+    except Exception as e:
+        print(f"[BOT] setWebhook error: {e}")
+        return False
