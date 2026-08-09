@@ -1,4 +1,10 @@
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env from project root so APPS_SCRIPT_URL is available under gunicorn too.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 SCHOOL_NAME = os.environ.get("SCHOOL_NAME", "Madan Mohan Malviya Junior High School")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
