@@ -161,6 +161,133 @@ def start_keep_alive():
     if os.environ.get("RENDER_EXTERNAL_URL"):
         t = threading.Thread(target=self_ping_keep_alive, daemon=True)
         t.start()
+# ===========================================================================
+# PASTE THIS CODE AT THE BOTTOM OF main.py (BEFORE "if __name__" line)
+# ===========================================================================
+
+# ============== TELEGRAM WEBHOOK (instant replies 24/7) ==============
+
+def _escape_html(text):
+    return str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def _looks_like_uid(value):
+    raw = str(value or "").strip().replace(" ","").replace(":","").replace("-","")
+    if not raw: return False
+    if raw.isdigit() and len(raw) <= 6: return False
+    return len(raw) >= 8 and all(c in "0123456789ABCDEFabcdef" for c in raw)
+
+def _find_student(admission_no):
+    data = bot.apps_script_get({"action": "get_all_uids"})
+    if not isinstance(data, list): return None
+    key = str(admission_no).strip().lower()
+    for s in data:
+        if str(s.get("admissionNo","")).strip().lower() == key:
+            return s
+    return None
+
+@app.route("/bot_webhook", methods=["POST"])
+def telegram_webhook():
+    try:
+        update = request.get_json(force=True)
+        if not update: return "OK", 200
+        msg = update.get("message")
+        if not msg or not msg.get("text"): return "OK", 200
+
+        chat_id = msg["chat"]["id"]
+        text = msg["text"].strip()
+        parts = text.split()
+        cmd = parts[0].lower().lstrip("/").split("@")[0]
+        args = parts[1:]
+
+        if cmd == "start" and not args:
+            bot.send_telegram_message(chat_id,
+                f"🏫 <b>{SCHOOL_NAME}</b>\n\n"
+                "<b>Parents / Students:</b>\n"
+                "<code>/register &lt;Admission No&gt;</code>\n"
+                "Example: <code>/register 1658</code>\n\n"
+                "<b>Check Status:</b>\n"
+                "<code>/status &lt;Admission No&gt;</code>\n\n"
+                "<b>Admin — Link NFC Card:</b>\n"
+                "<code>/link &lt;Card UID&gt; &lt;Admission No&gt;</code>")
+
+        elif cmd == "register" or (cmd == "start" and args):
+            adm = args[0] if args else ""
+            if not adm:
+                bot.send_telegram_message(chat_id, "⚠️ <b>Usage</b>\n<code>/register 1658</code>")
+                return "OK", 200
+            if _looks_like_uid(adm):
+                bot.send_telegram_message(chat_id, "⚠️ That looks like a Card UID.\nUse <code>/register &lt;Admission No&gt;</code>")
+                return "OK", 200
+            student = _find_student(adm)
+            if not student:
+                bot.send_telegram_message(chat_id, f"❌ Admission <code>{_escape_html(adm)}</code> not found.")
+                return "OK", 200
+            ok = bot.save_chat_id_to_sheet(adm, chat_id)
+            db.update_student_chat_id(adm, str(chat_id))
+            name = _escape_html(student.get("name",""))
+            bot.send_telegram_message(chat_id,
+                f"✅ <b>Registration Successful!</b>\n\n"
+                f"Linked to: <b>{name}</b>\n\n"
+                "You will receive NFC gate attendance alerts on this chat.")
+
+        elif cmd == "link" and len(args) >= 2:
+            uid, adm = args[0], args[1]
+            if not _looks_like_uid(uid):
+                bot.send_telegram_message(chat_id, f"⚠️ <code>{_escape_html(uid)}</code> is not a valid NFC UID.")
+                return "OK", 200
+            ok = bot.link_card_on_sheet(adm, uid)
+            if ok:
+                bot.send_telegram_message(chat_id,
+                    f"✅ <b>NFC Card Linked!</b>\n\n"
+                    f"<b>Admission:</b> <code>{_escape_html(adm)}</code>\n"
+                    f"<b>Card UID:</b> <code>{_escape_html(uid.upper())}</code>")
+            else:
+                bot.send_telegram_message(chat_id, f"❌ Card link failed for <code>{_escape_html(adm)}</code>.")
+
+        elif cmd == "status":
+            adm = args[0] if args else ""
+            if not adm:
+                bot.send_telegram_message(chat_id, "📊 <b>Usage</b>\n<code>/status 1658</code>")
+                return "OK", 200
+            student = _find_student(adm)
+            if not student:
+                bot.send_telegram_message(chat_id, f"❌ Admission <code>{_escape_html(adm)}</code> not found.")
+                return "OK", 200
+            has_card = "✅ Linked" if student.get("nfcUid","") else "❌ Not linked"
+            has_chat = "✅ Registered" if student.get("telegramChatId","") else "❌ Not registered"
+            bot.send_telegram_message(chat_id,
+                f"📊 <b>Student Status</b>\n\n"
+                f"<b>Name:</b> {_escape_html(student.get('name','N/A'))}\n"
+                f"<b>Admission:</b> <code>{_escape_html(adm)}</code>\n"
+                f"<b>NFC Card:</b> {has_card}\n"
+                f"<b>Telegram:</b> {has_chat}")
+
+        elif cmd == "link":
+            bot.send_telegram_message(chat_id,
+                "⚠️ <b>Usage</b>\n<code>/link &lt;Card UID&gt; &lt;Admission No&gt;</code>")
+
+        else:
+            bot.send_telegram_message(chat_id,
+                "Commands:\n"
+                "👨‍👩‍👧 <code>/register &lt;Admission No&gt;</code>\n"
+                "📊 <code>/status &lt;Admission No&gt;</code>\n"
+                "🔗 <code>/link &lt;Card UID&gt; &lt;Admission No&gt;</code>")
+
+    except Exception as e:
+        print(f"[WEBHOOK ERROR] {e}")
+    return "OK", 200
+
+
+@app.route("/set_webhook_url")
+def set_webhook_url():
+    """Visit this URL once after deploy to connect Telegram."""
+    from config import BOT_TOKEN
+    webhook_url = f"https://{request.host}/bot_webhook"
+    resp = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}")
+    data = resp.json()
+    if data.get("ok"):
+        return f"✅ Webhook set to: {webhook_url}", 200
+    return f"❌ Failed: {resp.text}", 500
 
 
 if __name__ == "__main__":
