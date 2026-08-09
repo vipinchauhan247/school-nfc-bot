@@ -4,9 +4,16 @@ Used by Render webhook at POST /bot_webhook (24/7, no PC).
 """
 
 import re
+import os
 import time
 import requests
-from config import TELEGRAM_API, SCHOOL_NAME, APPS_SCRIPT_URL, BOT_TOKEN, ADMIN_CHAT_ID
+from config import TELEGRAM_API, SCHOOL_NAME, BOT_TOKEN
+
+try:
+    from config import APPS_SCRIPT_URL, ADMIN_CHAT_ID
+except ImportError:
+    APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "").strip()
+    ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "1722022492").strip()
 
 
 def send_telegram_message(chat_id, text, parse_mode="HTML"):
