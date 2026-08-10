@@ -107,13 +107,28 @@ def find_student_by_chat_id(chat_id):
     return matches[0] if matches else None
 
 
+def normalize_chat_id(value):
+    s = str(value or "").strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    return s
+
+
+def get_linked_students_from_sheet(chat_id):
+    cid = normalize_chat_id(chat_id)
+    result = apps_script_get({"action": "whoami", "chatId": cid})
+    if isinstance(result, dict) and result.get("ok"):
+        return result.get("students") or []
+    return find_all_students_by_chat_id(chat_id)
+
+
 def find_all_students_by_chat_id(chat_id):
-    cid = str(chat_id or "").strip()
+    cid = normalize_chat_id(chat_id)
     if not cid:
         return []
     linked = []
     for row in get_all_students():
-        if str(row.get("telegramChatId", "")).strip() == cid:
+        if normalize_chat_id(row.get("telegramChatId", "")) == cid:
             linked.append(row)
     return linked
 
@@ -337,8 +352,8 @@ def handle_telegram_update(update):
             )
             return
 
-        existing_chat = str(student.get("telegramChatId", "")).strip()
-        my_chat = str(chat_id).strip()
+        existing_chat = normalize_chat_id(student.get("telegramChatId", ""))
+        my_chat = normalize_chat_id(chat_id)
 
         if not is_admin_chat(chat_id):
             if existing_chat and existing_chat != my_chat:
@@ -410,7 +425,7 @@ def handle_telegram_update(update):
         return
 
     if cmd == "whoami":
-        linked = find_all_students_by_chat_id(chat_id)
+        linked = get_linked_students_from_sheet(chat_id)
         if not linked:
             send_telegram_message(
                 chat_id,
