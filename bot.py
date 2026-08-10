@@ -102,13 +102,38 @@ def find_student_on_sheet(admission_no):
 
 
 def find_student_by_chat_id(chat_id):
+    """First linked student (legacy). Prefer find_all_students_by_chat_id."""
+    matches = find_all_students_by_chat_id(chat_id)
+    return matches[0] if matches else None
+
+
+def find_all_students_by_chat_id(chat_id):
     cid = str(chat_id or "").strip()
     if not cid:
-        return None
+        return []
+    linked = []
     for row in get_all_students():
         if str(row.get("telegramChatId", "")).strip() == cid:
-            return row
-    return None
+            linked.append(row)
+    return linked
+
+
+def chat_linked_to_admission(chat_id, admission_no):
+    if is_admin_chat(chat_id):
+        return True
+    for row in find_all_students_by_chat_id(chat_id):
+        if admissions_match(row.get("admissionNo"), admission_no):
+            return True
+    return False
+
+
+def format_linked_students_list(students):
+    if not students:
+        return ""
+    lines = []
+    for s in students:
+        lines.append("• " + format_student_label(s, include_admission=True))
+    return "\n".join(lines)
 
 
 def save_chat_id_to_sheet(admission_no, chat_id):
@@ -122,9 +147,12 @@ def save_chat_id_to_sheet(admission_no, chat_id):
     print(f"[SHEET] save_chat_id {admission_no} -> {result}")
     if not result:
         return False
-    if isinstance(result, dict) and result.get("ok") is True:
-        return True
-    raw = str(result.get("raw", result)).upper()
+    if isinstance(result, dict):
+        if result.get("ok") is True:
+            return True
+        if result.get("error") == "admission_linked_to_other_chat":
+            return "blocked_other_parent"
+    raw = str(result.get("raw", result) if isinstance(result, dict) else result).upper()
     return "TRUE" in raw or '"OK":TRUE' in raw.replace(" ", "")
 
 
@@ -176,8 +204,10 @@ def parse_attendance_args(parts, chat_id):
     arg2 = parts[2].strip() if len(parts) > 2 else ""
 
     if not arg1:
-        linked = find_student_by_chat_id(chat_id)
-        return ((linked or {}).get("admissionNo", ""), "")
+        linked = find_all_students_by_chat_id(chat_id)
+        if len(linked) == 1:
+            return (linked[0].get("admissionNo", ""), "")
+        return ("", "")
 
     if arg2:
         if looks_like_date(arg2):
@@ -187,8 +217,10 @@ def parse_attendance_args(parts, chat_id):
         return (arg1, arg2)
 
     if looks_like_date(arg1):
-        linked = find_student_by_chat_id(chat_id)
-        return ((linked or {}).get("admissionNo", ""), arg1)
+        linked = find_all_students_by_chat_id(chat_id)
+        if len(linked) == 1:
+            return (linked[0].get("admissionNo", ""), arg1)
+        return ("", arg1)
 
     return (arg1, "")
 
@@ -263,7 +295,8 @@ def handle_telegram_update(update):
             f"Hello {escape_html(first_name)}!\n\n"
             f"<b>Parents — link for attendance alerts:</b>\n"
             f"<code>/register &lt;Admission No&gt;</code>\n"
-            f"Example: <code>/register 1658</code>\n\n"
+            f"Example: <code>/register 1658</code>\n"
+            f"<i>Two or more children? Register each admission on this same chat.</i>\n\n"
             f"<b>To check status of registration:</b>\n"
             f"<code>/status &lt;Admission No&gt;</code>\n"
             f"Example: <code>/status 1658</code>\n\n"
@@ -304,43 +337,54 @@ def handle_telegram_update(update):
             )
             return
 
-        if not is_admin_chat(chat_id):
-            linked_here = find_student_by_chat_id(chat_id)
-            if linked_here and not admissions_match(linked_here.get("admissionNo"), arg1):
-                send_telegram_message(
-                    chat_id,
-                    "⚠️ <b>This Telegram is already linked to another student</b>\n\n"
-                    + format_student_label(linked_here)
-                    + "\n\nYou tried: <code>"
-                    + escape_html(arg1)
-                    + "</code>\n\n"
-                    "If the admission number is wrong, contact school admin to fix the link.",
-                )
-                return
+        existing_chat = str(student.get("telegramChatId", "")).strip()
+        my_chat = str(chat_id).strip()
 
-            existing_chat = str(student.get("telegramChatId", "")).strip()
-            if existing_chat and existing_chat != str(chat_id).strip():
+        if not is_admin_chat(chat_id):
+            if existing_chat and existing_chat != my_chat:
                 send_telegram_message(
                     chat_id,
                     f"⚠️ Admission <code>{escape_html(arg1)}</code> is already linked to another parent.\n\n"
                     f"Student: {format_student_label(student, include_admission=False)}\n\n"
-                    "If you typed the wrong admission number, use the correct one from the ID card.\n"
                     "Contact school admin if you need help.",
                 )
                 return
 
-        # Sheet is source of truth (no Render/SQLite database)
+        already_mine = existing_chat == my_chat and bool(existing_chat)
+
         ok = save_chat_id_to_sheet(arg1, chat_id)
-        if ok:
+        if ok == "blocked_other_parent":
             send_telegram_message(
                 chat_id,
-                "✅ <b>Registration Successful!</b>\n\n"
+                f"⚠️ Admission <code>{escape_html(arg1)}</code> is already linked to another parent.\n\n"
+                f"Student: {format_student_label(student, include_admission=False)}\n\n"
+                "Contact school admin if you need help.",
+            )
+            return
+        if ok is True:
+            others = [
+                s for s in find_all_students_by_chat_id(chat_id)
+                if not admissions_match(s.get("admissionNo"), arg1)
+            ]
+            extra = ""
+            if others:
+                extra = (
+                    "\n\n<b>Also linked on this chat:</b>\n"
+                    + format_linked_students_list(others)
+                )
+            if already_mine:
+                title = "✅ <b>Already linked</b>"
+            else:
+                title = "✅ <b>Registration Successful!</b>"
+            send_telegram_message(
+                chat_id,
+                title + "\n\n"
                 "Please verify this is YOUR child:\n"
                 + format_student_label(student)
                 + "\n\n"
-                "Chat ID saved to <b>Google Sheet</b>.\n"
-                "You will receive NFC gate attendance alerts on this chat.\n\n"
-                "Wrong name? Send <code>/whoami</code> and contact school admin immediately.",
+                "You will receive NFC gate IN/OUT alerts for this child on this chat.\n"
+                "<i>Another child? Send</i> <code>/register &lt;Admission No&gt;</code>"
+                + extra,
             )
             return
 
@@ -357,19 +401,35 @@ def handle_telegram_update(update):
         )
         return
 
+    if cmd == "myid":
+        send_telegram_message(
+            chat_id,
+            f"🆔 <b>Your Telegram Chat ID</b>\n\n<code>{escape_html(chat_id)}</code>\n\n"
+            "Share this only with school admin if needed.",
+        )
+        return
+
     if cmd == "whoami":
-        linked = find_student_by_chat_id(chat_id)
+        linked = find_all_students_by_chat_id(chat_id)
         if not linked:
             send_telegram_message(
                 chat_id,
                 "ℹ️ This Telegram chat is <b>not linked</b> yet.\n\n"
                 "Use: <code>/register &lt;Admission No&gt;</code>\n"
-                "Example: <code>/register 1725</code>",
+                "Example: <code>/register 1725</code>\n\n"
+                "<i>Register each child separately on this same chat.</i>",
+            )
+            return
+        if len(linked) == 1:
+            send_telegram_message(
+                chat_id,
+                "👤 <b>Your linked student</b>\n\n" + format_student_label(linked[0]),
             )
             return
         send_telegram_message(
             chat_id,
-            "👤 <b>Your linked student</b>\n\n" + format_student_label(linked),
+            f"👤 <b>Your linked students ({len(linked)})</b>\n\n"
+            + format_linked_students_list(linked),
         )
         return
 
@@ -409,14 +469,18 @@ def handle_telegram_update(update):
             return
         has_card = "✅" if student.get("nfcUid") else "❌"
         has_chat = "✅" if student.get("telegramChatId") else "❌"
-        linked_here = find_student_by_chat_id(chat_id)
         mismatch = ""
-        if linked_here and not admissions_match(linked_here.get("admissionNo"), arg1):
-            mismatch = (
-                "\n\n⚠️ <b>Note:</b> YOUR chat is linked to "
-                + format_student_label(linked_here, include_admission=True)
-                + "\nYou asked about a <b>different</b> admission number."
-            )
+        if not is_admin_chat(chat_id) and student.get("telegramChatId"):
+            if str(student.get("telegramChatId", "")).strip() == str(chat_id).strip():
+                pass  # this admission is linked to caller
+            elif not chat_linked_to_admission(chat_id, arg1):
+                linked = find_all_students_by_chat_id(chat_id)
+                if linked:
+                    mismatch = (
+                        "\n\n⚠️ <b>Note:</b> YOUR chat is linked to:\n"
+                        + format_linked_students_list(linked)
+                        + f"\n\nThis status is for admission <code>{escape_html(arg1)}</code>."
+                    )
         send_telegram_message(
             chat_id,
             f"📊 <b>Student Status</b>\n\n"
@@ -431,13 +495,25 @@ def handle_telegram_update(update):
         admission_no, date_str = parse_attendance_args(parts, chat_id)
 
         if not admission_no:
+            linked = find_all_students_by_chat_id(chat_id)
+            if len(linked) > 1:
+                date_hint = ""
+                if date_str:
+                    date_hint = f" on <code>{escape_html(date_str)}</code>"
+                send_telegram_message(
+                    chat_id,
+                    "⚠️ <b>Which child?</b> You have "
+                    f"<b>{len(linked)}</b> children on this chat:\n\n"
+                    + format_linked_students_list(linked)
+                    + f"\n\nUse:\n<code>/attendance &lt;Admission No&gt;{date_hint}</code>",
+                )
+                return
             send_telegram_message(
                 chat_id,
                 "⚠️ <b>Usage</b>\n\n"
-                "<code>/attendance</code> — today (after <code>/register</code>)\n"
+                "<code>/attendance</code> — today (one child linked)\n"
                 "<code>/attendance 1725</code> — today\n"
-                "<code>/attendance 1725 09-08-2026</code> — that day\n"
-                "<code>/attendance 09-08-2026</code> — your child, that day",
+                "<code>/attendance 1725 09-08-2026</code> — past day",
             )
             return
 
@@ -450,18 +526,19 @@ def handle_telegram_update(update):
 
         record = get_attendance_from_sheet(admission_no, chat_id, date_str)
         if record.get("error") == "not_authorized":
-            linked = find_student_by_chat_id(chat_id)
+            linked = find_all_students_by_chat_id(chat_id)
             if linked:
                 send_telegram_message(
                     chat_id,
-                    "🔒 <b>Admission number does not match your link</b>\n\n"
+                    "🔒 <b>Not linked to this admission</b>\n\n"
                     "YOUR chat is linked to:\n"
-                    + format_student_label(linked)
-                    + "\n\nYou asked about: <code>"
+                    + format_linked_students_list(linked)
+                    + "\n\nYou asked: <code>"
                     + escape_html(admission_no)
                     + "</code>\n\n"
-                    "Check the admission number on the student's ID card.\n"
-                    "Send <code>/whoami</code> to see your linked student.",
+                    "Use <code>/register "
+                    + escape_html(admission_no)
+                    + "</code> to add this child.",
                 )
             else:
                 send_telegram_message(
