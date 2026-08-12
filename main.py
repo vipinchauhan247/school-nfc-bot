@@ -10,7 +10,7 @@ import threading
 import time
 import urllib.request
 
-from flask import Flask, request, Response
+from flask import Flask, request, Response, jsonify
 
 import bot
 import nfc_gate
@@ -26,6 +26,7 @@ def index():
         "<p>@Vipinbellbot — 24/7 on Render</p>"
         "<ul>"
         "<li><a href='/health'>/health</a> — status check</li>"
+        "<li><a href='/warm'>/warm</a> — wake server + reload card cache (use before 8 AM / 2 PM)</li>"
         "<li><a href='/setup'>/setup</a> — connect Telegram webhook (open once after deploy)</li>"
         "<li><code>/nfc?uid=CARDUID</code> — fast NFC gate for ESP8266</li>"
         "</ul>",
@@ -39,8 +40,26 @@ def health():
     return (
         f"OK - @Vipinbellbot active on Render | "
         f"students={cache.get('students')} cards={cache.get('cards')} "
-        f"cache_age_sec={cache.get('age_sec')}",
+        f"cache_age_sec={cache.get('age_sec')} "
+        f"attendance_rows={cache.get('attendance_rows')}",
         200,
+    )
+
+
+@app.route("/warm")
+def warm():
+    """
+    Call this before school gate / recess (or via UptimeRobot every 5 min).
+    Wakes Render and reloads student cache so first taps stay fast.
+    """
+    threading.Thread(target=nfc_gate.refresh_student_cache, kwargs={"force": True}, daemon=True).start()
+    cache = nfc_gate.cache_status()
+    return jsonify(
+        {
+            "ok": True,
+            "message": "Warming NFC cache in background",
+            "cache": cache,
+        }
     )
 
 
@@ -89,16 +108,16 @@ def setup():
 
 
 def keep_alive():
-    """Ping /health every 4 min so Render free tier stays warm."""
+    """Ping /health every 2.5 min so Render free tier stays warm."""
     base = os.environ.get("RENDER_EXTERNAL_URL", "")
     if not base:
         return
-    time.sleep(20)
+    time.sleep(15)
     url = base.rstrip("/") + "/health"
     print(f"[KEEP-ALIVE] {url}")
     while True:
         try:
-            time.sleep(240)
+            time.sleep(150)
             req = urllib.request.Request(url, headers={"User-Agent": "MMM-KeepAlive/1.0"})
             with urllib.request.urlopen(req, timeout=30) as resp:
                 print(f"[KEEP-ALIVE] status {resp.status}")
