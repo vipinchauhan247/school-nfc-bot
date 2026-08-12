@@ -24,9 +24,12 @@ def send_telegram_message(chat_id, text, parse_mode="HTML"):
         resp = requests.post(
             f"{TELEGRAM_API}/sendMessage",
             json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode},
-            timeout=10,
+            timeout=15,
         )
-        return resp.json()
+        data = resp.json()
+        if not data.get("ok"):
+            print(f"[BOT] sendMessage failed for {chat_id}: {data}")
+        return data
     except Exception as e:
         print(f"[BOT] sendMessage error: {e}")
         return None
@@ -84,19 +87,35 @@ def format_student_label(student, include_admission=True):
 
 
 def get_all_students():
-    data = apps_script_get({"action": "get_all_uids"})
+    data = apps_script_get({"action": "get_all_uids"}, timeout=45)
     return data if isinstance(data, list) else []
 
 
 def find_student_on_sheet(admission_no):
-    adm = normalize_admission(admission_no).lower()
+    """Prefer single-row Apps Script lookup (fast/reliable). Fallback to full list."""
+    adm = normalize_admission(admission_no)
     if not adm:
         return None
+
+    result = apps_script_get(
+        {"action": "find_student", "admission": adm},
+        timeout=30,
+    )
+    if isinstance(result, dict) and result.get("ok") and isinstance(result.get("student"), dict):
+        student = result["student"]
+        student["admissionNo"] = normalize_admission(student.get("admissionNo") or adm)
+        student["telegramChatId"] = normalize_chat_id(student.get("telegramChatId", ""))
+        student["nfcUid"] = str(student.get("nfcUid") or "").replace(" ", "").replace(":", "").replace("-", "").upper()
+        return student
+
+    # Fallback: full sheet dump (older Apps Script without find_student)
     data = get_all_students()
     if not data:
+        print(f"[SHEET] find_student failed for {adm}; get_all_uids empty/unavailable: {result}")
         return None
+    needle = adm.lower()
     for row in data:
-        if normalize_admission(row.get("admissionNo", "")).lower() == adm:
+        if normalize_admission(row.get("admissionNo", "")).lower() == needle:
             return row
     return None
 
@@ -116,7 +135,7 @@ def normalize_chat_id(value):
 
 def get_linked_students_from_sheet(chat_id):
     cid = normalize_chat_id(chat_id)
-    result = apps_script_get({"action": "whoami", "chatId": cid})
+    result = apps_script_get({"action": "whoami", "chatId": cid}, timeout=30)
     if isinstance(result, dict) and result.get("ok"):
         return result.get("students") or []
     return find_all_students_by_chat_id(chat_id)
@@ -126,11 +145,23 @@ def find_all_students_by_chat_id(chat_id):
     cid = normalize_chat_id(chat_id)
     if not cid:
         return []
+    # Prefer whoami (small payload)
+    result = apps_script_get({"action": "whoami", "chatId": cid}, timeout=30)
+    if isinstance(result, dict) and result.get("ok"):
+        return result.get("students") or []
     linked = []
     for row in get_all_students():
         if normalize_chat_id(row.get("telegramChatId", "")) == cid:
             linked.append(row)
     return linked
+
+
+def _bump_nfc_cache():
+    try:
+        import nfc_gate
+        nfc_gate.invalidate_student_cache()
+    except Exception:
+        pass
 
 
 def chat_linked_to_admission(chat_id, admission_no):
@@ -157,18 +188,23 @@ def save_chat_id_to_sheet(admission_no, chat_id):
             "action": "save_chat_id",
             "admission": normalize_admission(admission_no),
             "chatId": str(chat_id).strip(),
-        }
+        },
+        timeout=30,
     )
     print(f"[SHEET] save_chat_id {admission_no} -> {result}")
     if not result:
         return False
     if isinstance(result, dict):
         if result.get("ok") is True:
+            _bump_nfc_cache()
             return True
         if result.get("error") == "admission_linked_to_other_chat":
             return "blocked_other_parent"
     raw = str(result.get("raw", result) if isinstance(result, dict) else result).upper()
-    return "TRUE" in raw or '"OK":TRUE' in raw.replace(" ", "")
+    ok = "TRUE" in raw or '"OK":TRUE' in raw.replace(" ", "")
+    if ok:
+        _bump_nfc_cache()
+    return ok
 
 
 def link_card_on_sheet(admission_no, uid):
@@ -178,12 +214,15 @@ def link_card_on_sheet(admission_no, uid):
             "action": "register_card",
             "admission": normalize_admission(admission_no),
             "uid": clean_uid,
-        }
+        },
+        timeout=30,
     )
     print(f"[SHEET] register_card {admission_no} {clean_uid} -> {result}")
     text = str(result.get("raw", result) if isinstance(result, dict) else result)
-    return "SUCCESS" in text.upper() or "REGISTERED" in text.upper()
-
+    ok = "SUCCESS" in text.upper() or "REGISTERED" in text.upper()
+    if ok:
+        _bump_nfc_cache()
+    return ok
 
 def get_attendance_from_sheet(admission_no, chat_id, date_str=""):
     params = {
@@ -219,7 +258,7 @@ def parse_attendance_args(parts, chat_id):
     arg2 = parts[2].strip() if len(parts) > 2 else ""
 
     if not arg1:
-        linked = find_all_students_by_chat_id(chat_id)
+        linked = get_linked_students_from_sheet(chat_id)
         if len(linked) == 1:
             return (linked[0].get("admissionNo", ""), "")
         return ("", "")
@@ -232,7 +271,7 @@ def parse_attendance_args(parts, chat_id):
         return (arg1, arg2)
 
     if looks_like_date(arg1):
-        linked = find_all_students_by_chat_id(chat_id)
+        linked = get_linked_students_from_sheet(chat_id)
         if len(linked) == 1:
             return (linked[0].get("admissionNo", ""), arg1)
         return ("", arg1)
@@ -478,8 +517,8 @@ def handle_telegram_update(update):
         if not student:
             send_telegram_message(
                 chat_id,
-                f"❌ Admission <code>{escape_html(arg1)}</code> not found on "
-                f"<b>Google Sheet</b> (not a Render database).",
+                f"❌ Admission <code>{escape_html(arg1)}</code> not found on Google Sheet.\n\n"
+                "Check the admission number and try again.",
             )
             return
         has_card = "✅" if student.get("nfcUid") else "❌"
@@ -510,7 +549,7 @@ def handle_telegram_update(update):
         admission_no, date_str = parse_attendance_args(parts, chat_id)
 
         if not admission_no:
-            linked = find_all_students_by_chat_id(chat_id)
+            linked = get_linked_students_from_sheet(chat_id)
             if len(linked) > 1:
                 date_hint = ""
                 if date_str:
@@ -596,10 +635,9 @@ def register_webhook(public_base_url):
     webhook_url = public_base_url.rstrip("/") + "/bot_webhook"
     try:
         # Clear old webhook first
-        requests.get(f"{TELEGRAM_API}/deleteWebhook", params={"drop_pending_updates": True}, timeout=15)
         resp = requests.get(
             f"{TELEGRAM_API}/setWebhook",
-            params={"url": webhook_url, "drop_pending_updates": True},
+            params={"url": webhook_url, "drop_pending_updates": False},
             timeout=15,
         )
         data = resp.json()
