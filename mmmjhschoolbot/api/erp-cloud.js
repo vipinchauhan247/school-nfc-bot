@@ -1,129 +1,101 @@
 /**
- * ERP Cloud layer — snapshot (compat) + native student rows (cloud-native).
+ * Phase 1 ERP cloud API — stores full SchoolData snapshot in Supabase.
+ * Telegram bot, GAS fee sync, and NFC attendance are unchanged; ERP pushes here on save.
  *
- * Env (Render — already used by live cloud sync):
- *   SUPABASE_URL
- *   SUPABASE_SERVICE_ROLE_KEY  (or SUPABASE_SERVICE_KEY)
- *   ERP_CLOUD_SECRET
- *   ERP_CLOUD_SCHOOL_ID=mmm-jhs
- *
- * Does NOT touch @Vipinbellbot / NFC.
+ * Safe cloud-native add-on: also dual-writes erp_students rows (chat ID + username).
+ * Does not replace snapshot sync.
  */
-const https = require('https');
-const { URL } = require('url');
-
-function env(name, fallback = '') {
-  return String(process.env[name] || fallback).trim();
-}
-
-function schoolIdDefault() {
-  return env('ERP_CLOUD_SCHOOL_ID', 'mmm-jhs') || 'mmm-jhs';
-}
-
-function cloudSecret() {
-  return env('ERP_CLOUD_SECRET');
-}
-
-function supabaseUrl() {
-  return env('SUPABASE_URL').replace(/\/$/, '');
-}
-
-function supabaseKey() {
-  return env('SUPABASE_SERVICE_ROLE_KEY') || env('SUPABASE_SERVICE_KEY') || env('SUPABASE_KEY');
-}
-
-function isConfigured() {
-  return !!(supabaseUrl() && supabaseKey());
-}
 
 function json(res, status, body) {
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, X-ERP-Cloud-Secret',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
-  });
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-ERP-Cloud-Secret');
   res.end(JSON.stringify(body));
 }
 
-function readSecret(req) {
-  const q = req.query || {};
-  const header = req.headers['x-erp-cloud-secret'] || req.headers['X-ERP-Cloud-Secret'];
-  return String(header || q.secret || '').trim();
+function empty(res) {
+  res.statusCode = 204;
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-ERP-Cloud-Secret');
+  res.end();
 }
 
-function requireSecret(req, res) {
+function getEnv(name) {
+  return String(process.env[name] || '').trim();
+}
+
+function cloudSecret() {
+  return getEnv('ERP_CLOUD_SECRET');
+}
+
+function schoolIdDefault() {
+  return getEnv('ERP_CLOUD_SCHOOL_ID') || 'mmm-jhs';
+}
+
+function supabaseConfig() {
+  const url = getEnv('SUPABASE_URL');
+  const key = getEnv('SUPABASE_SERVICE_ROLE_KEY');
+  if (!url || !key) return null;
+  return { url: url.replace(/\/$/, ''), key };
+}
+
+function isConfigured() {
+  return !!supabaseConfig();
+}
+
+function authorize(req) {
   const expected = cloudSecret();
   if (!expected) return true;
-  if (readSecret(req) !== expected) {
-    json(res, 200, { ok: false, error: 'Invalid cloud sync secret.' });
-    return false;
-  }
-  return true;
+  const provided = String(req.headers['x-erp-cloud-secret'] || req.query.secret || '').trim();
+  return provided === expected;
 }
 
-function supabaseRequest(method, pathWithQuery, body, prefer) {
-  const base = supabaseUrl();
-  const key = supabaseKey();
-  if (!base || !key) return Promise.reject(new Error('Supabase is not configured on Render.'));
+async function supabaseRequest(method, path, body, prefer) {
+  const cfg = supabaseConfig();
+  if (!cfg) throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are not set on Render.');
 
-  const url = new URL(pathWithQuery.startsWith('http') ? pathWithQuery : `${base}${pathWithQuery}`);
-  const payload = body == null ? null : Buffer.from(JSON.stringify(body));
-
-  const options = {
+  const init = {
     method,
-    hostname: url.hostname,
-    path: `${url.pathname}${url.search}`,
     headers: {
-      apikey: key,
-      Authorization: `Bearer ${key}`,
+      apikey: cfg.key,
+      Authorization: `Bearer ${cfg.key}`,
       'Content-Type': 'application/json',
-      Prefer:
-        prefer ||
-        (method === 'POST' || method === 'PATCH'
-          ? 'return=representation'
-          : 'return=minimal')
+      Prefer: prefer || 'return=representation'
     }
   };
-  if (payload) options.headers['Content-Length'] = payload.length;
+  if (body !== undefined) init.body = JSON.stringify(body);
 
-  return new Promise((resolve, reject) => {
-    const req = https.request(options, (resp) => {
-      let data = '';
-      resp.on('data', (c) => (data += c));
-      resp.on('end', () => {
-        const status = resp.statusCode || 0;
-        if (status >= 200 && status < 300) {
-          if (!data) return resolve(null);
-          try {
-            resolve(JSON.parse(data));
-          } catch (_) {
-            resolve(data);
-          }
-          return;
-        }
-        reject(new Error(`Supabase ${status}: ${data.slice(0, 300)}`));
-      });
-    });
-    req.on('error', reject);
-    if (payload) req.write(payload);
-    req.end();
-  });
+  const response = await fetch(`${cfg.url}/rest/v1/${path}`, init);
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch (err) {
+    throw new Error(`Supabase returned non-JSON: ${text.slice(0, 200)}`);
+  }
+  if (!response.ok) {
+    const msg = data?.message || data?.error || data?.hint || text.slice(0, 200);
+    throw new Error(msg || `Supabase HTTP ${response.status}`);
+  }
+  return data;
 }
 
 function normalizeAdmission(value) {
   let s = String(value || '').trim();
-  if (s.endsWith('.0') && s.slice(0, -2).match(/^\d+$/)) s = s.slice(0, -2);
+  if (s.endsWith('.0') && /^\d+$/.test(s.slice(0, -2))) s = s.slice(0, -2);
   return s;
 }
 
-function studentFromPayloadRow(row) {
+function nativeRowFromStudent(row, schoolId) {
   if (!row || typeof row !== 'object') return null;
   const admissionNo = normalizeAdmission(row.admissionNo || row.AdmissionNo);
   if (!admissionNo) return null;
   return {
-    school_id: schoolIdDefault(),
+    school_id: schoolId || schoolIdDefault(),
     admission_no: admissionNo,
     name: String(row.name || row.StudentName || '').trim(),
     current_class: String(row.currentClass || row.Class || '').trim(),
@@ -135,101 +107,26 @@ function studentFromPayloadRow(row) {
       row.schoolTelegramChatId || row.schoolBotChatId || row.SchoolBotChatId || row.telegramChatId || ''
     ).trim(),
     telegram_user_name: String(row.telegramUserName || row.TelegramUserName || '').trim(),
-    status: String(row.Status || row.status || '').trim() || null,
+    status: String(row.status || row.Status || '').trim() || null,
     payload: row,
     updated_at: new Date().toISOString()
-  };
-}
-
-async function getSnapshot(schoolId) {
-  const sid = encodeURIComponent(schoolId || schoolIdDefault());
-  const tables = [
-    env('ERP_SNAPSHOT_TABLE', 'erp_snapshots'),
-    'erp_snapshots',
-    'school_snapshots',
-    'mmm_erp_snapshots'
-  ].filter((v, i, a) => v && a.indexOf(v) === i);
-
-  let lastErr;
-  for (const table of tables) {
-    try {
-      const rows = await supabaseRequest(
-        'GET',
-        `/rest/v1/${table}?school_id=eq.${sid}&select=*&order=saved_at.desc&limit=1`
-      );
-      if (Array.isArray(rows)) {
-        // Remember working table for later writes
-        process.env.ERP_SNAPSHOT_TABLE = table;
-        return rows[0] || null;
-      }
-    } catch (err) {
-      lastErr = err;
-    }
-  }
-  throw lastErr || new Error('No erp snapshot table found. Run sql/erp_cloud_native.sql or set ERP_SNAPSHOT_TABLE.');
-}
-
-async function saveSnapshot({ schoolId, payload, savedBy }) {
-  const sid = schoolId || schoolIdDefault();
-  const students = Array.isArray(payload?.students) ? payload.students : [];
-  const savedAt = new Date().toISOString();
-  const row = {
-    school_id: sid,
-    payload,
-    saved_at: savedAt,
-    saved_by: savedBy || 'ERP',
-    version: String(payload?.version || '2.1')
-  };
-
-  // Upsert one row per school_id
-  const table = env('ERP_SNAPSHOT_TABLE', 'erp_snapshots');
-  try {
-    await supabaseRequest(
-      'POST',
-      `/rest/v1/${table}?on_conflict=school_id`,
-      [row],
-      'resolution=merge-duplicates,return=representation'
-    );
-  } catch (_) {
-    await supabaseRequest('DELETE', `/rest/v1/${table}?school_id=eq.${encodeURIComponent(sid)}`);
-    await supabaseRequest('POST', `/rest/v1/${table}`, [row]);
-  }
-
-  // Dual-write native student rows (cloud-native core)
-  try {
-    await upsertStudentsFromPayload(sid, students);
-  } catch (err) {
-    console.error('[erp-cloud] native dual-write failed:', err.message);
-  }
-
-  return {
-    ok: true,
-    configured: true,
-    schoolId: sid,
-    savedAt,
-    studentCount: students.length,
-    native: true
   };
 }
 
 async function upsertStudentsFromPayload(schoolId, students) {
   const rows = [];
   for (const s of students || []) {
-    const row = studentFromPayloadRow(s);
-    if (!row) continue;
-    row.school_id = schoolId;
-    rows.push(row);
+    const row = nativeRowFromStudent(s, schoolId);
+    if (row) rows.push(row);
   }
   if (!rows.length) return { upserted: 0 };
-
-  // Chunk to avoid huge payloads
   const chunkSize = 200;
   let upserted = 0;
   for (let i = 0; i < rows.length; i += chunkSize) {
     const chunk = rows.slice(i, i + chunkSize);
     await supabaseRequest(
       'POST',
-      '/rest/v1/erp_students?on_conflict=school_id,admission_no',
+      'erp_students?on_conflict=school_id,admission_no',
       chunk,
       'resolution=merge-duplicates,return=minimal'
     );
@@ -239,31 +136,23 @@ async function upsertStudentsFromPayload(schoolId, students) {
 }
 
 async function upsertStudentLink({ admissionNo, chatId, username, student }) {
+  if (!isConfigured()) return { ok: false, skipped: true };
   const admission_no = normalizeAdmission(admissionNo);
   if (!admission_no) throw new Error('admissionNo required');
-  const school_id = schoolIdDefault();
-  const base = studentFromPayloadRow(student || { admissionNo: admission_no }) || {
-    school_id,
+  const schoolId = schoolIdDefault();
+  const base = nativeRowFromStudent(student || { admissionNo: admission_no }, schoolId) || {
+    school_id: schoolId,
     admission_no,
     name: '',
-    current_class: '',
-    current_section: '',
-    parent_name: '',
-    parent_phone: '',
-    nfc_uid: '',
     payload: {}
   };
-  base.school_id = school_id;
-  base.admission_no = admission_no;
   base.school_bot_chat_id = String(chatId || '').trim();
   base.telegram_user_name = String(username || '').trim();
   base.status = 'Linked';
   base.updated_at = new Date().toISOString();
-  if (student && typeof student === 'object') base.payload = { ...(base.payload || {}), ...student };
-
   await supabaseRequest(
     'POST',
-    '/rest/v1/erp_students?on_conflict=school_id,admission_no',
+    'erp_students?on_conflict=school_id,admission_no',
     [base],
     'resolution=merge-duplicates,return=representation'
   );
@@ -274,123 +163,133 @@ async function listNativeStudents(schoolId) {
   const sid = encodeURIComponent(schoolId || schoolIdDefault());
   const rows = await supabaseRequest(
     'GET',
-    `/rest/v1/erp_students?school_id=eq.${sid}&select=admission_no,name,current_class,current_section,parent_name,parent_phone,nfc_uid,school_bot_chat_id,telegram_user_name,status,updated_at&order=admission_no.asc`
+    `erp_students?school_id=eq.${sid}&select=admission_no,name,current_class,current_section,parent_name,parent_phone,nfc_uid,school_bot_chat_id,telegram_user_name,status,updated_at&order=admission_no.asc`
   );
   return Array.isArray(rows) ? rows : [];
 }
 
-async function handleCloudConfig(req, res) {
-  return json(res, 200, {
-    ok: true,
-    gasUrl: env('GOOGLE_SCRIPT_URL') || null,
-    cloudSync: {
-      configured: isConfigured(),
-      schoolId: schoolIdDefault(),
-      requiresSecret: !!cloudSecret(),
-      native: true,
-      mode: 'snapshot+native'
-    }
-  });
+async function readSnapshot(schoolId) {
+  const rows = await supabaseRequest(
+    'GET',
+    `erp_snapshots?school_id=eq.${encodeURIComponent(schoolId)}&select=school_id,payload,saved_at,saved_by,version&limit=1`
+  );
+  return Array.isArray(rows) && rows.length ? rows[0] : null;
 }
 
-async function handleCloudPull(req, res) {
-  if (!requireSecret(req, res)) return;
-  if (!isConfigured()) {
-    return json(res, 200, { ok: false, configured: false, error: 'Supabase not configured.' });
-  }
-  const schoolId = String(req.query.schoolId || schoolIdDefault()).trim();
-  const snapshot = await getSnapshot(schoolId);
-  return json(res, 200, {
-    ok: true,
-    configured: true,
-    schoolId,
-    snapshot,
-    native: true
-  });
-}
-
-async function handleCloudPush(req, res) {
-  if (!requireSecret(req, res)) return;
-  if (!isConfigured()) {
-    return json(res, 200, { ok: false, configured: false, error: 'Supabase not configured.' });
-  }
-  const body = req.body || {};
-  const schoolId = String(body.schoolId || req.query.schoolId || schoolIdDefault()).trim();
-  const payload = body.payload;
-  if (!payload || typeof payload !== 'object') {
-    return json(res, 200, { ok: false, error: 'payload required' });
-  }
-  const result = await saveSnapshot({
-    schoolId,
+async function writeSnapshot(schoolId, payload, savedBy) {
+  const row = {
+    school_id: schoolId,
     payload,
-    savedBy: body.savedBy || 'ERP'
+    saved_at: payload?.savedAt || new Date().toISOString(),
+    saved_by: savedBy || '',
+    version: payload?.version || '2.0'
+  };
+  const cfg = supabaseConfig();
+  const response = await fetch(`${cfg.url}/rest/v1/erp_snapshots`, {
+    method: 'POST',
+    headers: {
+      apikey: cfg.key,
+      Authorization: `Bearer ${cfg.key}`,
+      'Content-Type': 'application/json',
+      Prefer: 'resolution=merge-duplicates,return=representation'
+    },
+    body: JSON.stringify(row)
   });
-  return json(res, 200, result);
-}
-
-async function handleNativeStudents(req, res) {
-  if (!requireSecret(req, res)) return;
-  if (!isConfigured()) {
-    return json(res, 200, { ok: false, configured: false, error: 'Supabase not configured.' });
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (err) {
+    throw new Error(`Supabase upsert failed: ${text.slice(0, 200)}`);
   }
-  const schoolId = String(req.query.schoolId || schoolIdDefault()).trim();
-  const students = await listNativeStudents(schoolId);
-  return json(res, 200, {
-    ok: true,
-    configured: true,
-    native: true,
-    schoolId,
-    count: students.length,
-    students
-  });
-}
-
-async function handleNativeMigrate(req, res) {
-  if (!requireSecret(req, res)) return;
-  if (!isConfigured()) {
-    return json(res, 200, { ok: false, configured: false, error: 'Supabase not configured.' });
-  }
-  const schoolId = String((req.body && req.body.schoolId) || req.query.schoolId || schoolIdDefault()).trim();
-  const snapshot = await getSnapshot(schoolId);
-  const students = snapshot?.payload?.students || [];
-  const result = await upsertStudentsFromPayload(schoolId, students);
-  return json(res, 200, {
-    ok: true,
-    schoolId,
-    snapshotStudents: students.length,
-    nativeUpserted: result.upserted,
-    message: 'Snapshot students dual-written into erp_students (cloud-native core).'
-  });
-}
-
-async function route(req, res, action) {
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Content-Type, X-ERP-Cloud-Secret',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
-    });
-    return res.end();
+  if (!response.ok) {
+    throw new Error(data?.message || data?.error || `Supabase HTTP ${response.status}`);
   }
 
   try {
-    if (action === 'cloudConfig') return handleCloudConfig(req, res);
-    if (action === 'cloudPull') return handleCloudPull(req, res);
-    if (action === 'cloudPush') return handleCloudPush(req, res);
-    if (action === 'nativeStudents') return handleNativeStudents(req, res);
-    if (action === 'nativeMigrate') return handleNativeMigrate(req, res);
-    return false;
+    await upsertStudentsFromPayload(schoolId, payload.students || []);
+  } catch (err) {
+    console.error('[ERP-CLOUD] native dual-write failed:', err.message);
+  }
+
+  return Array.isArray(data) ? data[0] : data;
+}
+
+async function erpCloudHandler(req, res) {
+  try {
+    if (req.method === 'OPTIONS') return empty(res);
+
+    if (!supabaseConfig()) {
+      return json(res, 200, {
+        ok: false,
+        configured: false,
+        error: 'Cloud database is not configured on the server yet. ERP will use local storage only.'
+      });
+    }
+
+    if (!authorize(req)) {
+      return json(res, 403, { ok: false, error: 'Invalid cloud sync secret.' });
+    }
+
+    const schoolId = String(req.query.schoolId || req.body?.schoolId || schoolIdDefault()).trim() || schoolIdDefault();
+    const action = String(req.query.action || '').trim();
+
+    if (req.method === 'GET' && action === 'nativeStudents') {
+      const students = await listNativeStudents(schoolId);
+      return json(res, 200, { ok: true, configured: true, native: true, schoolId, count: students.length, students });
+    }
+
+    if (req.method === 'POST' && action === 'nativeMigrate') {
+      const snapshot = await readSnapshot(schoolId);
+      const students = snapshot?.payload?.students || [];
+      const result = await upsertStudentsFromPayload(schoolId, students);
+      return json(res, 200, {
+        ok: true,
+        schoolId,
+        snapshotStudents: students.length,
+        nativeUpserted: result.upserted
+      });
+    }
+
+    if (req.method === 'GET') {
+      const snapshot = await readSnapshot(schoolId);
+      return json(res, 200, {
+        ok: true,
+        configured: true,
+        schoolId,
+        snapshot: snapshot || null,
+        native: true
+      });
+    }
+
+    if (req.method === 'POST') {
+      const body = req.body || {};
+      const payload = body.payload;
+      if (!payload || typeof payload !== 'object') {
+        return json(res, 400, { ok: false, error: 'POST body must include payload object.' });
+      }
+      if (!Array.isArray(payload.students)) {
+        return json(res, 400, { ok: false, error: 'payload.students array is required.' });
+      }
+      const savedBy = String(body.savedBy || '').trim();
+      const snapshot = await writeSnapshot(schoolId, payload, savedBy);
+      return json(res, 200, {
+        ok: true,
+        configured: true,
+        schoolId,
+        savedAt: snapshot?.saved_at || payload.savedAt,
+        studentCount: payload.students.length,
+        native: true
+      });
+    }
+
+    return json(res, 405, { ok: false, error: 'Method not allowed' });
   } catch (error) {
-    console.error('[erp-cloud]', error);
-    return json(res, 200, { ok: false, error: error.message });
+    console.error('[ERP-CLOUD]', error);
+    return json(res, 500, { ok: false, error: error.message });
   }
 }
 
-module.exports = {
-  isConfigured,
-  schoolIdDefault,
-  route,
-  upsertStudentLink,
-  listNativeStudents,
-  handleCloudConfig
-};
+erpCloudHandler.upsertStudentLink = upsertStudentLink;
+erpCloudHandler.isConfigured = isConfigured;
+erpCloudHandler.listNativeStudents = listNativeStudents;
+
+module.exports = erpCloudHandler;
