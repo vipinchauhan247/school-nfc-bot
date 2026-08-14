@@ -15174,6 +15174,7 @@ function printCertificatePreview(mode = 'full') {
             page-break-inside:avoid;
           }
           #certificatePrintArea.letterhead-print .tc-logo,
+          #certificatePrintArea.letterhead-print .tc-school-name-spacer,
           #certificatePrintArea.letterhead-print .tc-watermark,
           #certificatePrintArea.letterhead-print .tc-decoration {
             visibility:hidden !important;
