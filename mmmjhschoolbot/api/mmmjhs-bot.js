@@ -103,7 +103,7 @@ function json(res, status, body) {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-ERP-Cloud-Secret');
   res.end(JSON.stringify(body));
 }
 
@@ -112,7 +112,7 @@ function empty(res, status = 204) {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-ERP-Cloud-Secret');
   res.end();
 }
 
@@ -1057,8 +1057,11 @@ module.exports = async function handler(req, res) {
 
     // Cloud-native + snapshot compat (Supabase). Never touches @Vipinbellbot.
     if (erpCloud && ['cloudConfig', 'cloudPull', 'cloudPush', 'nativeStudents', 'nativeMigrate'].includes(action)) {
-      const handled = await erpCloud.route(req, res, action);
-      if (handled !== false) return;
+      if (typeof erpCloud.route === 'function') {
+        const handled = await erpCloud.route(req, res, action);
+        if (handled !== false) return;
+      }
+      return erpCloud(req, res);
     }
 
     if (req.method === 'GET') {
@@ -1067,10 +1070,6 @@ module.exports = async function handler(req, res) {
       if (action === 'checkScript') return checkGoogleScript(req, res);
       if (action === 'registrations') return json(res, 200, { ok: true, registrations: await getRegistrations() });
       if (action === 'linkedStudents') return json(res, 200, { ok: true, students: await getLinkedStudents() });
-      if (action === 'cloudConfig' || !action) {
-        // Always advertise cloud status for ERP frontend
-        if (erpCloud) return erpCloud.handleCloudConfig(req, res);
-      }
       return json(res, 200, { ok: true, service: '@mmmjhschoolbot webhook' });
     }
 

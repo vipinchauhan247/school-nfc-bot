@@ -4,6 +4,12 @@ const http = require('http');
 const { URL } = require('url');
 
 const botHandler = require('./api/mmmjhs-bot');
+let erpCloudHandler = null;
+try {
+  erpCloudHandler = require('./api/erp-cloud');
+} catch (error) {
+  console.error('[ERP] erp-cloud module missing:', error.message);
+}
 
 const ROOT = __dirname;
 const PORT = process.env.PORT || 3000;
@@ -81,11 +87,15 @@ function readBody(req) {
 const server = http.createServer(async (req, res) => {
   const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
 
-  if (parsedUrl.pathname === '/api/mmmjhs-bot') {
+  if (parsedUrl.pathname === '/api/mmmjhs-bot' || parsedUrl.pathname === '/api/erp-cloud') {
     try {
       req.query = Object.fromEntries(parsedUrl.searchParams.entries());
       req.body = req.method === 'POST' ? await readBody(req) : {};
-      await botHandler(req, res);
+      if (parsedUrl.pathname === '/api/erp-cloud' && erpCloudHandler) {
+        await erpCloudHandler(req, res);
+      } else {
+        await botHandler(req, res);
+      }
     } catch (error) {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: false, error: error.message }));

@@ -213,9 +213,46 @@ async function writeSnapshot(schoolId, payload, savedBy) {
   return Array.isArray(data) ? data[0] : data;
 }
 
+function cloudConfigBody() {
+  const configured = isConfigured();
+  const schoolId = schoolIdDefault();
+  const requiresSecret = !!cloudSecret();
+  const cloudSync = { configured, schoolId, requiresSecret, native: configured };
+  return {
+    ok: true,
+    configured,
+    schoolId,
+    requiresSecret,
+    native: configured,
+    cloudSync
+  };
+}
+
+async function handleCloudConfig(req, res) {
+  return json(res, 200, cloudConfigBody());
+}
+
+async function route(req, res, action) {
+  const act = String(action || req.query?.action || '').trim();
+  if (act === 'cloudConfig') {
+    await handleCloudConfig(req, res);
+    return true;
+  }
+  if (['cloudPull', 'cloudPush', 'nativeStudents', 'nativeMigrate'].includes(act)) {
+    await erpCloudHandler(req, res);
+    return true;
+  }
+  return false;
+}
+
 async function erpCloudHandler(req, res) {
   try {
     if (req.method === 'OPTIONS') return empty(res);
+
+    const action = String(req.query.action || '').trim();
+    if (req.method === 'GET' && action === 'cloudConfig') {
+      return handleCloudConfig(req, res);
+    }
 
     if (!supabaseConfig()) {
       return json(res, 200, {
@@ -230,7 +267,6 @@ async function erpCloudHandler(req, res) {
     }
 
     const schoolId = String(req.query.schoolId || req.body?.schoolId || schoolIdDefault()).trim() || schoolIdDefault();
-    const action = String(req.query.action || '').trim();
 
     if (req.method === 'GET' && action === 'nativeStudents') {
       const students = await listNativeStudents(schoolId);
@@ -291,5 +327,8 @@ async function erpCloudHandler(req, res) {
 erpCloudHandler.upsertStudentLink = upsertStudentLink;
 erpCloudHandler.isConfigured = isConfigured;
 erpCloudHandler.listNativeStudents = listNativeStudents;
+erpCloudHandler.route = route;
+erpCloudHandler.handleCloudConfig = handleCloudConfig;
+erpCloudHandler.cloudConfigBody = cloudConfigBody;
 
 module.exports = erpCloudHandler;

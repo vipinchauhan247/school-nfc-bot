@@ -80,6 +80,15 @@
       const res = await fetchWithRetry(`${getErpCloudApiBase()}?action=cloudConfig`, { cache: 'no-store' });
       const data = await parseCloudResponse(res);
       if (data.cloudSync) return data.cloudSync;
+      if (typeof data.configured === 'boolean') {
+        return {
+          configured: data.configured,
+          schoolId: data.schoolId,
+          requiresSecret: data.requiresSecret,
+          native: data.native,
+          error: data.error
+        };
+      }
       if (data.service) {
         return {
           configured: false,
@@ -352,6 +361,49 @@
     const right = countPayments(b);
     return left.count !== right.count || left.total !== right.total
       || (a?.students || []).length !== (b?.students || []).length;
+  }
+
+  async function applyNativeStudentLinks(options) {
+    const schoolId = getCloudSchoolId();
+    const url = withCloudSecret(`${getErpCloudApiBase()}?action=nativeStudents&schoolId=${encodeURIComponent(schoolId)}`);
+    const res = await fetchWithRetry(url, { headers: cloudHeaders(), cache: 'no-store' });
+    const data = await parseCloudResponse(res);
+    if (!data.ok || !Array.isArray(data.students) || !data.students.length) {
+      return { ok: true, applied: 0 };
+    }
+    if (typeof buildSchoolDataStoragePayload !== 'function' || typeof applySchoolDataStoragePayload !== 'function') {
+      return { ok: false, error: 'ERP storage helpers missing.' };
+    }
+
+    const payload = buildSchoolDataStoragePayload();
+    const byAdmission = new Map((payload.students || []).map((student) => [admissionKey(student), student]));
+    let applied = 0;
+
+    data.students.forEach((row) => {
+      const key = String(row.admission_no || '').trim().toLowerCase();
+      if (!key) return;
+      const student = byAdmission.get(key);
+      if (!student) return;
+      const chatId = String(row.school_bot_chat_id || '').trim();
+      const username = String(row.telegram_user_name || '').trim();
+      if (chatId) {
+        if (student.telegramChatId !== chatId || student.schoolBotChatId !== chatId) applied += 1;
+        student.telegramChatId = chatId;
+        student.schoolBotChatId = chatId;
+        student.SchoolBotChatId = chatId;
+      }
+      if (username) {
+        student.telegramUserName = username;
+        student.TelegramUserName = username;
+      }
+      if (row.status) student.status = row.status;
+    });
+
+    if (applied) {
+      applySchoolDataStoragePayload(payload);
+      if (typeof saveSchoolDataToStorage === 'function') saveSchoolDataToStorage({ skipCloudPush: true });
+    }
+    return { ok: true, applied, count: data.students.length };
   }
 
   async function fetchCloudSnapshot() {
