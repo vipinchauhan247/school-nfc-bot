@@ -91,9 +91,9 @@ export default function WelcomeScreen({ navigation }: Props) {
             <Ionicons name="chevron-forward" size={20} color={colors.muted} />
           </TouchableOpacity>
         ))}
-        <Text style={styles.footerNote}>
-          Changes on the website or NFC gate appear here automatically.
-        </Text>
+            <Text style={styles.footerNote}>
+              ERP bot @mmmjhschoolbot · MMMJHS Telegram sheet (not NFC / @Vipinbellbot)
+            </Text>
       </ScrollView>
     </View>
   );

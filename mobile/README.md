@@ -1,45 +1,27 @@
-# MMM School ERP — Android APK + live Sheet sync
+# ERP vs NFC — do not mix sheets
 
-## Why QR / Sign disappeared
-The earlier mobile ERP branch used a **separate empty SQLite DB** (demo students 2211–2215) and the APK was pointed at **`http://127.0.0.1:8080`**.
+| System | Telegram bot | Google Sheet | Purpose |
+|--------|--------------|--------------|---------|
+| **ERP** (app / website / this QR) | **@mmmjhschoolbot** | **MMMJHS Telegram / ERP sheet** | School ERP portal |
+| **NFC attendance** | **@Vipinbellbot** | **NFC attendance sheet** | Gate taps only |
 
-Your real data (**677 students**) lives on **Google Sheets** via the live server:
-`https://school-nfc-bot.onrender.com`
+The Android ERP app reads **only** `ERP_APPS_SCRIPT_URL` (MMMJHS Telegram sheet).
+It does **not** read or write the NFC attendance sheet.
 
-So the app could not see your uploaded data, Telegram QR/sign-in on the site looked wrong on that branch, and the phone APK could not sync.
-
-**This branch restores:**
-- NFC gate + Telegram webhook + Google Sheet (source of truth)
-- Website **Telegram QR + Sign / Register** panel again
-- Mobile API reading the **same Sheet**
-- APK default API URL → `https://school-nfc-bot.onrender.com`
-
-> After merge, **redeploy on Render** so `/api/mobile/*` exists in production. Until then the APK login will fail with 404.
-
-## How to run / install the APK
-
-### On Android phone
-1. Copy **`MMM-School-ERP.apk`** to the phone (WhatsApp / Drive / USB / agent artifact download).
-2. Open **Files** or **Chrome** → tap the APK.
-3. If blocked: **Settings → Apps → Special access → Install unknown apps** → allow for Files/Chrome.
-4. Tap **Install** → **Open**.
-5. Choose Student / Parent / Staff.
-6. Enter a **real admission number from your Sheet** (not 2211 demo).
-7. Staff password = Render env `ADMIN_PASSWORD` (default `admin123` if unset).
-
-### Parent Telegram (QR sign-in)
-1. Open `https://school-nfc-bot.onrender.com`
-2. Scan the **Telegram QR**
-3. Send `/register <Admission No>`
-
-## Sync model
+## Render env you must set for ERP
 ```
-Google Sheet (uploaded students)
-        │
-        ▼
-Render server (NFC + Telegram + /api/mobile)
-        │
-   ┌────┴────┐
- Website   Android APK
+ERP_BOT_TOKEN=<token for @mmmjhschoolbot>
+ERP_BOT_USERNAME=mmmjhschoolbot
+ERP_APPS_SCRIPT_URL=https://script.google.com/macros/s/XXXX/exec   # MMMJHS Telegram sheet script
 ```
-App and website auto-refresh about every 12 seconds after deploy.
+
+NFC can keep:
+```
+NFC_BOT_TOKEN / BOT_TOKEN=<@Vipinbellbot>
+NFC_APPS_SCRIPT_URL / APPS_SCRIPT_URL=<NFC attendance script>
+```
+
+## APK install
+1. Download `MMM-School-ERP.apk`
+2. Install on Android (allow unknown apps)
+3. Open → login with admission numbers from the **MMMJHS Telegram sheet**

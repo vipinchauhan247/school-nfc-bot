@@ -1,67 +1,56 @@
 {% extends "base.html" %}
 
-{% block title %}{{ school_name }} — Live Attendance{% endblock %}
+{% block title %}{{ school_name }} — ERP{% endblock %}
 
 {% block content %}
 <div class="page-header">
     <h1>{{ school_name }}</h1>
-    <p class="subtitle">Live NFC attendance · Telegram alerts · Mobile ERP (same Google Sheet data)</p>
+    <p class="subtitle">ERP bot <strong>@{{ bot_username }}</strong> · MMMJHS Telegram sheet (not the NFC attendance sheet)</p>
 </div>
 
 <div class="stats-grid">
     <div class="stat-card stat-total">
         <div class="stat-info">
             <span class="stat-value">{{ stats.total }}</span>
-            <span class="stat-label">Students on Sheet</span>
-        </div>
-    </div>
-    <div class="stat-card stat-present">
-        <div class="stat-info">
-            <span class="stat-value">{{ stats.present }}</span>
-            <span class="stat-label">Checked in today</span>
-        </div>
-    </div>
-    <div class="stat-card stat-absent">
-        <div class="stat-info">
-            <span class="stat-value">{{ stats.absent }}</span>
-            <span class="stat-label">Not yet in</span>
+            <span class="stat-label">Students on ERP sheet</span>
         </div>
     </div>
 </div>
 
+{% if not erp_configured %}
+<section class="card" style="margin-top:1.5rem;border-left:4px solid #DC2626;">
+    <div class="card-header"><h2>ERP sheet not connected yet</h2></div>
+    <p>Set Render env <code>ERP_APPS_SCRIPT_URL</code> to the Apps Script for the
+    <strong>MMMJHS Telegram / ERP Google Sheet</strong>.</p>
+    <p>Do <strong>not</strong> paste the NFC attendance sheet script URL here.</p>
+</section>
+{% endif %}
+
 <section class="card telegram-info" style="margin-top:1.5rem;">
     <div class="card-header">
-        <h2>Parent sign-in (Telegram QR)</h2>
+        <h2>Parent / ERP sign-in QR</h2>
         <span class="badge badge-green">@{{ bot_username }}</span>
     </div>
     <div style="display:flex;flex-wrap:wrap;gap:1.5rem;align-items:center;">
-        <img src="{{ qr_url }}" width="220" height="220" alt="Telegram bot QR code"
+        <img src="{{ qr_url }}" width="220" height="220" alt="ERP Telegram bot QR"
              style="border-radius:16px;border:1px solid #e2e8f0;background:#fff;padding:8px;" />
         <div>
-            <p><strong>Scan this QR</strong> with your phone camera to open the school bot and register.</p>
+            <p><strong>Scan this QR</strong> for the ERP bot <code>@{{ bot_username }}</code>.</p>
             <ol style="margin:0.75rem 0 1rem 1.1rem;line-height:1.6;">
-                <li>Scan QR → open Telegram <code>@{{ bot_username }}</code></li>
+                <li>Open Telegram via the QR</li>
                 <li>Tap <strong>Start</strong></li>
-                <li>Send <code>/register &lt;Admission No&gt;</code></li>
-                <li>Get instant IN/OUT alerts when the NFC gate marks attendance</li>
+                <li>Send <code>/register &lt;Admission No&gt;</code> (from MMMJHS ERP sheet)</li>
             </ol>
-            <p><a class="btn btn-primary" href="{{ bot_link }}" target="_blank" rel="noopener">Open Telegram bot</a></p>
-            <p style="margin-top:0.75rem;color:#64748b;font-size:0.9rem;">
-                Your uploaded Google Sheet ({{ stats.total }} students) is the live source for the website, Telegram, NFC gate, and Android app after deploy.
-            </p>
+            <p><a class="btn btn-primary" href="{{ bot_link }}" target="_blank" rel="noopener">Open @{{ bot_username }}</a></p>
         </div>
     </div>
 </section>
 
 <section class="card" style="margin-top:1.5rem;">
-    <div class="card-header">
-        <h2>Android APK</h2>
-    </div>
-    <ol style="margin:0.5rem 0 0 1.1rem;line-height:1.7;">
-        <li>Download <code>MMM-School-ERP.apk</code> from the agent artifacts / release</li>
-        <li>On phone: allow <strong>Install unknown apps</strong> for Files/Chrome</li>
-        <li>Open the APK → Install → Open</li>
-        <li>Login with a real admission number from your Sheet (Staff password from Render <code>ADMIN_PASSWORD</code>)</li>
-    </ol>
+    <div class="card-header"><h2>Two systems (kept separate)</h2></div>
+    <ul style="margin:0.5rem 0 0 1.1rem;line-height:1.7;">
+        <li><strong>ERP</strong> — bot <code>@{{ bot_username }}</code> + <em>MMMJHS Telegram sheet</em> + Android app</li>
+        <li><strong>NFC attendance</strong> — bot <code>@{{ nfc_bot_username }}</code> + <em>NFC attendance sheet</em> + gate hardware</li>
+    </ul>
 </section>
 {% endblock %}
