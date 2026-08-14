@@ -1,18 +1,29 @@
-
-const GOOGLE_CONTACT_SHEET_ID = '1tUTF6GSKXCGEXW8iMibG83lnjoQK8SF_RWbFlJlFxHQ';
-const GOOGLE_CONTACT_SHEET_GID = '0';
+// ---------------------------------------------------------------------------
+// ERP contact / Telegram link roster — @mmmjhschoolbot sheet ONLY
+// https://docs.google.com/spreadsheets/d/1r5yK1Czn7MIY3WN-ngfEDJAC1MVJIgYIjyE8shUsYZU
+// Do NOT point this at the NFC attendance sheet / @Vipinbellbot.
+// ---------------------------------------------------------------------------
+const GOOGLE_ERP_TELEGRAM_SHEET_ID = '1r5yK1Czn7MIY3WN-ngfEDJAC1MVJIgYIjyE8shUsYZU';
+const GOOGLE_ERP_TELEGRAM_SHEET_GID = '1687220666';
+const GOOGLE_CONTACT_SHEET_ID = GOOGLE_ERP_TELEGRAM_SHEET_ID;
+const GOOGLE_CONTACT_SHEET_GID = GOOGLE_ERP_TELEGRAM_SHEET_GID;
 const GOOGLE_ATTENDANCE_SHEET_NAME = 'Attendance';
-const GOOGLE_CONTACT_SYNC_ENDPOINT = 'https://script.google.com/macros/s/AKfycbyE5iWnZO4YxhHQt9I0VP31ArQaflndxL2G9Tr43rJUHVWPyn0geiMZJo9D_EfdC6CGnw/exec?action=get_all_uids';
+// Contact sync must not call the NFC Apps Script (get_all_uids). Use ERP sheet CSV/JSONP.
+const GOOGLE_CONTACT_SYNC_ENDPOINT = '';
+
+// NFC attendance read for ERP Attendance page only (existing live endpoint). Locked otherwise.
+const GOOGLE_NFC_ATTENDANCE_ENDPOINT = 'https://script.google.com/macros/s/AKfycbyE5iWnZO4YxhHQt9I0VP31ArQaflndxL2G9Tr43rJUHVWPyn0geiMZJo9D_EfdC6CGnw/exec?action=get_attendance';
+const GOOGLE_NFC_SHEET_ID = '1tUTF6GSKXCGEXW8iMibG83lnjoQK8SF_RWbFlJlFxHQ';
 
 async function syncAdmissionNumbersFromGoogleSheets() {
-  showNotification('Syncing admission numbers, NFC UIDs and Telegram Chat IDs from Google Sheet...', 'info');
+  showNotification('Syncing admissions / Chat IDs from MMMJHS Telegram sheet (not NFC)...', 'info');
   try {
     const rows = await fetchGoogleContactRowsForSync();
     if (rows.length > 0) {
       const rosterResult = applyRosterIdentityRowsToStudents(rows);
       const result = applyContactUidRowsToStudents(rows, { updateAttendance: false });
       repairDuplicateNfcUidAssignments();
-      showNotification(`Google Sheet sync complete: ${rosterResult.updatedAdmissions} admission number(s) repaired, ${result.updated} contact field(s) updated.`, 'success');
+      showNotification(`MMMJHS Telegram sheet sync complete: ${rosterResult.updatedAdmissions} admission number(s) repaired, ${result.updated} contact field(s) updated.`, 'success');
       rerenderContactSyncViews();
       return;
     }
@@ -401,13 +412,16 @@ function parseSimpleCsvRows(text) {
 
 async function fetchGoogleContactRowsForSync() {
   const rows = [];
-  try {
-    const res = await fetch(GOOGLE_CONTACT_SYNC_ENDPOINT);
-    if (res.ok) {
-      const data = await res.json();
-      if (Array.isArray(data)) rows.push(...data);
-    }
-  } catch(e) {}
+  // Prefer MMMJHS Telegram / ERP sheet CSV + JSONP. Never use NFC get_all_uids here.
+  if (GOOGLE_CONTACT_SYNC_ENDPOINT) {
+    try {
+      const res = await fetch(GOOGLE_CONTACT_SYNC_ENDPOINT);
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) rows.push(...data);
+      }
+    } catch(e) {}
+  }
 
   try {
     const csvRows = await fetchGoogleSheetCsvRows();
@@ -440,11 +454,12 @@ async function fetchGoogleSheetCsvRows() {
   return [];
 }
 
-async function fetchGoogleSheetCsvRowsBySheet(sheetName) {
+async function fetchGoogleSheetCsvRowsBySheet(sheetName, spreadsheetId) {
+  const sheetId = spreadsheetId || GOOGLE_CONTACT_SHEET_ID;
   const encodedSheet = encodeURIComponent(sheetName);
   const urls = [
-    `https://docs.google.com/spreadsheets/d/${GOOGLE_CONTACT_SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodedSheet}`,
-    `https://docs.google.com/spreadsheets/d/${GOOGLE_CONTACT_SHEET_ID}/export?format=csv&sheet=${encodedSheet}`
+    `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&sheet=${encodedSheet}`,
+    `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv&sheet=${encodedSheet}`
   ];
 
   for (const url of urls) {
@@ -8331,9 +8346,12 @@ async function saveNewTeacher() {
     showNotification('Select a Teacher-role user from the list. Create the login in User Management first.', 'error');
     return;
   }
-  if (findStaffUserForTeacher({ id: user.assignedTeacherId || '', name: user.name }) &&
-      SchoolData.teachers.some(t => t.linkedStaffUserId === user.id || t.id === user.assignedTeacherId ||
-        String(t.name || '').trim().toLowerCase() === String(user.name || '').trim().toLowerCase())) {
+  const alreadyLinked = (SchoolData.teachers || []).some(t =>
+    t.linkedStaffUserId === user.id ||
+    t.id === user.assignedTeacherId ||
+    String(t.name || '').trim().toLowerCase() === String(user.name || '').trim().toLowerCase()
+  );
+  if (alreadyLinked) {
     showNotification(`${user.name} is already linked in Teachers Directory.`, 'warning');
     return;
   }
