@@ -33,5 +33,8 @@ PORT = int(os.environ.get("PORT", 8080))
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "school.db")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 
+# Public ERP domain (purchased) — set on Render / DNS
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://mmmjhschool.com").rstrip("/")
+
 # Default public Telegram bot for ERP UI / QR
 TELEGRAM_BOT_USERNAME = ERP_BOT_USERNAME

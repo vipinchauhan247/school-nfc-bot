@@ -8,11 +8,20 @@
 The Android ERP app reads **only** `ERP_APPS_SCRIPT_URL` (MMMJHS Telegram sheet).
 It does **not** read or write the NFC attendance sheet.
 
+## Domain
+Purchased: **https://mmmjhschool.com**
+
+Point DNS to your Render service (Custom Domain), then set:
+```
+PUBLIC_BASE_URL=https://mmmjhschool.com
+```
+
 ## Render env you must set for ERP
 ```
 ERP_BOT_TOKEN=<token for @mmmjhschoolbot>
 ERP_BOT_USERNAME=mmmjhschoolbot
 ERP_APPS_SCRIPT_URL=https://script.google.com/macros/s/XXXX/exec   # MMMJHS Telegram sheet script
+PUBLIC_BASE_URL=https://mmmjhschool.com
 ```
 
 NFC can keep:

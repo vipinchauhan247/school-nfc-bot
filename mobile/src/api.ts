@@ -1,6 +1,6 @@
-// Production ERP (Google Sheet + NFC). Override with EXPO_PUBLIC_API_URL when rebuilding.
+// ERP public site — mmmjhschool.com (point DNS to Render after deploy).
 export const API_BASE =
-  process.env.EXPO_PUBLIC_API_URL || "https://school-nfc-bot.onrender.com";
+  process.env.EXPO_PUBLIC_API_URL || "https://mmmjhschool.com";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const controller = new AbortController();
