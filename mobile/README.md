@@ -8,26 +8,24 @@
 The Android ERP app reads **only** `ERP_APPS_SCRIPT_URL` (MMMJHS Telegram sheet).
 It does **not** read or write the NFC attendance sheet.
 
-## Domain
-Purchased: **https://mmmjhschool.com**
+## Domain / website
+- Purchased: **https://mmmjhschool.com**
+- Website hosted on **Vercel** (point domain DNS to Vercel)
+- ERP bot **@mmmjhschoolbot** is working and updates the MMMJHS Telegram sheet
+- **Do not touch @Vipinbellbot / NFC sheet**
 
-Point DNS to your Render service (Custom Domain), then set:
-```
-PUBLIC_BASE_URL=https://mmmjhschool.com
-```
-
-## Render env you must set for ERP
+## Render / API env for ERP only (never change NFC bot vars)
 ```
 ERP_BOT_TOKEN=<token for @mmmjhschoolbot>
 ERP_BOT_USERNAME=mmmjhschoolbot
-ERP_APPS_SCRIPT_URL=https://script.google.com/macros/s/XXXX/exec   # MMMJHS Telegram sheet script
+ERP_APPS_SCRIPT_URL=https://script.google.com/macros/s/XXXX/exec   # MMMJHS Telegram sheet
 PUBLIC_BASE_URL=https://mmmjhschool.com
 ```
 
-NFC can keep:
+NFC (leave alone):
 ```
-NFC_BOT_TOKEN / BOT_TOKEN=<@Vipinbellbot>
-NFC_APPS_SCRIPT_URL / APPS_SCRIPT_URL=<NFC attendance script>
+BOT_TOKEN / NFC_BOT_TOKEN → @Vipinbellbot
+APPS_SCRIPT_URL / NFC_APPS_SCRIPT_URL → NFC attendance sheet
 ```
 
 ## APK install

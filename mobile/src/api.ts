@@ -1,4 +1,5 @@
-// ERP public site — mmmjhschool.com (point DNS to Render after deploy).
+// ERP website on Vercel: https://mmmjhschool.com
+// Do not point this app at NFC / @Vipinbellbot.
 export const API_BASE =
   process.env.EXPO_PUBLIC_API_URL || "https://mmmjhschool.com";
 
