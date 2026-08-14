@@ -2,20 +2,28 @@ import React from "react";
 import { View, Text, StyleSheet, ScrollView, RefreshControl } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { usePortal } from "../../context/PortalContext";
-import { colors, spacing } from "../../theme";
+import { SyncBadge } from "../../components/UI";
+import { colors, spacing, radius } from "../../theme";
 
 export default function NoticesTab() {
-  const { data, refreshing, refresh } = usePortal();
+  const { data, refreshing, refresh, lastSynced } = usePortal();
   const notices = data?.notices ?? [];
 
   return (
     <SafeAreaView style={styles.container} edges={["top"]}>
       <ScrollView
         contentContainerStyle={styles.scroll}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} tintColor={colors.primary} />}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={refresh} tintColor={colors.brand} />
+        }
       >
-        <Text style={styles.title}>📢 School Notices</Text>
-        <Text style={styles.subtitle}>Latest announcements from school</Text>
+        <View style={styles.top}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.title}>Notices</Text>
+            <Text style={styles.subtitle}>School announcements</Text>
+          </View>
+          <SyncBadge lastSynced={lastSynced} live />
+        </View>
 
         {notices.length === 0 ? (
           <View style={styles.empty}>
@@ -43,22 +51,51 @@ export default function NoticesTab() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: colors.gray50 },
+  container: { flex: 1, backgroundColor: colors.sand },
   scroll: { padding: spacing.lg, paddingBottom: spacing.xl },
-  title: { fontSize: 22, fontWeight: "700", color: colors.gray900 },
-  subtitle: { fontSize: 14, color: colors.gray500, marginBottom: spacing.lg, marginTop: 4 },
-  card: {
-    backgroundColor: colors.white, borderRadius: 14, padding: spacing.md,
-    marginBottom: spacing.sm, borderLeftWidth: 4, borderLeftColor: colors.primary,
+  top: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: spacing.sm,
+    marginBottom: spacing.lg,
   },
-  cardTop: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", gap: 8 },
-  noticeTitle: { fontSize: 16, fontWeight: "700", color: colors.gray900, flex: 1 },
+  title: { fontSize: 24, fontWeight: "800", color: colors.ink, letterSpacing: -0.3 },
+  subtitle: { fontSize: 13, color: colors.gray500, marginTop: 4 },
+  card: {
+    backgroundColor: colors.paper,
+    borderRadius: radius.lg,
+    padding: spacing.md,
+    marginBottom: spacing.sm,
+    borderLeftWidth: 4,
+    borderLeftColor: colors.brand,
+    borderWidth: 1,
+    borderColor: colors.line,
+  },
+  cardTop: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    gap: 8,
+  },
+  noticeTitle: { fontSize: 16, fontWeight: "800", color: colors.ink, flex: 1 },
   audienceBadge: {
-    fontSize: 10, fontWeight: "600", color: colors.primary,
-    backgroundColor: colors.primaryLight, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8,
+    fontSize: 10,
+    fontWeight: "700",
+    color: colors.brand,
+    backgroundColor: colors.brandSoft,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 8,
   },
   noticeBody: { fontSize: 14, color: colors.gray700, marginTop: 8, lineHeight: 21 },
-  noticeDate: { fontSize: 11, color: colors.gray400, marginTop: 8 },
-  empty: { backgroundColor: colors.white, borderRadius: 16, padding: spacing.xl, alignItems: "center" },
-  emptyText: { color: colors.gray400 },
+  noticeDate: { fontSize: 11, color: colors.muted, marginTop: 8 },
+  empty: {
+    backgroundColor: colors.paper,
+    borderRadius: radius.lg,
+    padding: spacing.xl,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: colors.line,
+  },
+  emptyText: { color: colors.muted },
 });

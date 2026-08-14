@@ -8,18 +8,19 @@ import LoginScreen from "./src/screens/LoginScreen";
 import PortalScreen from "./src/screens/PortalScreen";
 import AdminLoginScreen from "./src/screens/AdminLoginScreen";
 import AdminDashboardScreen from "./src/screens/AdminDashboardScreen";
+import { colors } from "./src/theme";
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
 export default function App() {
   return (
     <NavigationContainer>
-      <StatusBar style="dark" />
+      <StatusBar style="light" />
       <Stack.Navigator
         screenOptions={{
           headerShown: false,
           animation: "slide_from_right",
-          contentStyle: { backgroundColor: "#F9FAFB" },
+          contentStyle: { backgroundColor: colors.sand },
         }}
       >
         <Stack.Screen name="Welcome" component={WelcomeScreen} />
@@ -30,10 +31,14 @@ export default function App() {
           {(props) => <LoginScreen {...props} role="parent" />}
         </Stack.Screen>
         <Stack.Screen name="StudentPortal">
-          {({ route }) => <PortalScreen role="student" student={route.params.student} />}
+          {({ route }) => (
+            <PortalScreen role="student" student={route.params.student} />
+          )}
         </Stack.Screen>
         <Stack.Screen name="ParentPortal">
-          {({ route }) => <PortalScreen role="parent" student={route.params.student} />}
+          {({ route }) => (
+            <PortalScreen role="parent" student={route.params.student} />
+          )}
         </Stack.Screen>
         <Stack.Screen name="AdminLogin" component={AdminLoginScreen} />
         <Stack.Screen name="AdminDashboard" component={AdminDashboardScreen} />

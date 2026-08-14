@@ -1,6 +1,6 @@
 {
-  "name": "mobile",
-  "version": "1.0.0",
+  "name": "mmm-school-erp",
+  "version": "1.1.0",
   "main": "index.ts",
   "dependencies": {
     "@expo/metro-runtime": "~57.0.8",
@@ -9,6 +9,7 @@
     "@react-navigation/native": "^7.3.16",
     "@react-navigation/native-stack": "^7.18.8",
     "expo": "~57.0.11",
+    "expo-linear-gradient": "~15.0.8",
     "expo-secure-store": "~57.0.1",
     "expo-status-bar": "~57.0.1",
     "react": "19.2.3",
@@ -20,13 +21,15 @@
   },
   "devDependencies": {
     "@types/react": "~19.2.2",
-    "typescript": "~6.0.3"
+    "typescript": "~5.9.2"
   },
   "scripts": {
     "start": "expo start",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
-    "web": "expo start --web"
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "web": "expo start --web",
+    "build:apk": "eas build -p android --profile preview",
+    "typecheck": "tsc --noEmit"
   },
   "private": true
 }

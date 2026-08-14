@@ -39,3 +39,7 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# Built binaries
+*.apk
+MMM-School-ERP.apk

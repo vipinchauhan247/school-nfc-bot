@@ -14,21 +14,22 @@ export default function PortalTabs() {
     <Tab.Navigator
       screenOptions={({ route }) => ({
         headerShown: false,
-        tabBarActiveTintColor: colors.primary,
-        tabBarInactiveTintColor: colors.gray400,
+        tabBarActiveTintColor: colors.brand,
+        tabBarInactiveTintColor: colors.muted,
         tabBarStyle: {
-          backgroundColor: colors.white,
-          borderTopColor: colors.gray200,
-          paddingBottom: 4,
-          height: 60,
+          backgroundColor: colors.paper,
+          borderTopColor: colors.line,
+          paddingBottom: 6,
+          paddingTop: 6,
+          height: 64,
         },
-        tabBarLabelStyle: { fontSize: 11, fontWeight: "600" },
+        tabBarLabelStyle: { fontSize: 11, fontWeight: "700" },
         tabBarIcon: ({ color, size }) => {
           const icons: Record<string, keyof typeof Ionicons.glyphMap> = {
-            Home: "home",
-            Homework: "book",
-            Notices: "megaphone",
-            Profile: "person",
+            Home: "home-outline",
+            Homework: "book-outline",
+            Notices: "megaphone-outline",
+            Profile: "person-outline",
           };
           return <Ionicons name={icons[route.name]} size={size} color={color} />;
         },
