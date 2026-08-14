@@ -1,8 +1,10 @@
 /**
- * Phase 1 ERP cloud API — stores full SchoolData snapshot in Supabase.
- * Telegram bot, GAS fee sync, and NFC attendance are unchanged; ERP pushes here on save.
+ * ERP cloud API — snapshot sync (compat) + native students/fees in Supabase.
+ * Telegram bot, GAS fee sync, and NFC attendance are unchanged.
  *
- * Safe cloud-native add-on: also dual-writes erp_students rows (chat ID + username).
+ * Phase 2: dual-writes erp_payments / erp_fee_sessions on every cloud push.
+ * School website on mmmjhschool.com can sync without pasting a secret
+ * (Origin/Referer allow-list). Random internet still needs ERP_CLOUD_SECRET.
  * Does not replace snapshot sync.
  */
 
@@ -47,7 +49,37 @@ function isConfigured() {
   return !!supabaseConfig();
 }
 
+function trustedSiteOrigins() {
+  const fromEnv = getEnv('ERP_CLOUD_SITE_ORIGINS');
+  const list = fromEnv
+    ? fromEnv.split(',').map(s => s.trim()).filter(Boolean)
+    : ['https://www.mmmjhschool.com', 'https://mmmjhschool.com'];
+  return list;
+}
+
+function requestSiteOrigin(req) {
+  const origin = String(req.headers.origin || '').trim();
+  if (origin) return origin.replace(/\/$/, '');
+  const referer = String(req.headers.referer || '').trim();
+  if (!referer) return '';
+  try {
+    const url = new URL(referer);
+    return `${url.protocol}//${url.host}`;
+  } catch (err) {
+    return '';
+  }
+}
+
+function isTrustedSiteRequest(req) {
+  const flag = getEnv('ERP_CLOUD_TRUST_SITE_ORIGIN').toLowerCase();
+  if (flag === '0' || flag === 'false' || flag === 'off') return false;
+  const origin = requestSiteOrigin(req);
+  if (!origin) return false;
+  return trustedSiteOrigins().some(allowed => origin === allowed.replace(/\/$/, ''));
+}
+
 function authorize(req) {
+  if (isTrustedSiteRequest(req)) return true;
   const expected = cloudSecret();
   if (!expected) return true;
   const provided = String(req.headers['x-erp-cloud-secret'] || req.query.secret || '').trim();
@@ -135,6 +167,180 @@ async function upsertStudentsFromPayload(schoolId, students) {
   return { upserted };
 }
 
+function fallbackReceiptNo(admissionNo, payment) {
+  return [
+    admissionNo,
+    payment?.date || payment?.paidOn || '',
+    payment?.amount || '',
+    payment?.month || '',
+    payment?.mode || payment?.paymentMode || ''
+  ].join('|');
+}
+
+function extractFeeDataFromStudents(schoolId, students, cancelledReceipts) {
+  const payments = [];
+  const sessions = [];
+  const cancelled = new Set(
+    (cancelledReceipts || []).map(item => String(typeof item === 'string' ? item : item?.receiptNo || '').trim()).filter(Boolean)
+  );
+
+  for (const student of students || []) {
+    const admission_no = normalizeAdmission(student.admissionNo || student.AdmissionNo);
+    if (!admission_no) continue;
+    const feeRecords = { ...(student.feeRecords && typeof student.feeRecords === 'object' ? student.feeRecords : {}) };
+    const sessionNames = new Set(Object.keys(feeRecords));
+    if (student.currentFeeInfo && typeof student.currentFeeInfo === 'object') {
+      sessionNames.add(String(student.currentFeeInfo.session || student.currentSession || 'current'));
+      if (!feeRecords[student.currentFeeInfo.session || student.currentSession || 'current']) {
+        feeRecords[student.currentFeeInfo.session || student.currentSession || 'current'] = student.currentFeeInfo;
+      }
+    }
+
+    sessionNames.forEach((session_name) => {
+      const fee = feeRecords[session_name];
+      if (!fee || typeof fee !== 'object') return;
+      sessions.push({
+        school_id: schoolId,
+        admission_no,
+        session_name: String(session_name || 'current'),
+        monthly_tuition: Number(fee.monthlyTuition || 0) || null,
+        due_months: Array.isArray(fee.dueMonths) ? fee.dueMonths : [],
+        paid_months: Array.isArray(fee.paidMonths) ? fee.paidMonths : [],
+        wallet_balance: Number(fee.walletBalance || 0) || null,
+        payload: fee,
+        updated_at: new Date().toISOString()
+      });
+      (fee.payments || []).forEach((p) => {
+        if (!p || typeof p !== 'object') return;
+        const receipt_no = String(p.receiptNo || fallbackReceiptNo(admission_no, p)).trim();
+        if (!receipt_no) return;
+        payments.push({
+          school_id: schoolId,
+          admission_no,
+          receipt_no,
+          session_name: String(session_name || 'current'),
+          amount: Number(p.amount || 0) || 0,
+          paid_on: String(p.date || p.paidOn || ''),
+          month: String(p.month || ''),
+          mode: String(p.mode || p.paymentMode || ''),
+          cancelled: cancelled.has(receipt_no),
+          payload: p,
+          updated_at: new Date().toISOString()
+        });
+      });
+    });
+  }
+
+  cancelled.forEach((receipt_no) => {
+    if (payments.some(p => p.receipt_no === receipt_no)) return;
+    payments.push({
+      school_id: schoolId,
+      admission_no: '',
+      receipt_no,
+      session_name: '',
+      amount: 0,
+      paid_on: '',
+      month: '',
+      mode: '',
+      cancelled: true,
+      payload: { receiptNo: receipt_no },
+      updated_at: new Date().toISOString()
+    });
+  });
+
+  return { payments, sessions };
+}
+
+async function upsertChunked(table, conflict, rows) {
+  if (!rows.length) return { upserted: 0 };
+  const chunkSize = 200;
+  let upserted = 0;
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    const chunk = rows.slice(i, i + chunkSize);
+    await supabaseRequest(
+      'POST',
+      `${table}?on_conflict=${conflict}`,
+      chunk,
+      'resolution=merge-duplicates,return=minimal'
+    );
+    upserted += chunk.length;
+  }
+  return { upserted };
+}
+
+async function upsertFeesFromPayload(schoolId, payload) {
+  const { payments, sessions } = extractFeeDataFromStudents(
+    schoolId,
+    payload?.students || [],
+    payload?.cancelledReceipts || []
+  );
+  const pay = await upsertChunked('erp_payments', 'school_id,receipt_no', payments);
+  const sess = await upsertChunked('erp_fee_sessions', 'school_id,admission_no,session_name', sessions);
+  return { payments: pay.upserted, sessions: sess.upserted };
+}
+
+async function listNativePayments(schoolId) {
+  const sid = encodeURIComponent(schoolId || schoolIdDefault());
+  const rows = await supabaseRequest(
+    'GET',
+    `erp_payments?school_id=eq.${sid}&select=admission_no,receipt_no,session_name,amount,paid_on,month,mode,cancelled,payload,updated_at&order=paid_on.asc`
+  );
+  return Array.isArray(rows) ? rows : [];
+}
+
+function applyNativePaymentsToPayload(payload, payments) {
+  if (!payload || !Array.isArray(payload.students) || !Array.isArray(payments) || !payments.length) {
+    return payload;
+  }
+  const byAdmission = new Map();
+  payload.students.forEach((student) => {
+    const key = normalizeAdmission(student.admissionNo || student.AdmissionNo).toLowerCase();
+    if (key) byAdmission.set(key, student);
+  });
+
+  const cancelled = Array.isArray(payload.cancelledReceipts) ? payload.cancelledReceipts.slice() : [];
+  const cancelledSet = new Set(
+    cancelled.map(item => String(typeof item === 'string' ? item : item?.receiptNo || '').trim().toLowerCase()).filter(Boolean)
+  );
+
+  payments.forEach((row) => {
+    const receiptNo = String(row.receipt_no || '').trim();
+    if (!receiptNo) return;
+    if (row.cancelled) {
+      if (!cancelledSet.has(receiptNo.toLowerCase())) {
+        cancelled.push({ receiptNo, cancelledAt: row.updated_at });
+        cancelledSet.add(receiptNo.toLowerCase());
+      }
+      return;
+    }
+    const student = byAdmission.get(String(row.admission_no || '').trim().toLowerCase());
+    if (!student) return;
+    if (!student.feeRecords || typeof student.feeRecords !== 'object') student.feeRecords = {};
+    const sessionName = String(row.session_name || 'current');
+    if (!student.feeRecords[sessionName] || typeof student.feeRecords[sessionName] !== 'object') {
+      student.feeRecords[sessionName] = { payments: [], paidMonths: [], dueMonths: [] };
+    }
+    const fee = student.feeRecords[sessionName];
+    if (!Array.isArray(fee.payments)) fee.payments = [];
+    const nativePay = (row.payload && typeof row.payload === 'object')
+      ? { ...row.payload }
+      : {
+        receiptNo,
+        amount: Number(row.amount || 0),
+        date: row.paid_on,
+        month: row.month,
+        mode: row.mode
+      };
+    nativePay.receiptNo = nativePay.receiptNo || receiptNo;
+    nativePay.amount = Number(nativePay.amount || row.amount || 0);
+    const exists = fee.payments.some(p => String(p?.receiptNo || '').trim().toLowerCase() === receiptNo.toLowerCase());
+    if (!exists) fee.payments.push(nativePay);
+  });
+
+  payload.cancelledReceipts = cancelled;
+  return payload;
+}
+
 async function upsertStudentLink({ admissionNo, chatId, username, student }) {
   if (!isConfigured()) return { ok: false, skipped: true };
   const admission_no = normalizeAdmission(admissionNo);
@@ -207,29 +413,47 @@ async function writeSnapshot(schoolId, payload, savedBy) {
   try {
     await upsertStudentsFromPayload(schoolId, payload.students || []);
   } catch (err) {
-    console.error('[ERP-CLOUD] native dual-write failed:', err.message);
+    console.error('[ERP-CLOUD] native student dual-write failed:', err.message);
   }
 
-  return Array.isArray(data) ? data[0] : data;
+  let fees = { payments: 0, sessions: 0 };
+  try {
+    fees = await upsertFeesFromPayload(schoolId, payload);
+  } catch (err) {
+    console.error('[ERP-CLOUD] native fee dual-write failed:', err.message);
+  }
+
+  const saved = Array.isArray(data) ? data[0] : data;
+  return { snapshot: saved, fees };
 }
 
-function cloudConfigBody() {
+function cloudConfigBody(req) {
   const configured = isConfigured();
   const schoolId = schoolIdDefault();
-  const requiresSecret = !!cloudSecret();
-  const cloudSync = { configured, schoolId, requiresSecret, native: configured };
+  const siteTrusted = !!(req && isTrustedSiteRequest(req));
+  const requiresSecret = !!cloudSecret() && !siteTrusted;
+  const cloudSync = {
+    configured,
+    schoolId,
+    requiresSecret,
+    native: configured,
+    siteTrusted,
+    feesNative: configured
+  };
   return {
     ok: true,
     configured,
     schoolId,
     requiresSecret,
     native: configured,
+    siteTrusted,
+    feesNative: configured,
     cloudSync
   };
 }
 
 async function handleCloudConfig(req, res) {
-  return json(res, 200, cloudConfigBody());
+  return json(res, 200, cloudConfigBody(req));
 }
 
 async function route(req, res, action) {
@@ -238,7 +462,7 @@ async function route(req, res, action) {
     await handleCloudConfig(req, res);
     return true;
   }
-  if (['cloudPull', 'cloudPush', 'nativeStudents', 'nativeMigrate'].includes(act)) {
+  if (['cloudPull', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments'].includes(act)) {
     await erpCloudHandler(req, res);
     return true;
   }
@@ -273,26 +497,55 @@ async function erpCloudHandler(req, res) {
       return json(res, 200, { ok: true, configured: true, native: true, schoolId, count: students.length, students });
     }
 
-    if (req.method === 'POST' && action === 'nativeMigrate') {
+    if (req.method === 'GET' && action === 'nativePayments') {
+      const payments = await listNativePayments(schoolId);
+      return json(res, 200, {
+        ok: true,
+        configured: true,
+        native: true,
+        schoolId,
+        count: payments.length,
+        payments
+      });
+    }
+
+    if ((req.method === 'POST' || req.method === 'GET') && action === 'nativeMigrate') {
       const snapshot = await readSnapshot(schoolId);
       const students = snapshot?.payload?.students || [];
-      const result = await upsertStudentsFromPayload(schoolId, students);
+      const studentResult = await upsertStudentsFromPayload(schoolId, students);
+      let feeResult = { payments: 0, sessions: 0 };
+      try {
+        feeResult = await upsertFeesFromPayload(schoolId, snapshot?.payload || {});
+      } catch (err) {
+        console.error('[ERP-CLOUD] fee migrate failed:', err.message);
+      }
       return json(res, 200, {
         ok: true,
         schoolId,
         snapshotStudents: students.length,
-        nativeUpserted: result.upserted
+        nativeUpserted: studentResult.upserted,
+        nativePayments: feeResult.payments,
+        nativeFeeSessions: feeResult.sessions
       });
     }
 
     if (req.method === 'GET') {
       const snapshot = await readSnapshot(schoolId);
+      if (snapshot && snapshot.payload) {
+        try {
+          const payments = await listNativePayments(schoolId);
+          snapshot.payload = applyNativePaymentsToPayload(snapshot.payload, payments);
+        } catch (err) {
+          console.error('[ERP-CLOUD] native payment overlay failed:', err.message);
+        }
+      }
       return json(res, 200, {
         ok: true,
         configured: true,
         schoolId,
         snapshot: snapshot || null,
-        native: true
+        native: true,
+        feesNative: true
       });
     }
 
@@ -306,14 +559,17 @@ async function erpCloudHandler(req, res) {
         return json(res, 400, { ok: false, error: 'payload.students array is required.' });
       }
       const savedBy = String(body.savedBy || '').trim();
-      const snapshot = await writeSnapshot(schoolId, payload, savedBy);
+      const written = await writeSnapshot(schoolId, payload, savedBy);
+      const snapshot = written?.snapshot || written;
       return json(res, 200, {
         ok: true,
         configured: true,
         schoolId,
         savedAt: snapshot?.saved_at || payload.savedAt,
         studentCount: payload.students.length,
-        native: true
+        native: true,
+        nativePayments: written?.fees?.payments || 0,
+        nativeFeeSessions: written?.fees?.sessions || 0
       });
     }
 

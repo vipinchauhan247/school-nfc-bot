@@ -86,6 +86,8 @@
           schoolId: data.schoolId,
           requiresSecret: data.requiresSecret,
           native: data.native,
+          siteTrusted: data.siteTrusted,
+          feesNative: data.feesNative,
           error: data.error
         };
       }
@@ -612,7 +614,7 @@
       console.info('ERP cloud sync: server not configured yet (Supabase env on Render).');
       return { ok: false, configured: false };
     }
-    if (cfg.requiresSecret && !getCloudSecret()) {
+    if (cfg.requiresSecret && !getCloudSecret() && !cfg.siteTrusted) {
       window._erpCloudLastPullError = 'Admin: set window.ERP_CLOUD_SECRET in js/erp-cloud-config.js';
       return { ok: false, configured: true, error: 'Cloud secret not set in website config.' };
     }
