@@ -105,8 +105,8 @@
                     <td><span class="badge badge-blue">{{ student.class_name }}</span></td>
                     <td>{{ student.parent_name or '—' }}</td>
                     <td>
-                        {% if student.nfc_card_id %}
-                        <code class="nfc-linked">{{ student.nfc_card_id }}</code>
+                        {% if student.nfc_uid %}
+                        <code class="nfc-linked">{{ student.nfc_uid }}</code>
                         {% else %}
                         <button class="btn btn-sm btn-outline" onclick="linkCard('{{ student.admission_no }}')">Link Card</button>
                         {% endif %}

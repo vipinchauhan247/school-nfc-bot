@@ -1,5 +1,6 @@
+// Production ERP (Google Sheet + NFC). Override with EXPO_PUBLIC_API_URL when rebuilding.
 export const API_BASE =
-  process.env.EXPO_PUBLIC_API_URL || "http://127.0.0.1:8080";
+  process.env.EXPO_PUBLIC_API_URL || "https://school-nfc-bot.onrender.com";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const controller = new AbortController();

@@ -105,7 +105,7 @@ export default function LoginScreen({ navigation, role }: Props) {
           />
         </View>
 
-        <Text style={styles.hint}>Demo admissions: 2211 · 2212 · 2213 · 2214 · 2215</Text>
+        <Text style={styles.hint}>Use a real admission number from the school Google Sheet</Text>
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
