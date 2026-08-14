@@ -516,12 +516,13 @@ function fetchGoogleSheetRowsViaJsonp() {
   });
 }
 
-function fetchGoogleSheetRowsViaJsonpBySheet(sheetName) {
+function fetchGoogleSheetRowsViaJsonpBySheet(sheetName, spreadsheetId) {
   return new Promise((resolve, reject) => {
     if (typeof document === 'undefined') {
       resolve([]);
       return;
     }
+    const sheetId = spreadsheetId || GOOGLE_CONTACT_SHEET_ID;
     const callbackName = `mmmSheetSync_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     const script = document.createElement('script');
     const cleanup = () => {
@@ -553,20 +554,21 @@ function fetchGoogleSheetRowsViaJsonpBySheet(sheetName) {
       cleanup();
       reject(new Error(`${sheetName} JSONP sync failed`));
     };
-    script.src = `https://docs.google.com/spreadsheets/d/${GOOGLE_CONTACT_SHEET_ID}/gviz/tq?sheet=${encodeURIComponent(sheetName)}&tqx=responseHandler:${callbackName}`;
+    script.src = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?sheet=${encodeURIComponent(sheetName)}&tqx=responseHandler:${callbackName}`;
     document.head.appendChild(script);
   });
 }
 
 async function fetchGoogleAttendanceRowsForSync() {
   const rows = [];
+  // Attendance tab lives on the NFC sheet (Vipinbellbot), not the ERP Telegram sheet.
   try {
-    const csvRows = await fetchGoogleSheetCsvRowsBySheet(GOOGLE_ATTENDANCE_SHEET_NAME);
+    const csvRows = await fetchGoogleSheetCsvRowsBySheet(GOOGLE_ATTENDANCE_SHEET_NAME, GOOGLE_NFC_SHEET_ID);
     if (csvRows.length) rows.push(...csvRows);
   } catch(e) {}
 
   try {
-    const visualRows = await fetchGoogleSheetRowsViaJsonpBySheet(GOOGLE_ATTENDANCE_SHEET_NAME);
+    const visualRows = await fetchGoogleSheetRowsViaJsonpBySheet(GOOGLE_ATTENDANCE_SHEET_NAME, GOOGLE_NFC_SHEET_ID);
     if (visualRows.length) rows.push(...visualRows);
   } catch(e) {}
 
@@ -7517,11 +7519,11 @@ async function syncAttendanceFromGoogleSheets() {
   };
 
   try {
-    const res = await fetch('https://script.google.com/macros/s/AKfycbyE5iWnZO4YxhHQt9I0VP31ArQaflndxL2G9Tr43rJUHVWPyn0geiMZJo9D_EfdC6CGnw/exec?action=get_attendance');
+    const res = await fetch(GOOGLE_NFC_ATTENDANCE_ENDPOINT);
     if (res.ok) {
       const data = await res.json();
       if (Array.isArray(data) && data.length > 0) {
-        finishAttendanceSync(data, 'live API');
+        finishAttendanceSync(data, 'NFC attendance API');
         return;
       }
     }
@@ -15077,7 +15079,7 @@ function generateCertificate(admissionNo, certType) {
             <div style="${isTransferCertificate ? 'display:block; text-align:center; padding:6px 18px 0;' : 'display:flex; justify-content:space-between; gap:18px; align-items:center;'} position:relative; z-index:1;">
               ${isTransferCertificate ? `
                 <div class="tc-logo" style="display:flex; justify-content:center; margin-bottom:6px;">${getTransferCertificateLogoHtml(78)}</div>
-                <div contenteditable="true" style="font-family:'Playfair Display', Georgia, serif; font-size:28px; font-weight:800; color:#10213f; letter-spacing:0; line-height:1.15;">${profile.name}</div>
+                <div class="tc-school-name-spacer" aria-hidden="true" style="height:32px; line-height:1.15; margin:0;"></div>
                 <div contenteditable="true" style="font-family:'Outfit', sans-serif; font-size:13px; color:#64748b; margin-top:5px; font-weight:700;">${profile.address} • Academic Session ${SchoolData.activeSession}</div>
                 <div style="height:1px; background:linear-gradient(90deg, transparent, #d4af37, #10213f, #d4af37, transparent); margin:10px auto 0; width:72%;"></div>
               ` : `
