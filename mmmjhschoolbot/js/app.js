@@ -1495,12 +1495,24 @@ document.addEventListener('DOMContentLoaded', () => {
   initApp();
 });
 
+function isErpCloudOnly() {
+  // Default ON. Browser localStorage is no longer the school roster source of truth.
+  return window.ERP_CLOUD_ONLY !== false;
+}
+
 async function initApp() {
-  loadSchoolDataFromStorage();
-  try {
-    await hydrateSchoolDataFromIndexedDb();
-  } catch (err) {
-    console.warn('IndexedDB hydrate skipped:', err);
+  // Cloud-only: do NOT load students from localStorage/IndexedDB (stale PCs caused duplicates).
+  // Printer + appearance stay on their own local keys.
+  if (isErpCloudOnly()) {
+    mergeLocalCancelledReceiptsFromTinyStore();
+    SchoolData.students = [];
+  } else {
+    loadSchoolDataFromStorage();
+    try {
+      await hydrateSchoolDataFromIndexedDb();
+    } catch (err) {
+      console.warn('IndexedDB hydrate skipped:', err);
+    }
   }
   ensureStaffUserIds();
   repairUnsafeSampleContactData();
@@ -1525,7 +1537,12 @@ async function initApp() {
   window.addEventListener('hashchange', handleRouting);
 
   if (typeof initCloudSync === 'function') {
-    initCloudSync().catch(err => console.warn('Cloud sync init:', err));
+    try {
+      await initCloudSync();
+      if (isErpCloudOnly()) handleRouting();
+    } catch (err) {
+      console.warn('Cloud sync init:', err);
+    }
   }
 }
 
@@ -5747,6 +5764,7 @@ function loadSchoolDataFromIndexedDb() {
 }
 
 async function hydrateSchoolDataFromIndexedDb() {
+  if (isErpCloudOnly()) return false;
   const stored = await loadSchoolDataFromIndexedDb();
   if (!stored || !Array.isArray(stored.students) || !stored.students.length) return false;
   const local = buildSchoolDataStoragePayload();
@@ -5755,6 +5773,50 @@ async function hydrateSchoolDataFromIndexedDb() {
     : stored;
   return applySchoolDataStoragePayload(merged);
 }
+
+function clearLocalSchoolDataAuthorityStores() {
+  try { localStorage.removeItem('MMM_SchoolData_v6'); } catch (e) {}
+  try { localStorage.removeItem('MMM_SchoolData_students'); } catch (e) {}
+  try { localStorage.removeItem('MMM_SchoolData_classes'); } catch (e) {}
+  try { localStorage.removeItem('MMM_SchoolData_staffUsers'); } catch (e) {}
+  try {
+    if (typeof indexedDB !== 'undefined') {
+      const req = indexedDB.open(ERP_IDB_NAME, 1);
+      req.onsuccess = () => {
+        try {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(ERP_IDB_STORE)) return;
+          db.transaction(ERP_IDB_STORE, 'readwrite').objectStore(ERP_IDB_STORE).delete(ERP_IDB_SNAPSHOT_KEY);
+        } catch (e) {}
+      };
+    }
+  } catch (e) {}
+}
+
+function peekLocalSchoolDataForCloudMigration() {
+  try {
+    const savedV6 = localStorage.getItem('MMM_SchoolData_v6');
+    if (savedV6) {
+      const parsed = JSON.parse(savedV6);
+      if (parsed && Array.isArray(parsed.students) && parsed.students.length > 0) return parsed;
+    }
+  } catch (e) {}
+  return null;
+}
+
+function loadEmergencyLocalSchoolCache() {
+  try {
+    const parsed = peekLocalSchoolDataForCloudMigration();
+    if (!parsed) return false;
+    return !!applySchoolDataStoragePayload(parsed);
+  } catch (e) {
+    return false;
+  }
+}
+
+window.clearLocalSchoolDataAuthorityStores = clearLocalSchoolDataAuthorityStores;
+window.peekLocalSchoolDataForCloudMigration = peekLocalSchoolDataForCloudMigration;
+window.loadEmergencyLocalSchoolCache = loadEmergencyLocalSchoolCache;
 
 function freeDuplicateLocalStorageCopies() {
   try { localStorage.removeItem('MMM_SchoolData_students'); } catch (e) {}
@@ -5801,6 +5863,14 @@ function notifyBrowserStorageFailure(options) {
 
 function saveSchoolDataToStorage(options) {
   persistCancelledReceiptsToLocalStorage();
+  // Cloud-only: do not write the full roster into localStorage/IndexedDB.
+  // That cache resurrected deleted/duplicate students across PCs.
+  // Printer (MMM_PrintSettings) and appearance stay on their own keys.
+  if (isErpCloudOnly()) {
+    clearLocalSchoolDataAuthorityStores();
+    window.lastSchoolDataSaveError = '';
+    return true;
+  }
   const payload = buildSchoolDataStoragePayload();
   saveSchoolDataToIndexedDb(payload);
   try {
@@ -5819,6 +5889,10 @@ function saveSchoolDataToStorage(options) {
 }
 
 function loadSchoolDataFromStorage() {
+  if (isErpCloudOnly()) {
+    mergeLocalCancelledReceiptsFromTinyStore();
+    return;
+  }
   try {
     mergeLocalCancelledReceiptsFromTinyStore();
     const savedV6 = localStorage.getItem('MMM_SchoolData_v6');
@@ -15488,22 +15562,25 @@ function savePrintSettingsFromPage() {
 }
 
 function renderBackupPage(container) {
+  const cloudOnly = isErpCloudOnly();
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-database" style="color:var(--accent-success)"></i> System Backup & Recovery</h2>
-        <p class="page-subtitle">One-Click Database Backup & JSON Export</p>
+        <p class="page-subtitle">${cloudOnly ? 'Cloud ERP is the source of truth — JSON export is optional safety only' : 'One-Click Database Backup & JSON Export'}</p>
       </div>
     </div>
     <div class="glass-card" style="max-width:600px;">
       <h3>Full ERP Database Snapshot</h3>
-      <p style="font-size:0.85rem; color:var(--text-muted); margin:12px 0;">Export all student profiles, NFC bindings, session history, fee receipts, and exam results into a single encrypted JSON backup file.</p>
+      <p style="font-size:0.85rem; color:var(--text-muted); margin:12px 0;">Export all student profiles, NFC bindings, session history, fee receipts, and exam results into a single JSON backup file${cloudOnly ? ' (download for safe-keeping; day-to-day data lives in Supabase)' : ''}.</p>
       <button class="btn btn-primary" onclick="downloadDatabaseBackup()"><i class="fa-solid fa-download"></i> Download Full Backup (.JSON)</button>
     </div>
 
     <div class="glass-card" style="max-width:600px; margin-top:20px; border:2px solid #0f766e;">
-      <h3 style="color:#14b8a6;"><i class="fa-solid fa-cloud"></i> Cloud Sync (Phase 1) — Same data on all phones & PCs</h3>
-      <p style="font-size:0.85rem; color:var(--text-muted); margin:12px 0;">Live auto-sync is ON: new fee receipts upload within ~1 second and other open PCs/phones refresh about every 5 seconds. Manual Upload/Download is only a backup if a PC was offline.</p>
+      <h3 style="color:#14b8a6;"><i class="fa-solid fa-cloud"></i> ${cloudOnly ? 'Cloud ERP (100%) — Supabase only' : 'Cloud Sync (Phase 1) — Same data on all phones & PCs'}</h3>
+      <p style="font-size:0.85rem; color:var(--text-muted); margin:12px 0;">${cloudOnly
+        ? 'This site loads students from the school cloud on every open. Browser local copies are cleared so old PCs cannot resurrect duplicates. Printer and appearance settings still stay on each PC.'
+        : 'Live auto-sync is ON: new fee receipts upload within ~1 second and other open PCs/phones refresh about every 5 seconds. Manual Upload/Download is only a backup if a PC was offline.'}</p>
       <div style="display:grid; gap:10px; margin-bottom:12px;">
         <label style="font-size:0.8rem; color:var(--text-muted);">School ID</label>
         <input id="cloudSchoolIdInput" type="text" value="mmm-jhs" style="padding:8px 10px; border-radius:8px; border:1px solid #334155; background:#0f172a; color:#fff;">

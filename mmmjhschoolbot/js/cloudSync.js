@@ -1,19 +1,30 @@
 /**
- * Phase 1 — shared ERP cloud sync (Supabase via Render /api/erp-cloud).
- * Does not replace Telegram bot, GAS fee sync, or local backup; adds shared copy for all devices.
+ * Shared ERP cloud sync (Supabase via Render /api/erp-cloud).
  *
- * Important: fee receipts are MERGED by receiptNo so a stale PC localStorage (₹0)
- * cannot wipe a phone / private-browser ledger (₹1900).
+ * When window.ERP_CLOUD_ONLY is true (default for MMM JHS):
+ *   - Cloud snapshot is the only roster source of truth
+ *   - Pull REPLACES memory (no merge with stale localStorage students)
+ *   - Push uploads this device's in-memory data (already cloud-based + local edits)
+ *   - One-time migrate: if cloud empty but browser still has old local data, upload once
+ *
+ * Hybrid mode (ERP_CLOUD_ONLY false): fee receipts still MERGED by receiptNo so a
+ * stale PC localStorage (₹0) cannot wipe a phone ledger (₹1900).
  */
 (function () {
   const LS_SCHOOL_ID = 'MMM_ERP_CLOUD_SCHOOL_ID';
   const LS_SECRET = 'MMM_ERP_CLOUD_SECRET';
   const LS_LAST_PULL = 'MMM_ERP_CLOUD_LAST_PULL_AT';
   const LS_LAST_CLOUD_AT = 'MMM_ERP_CLOUD_LAST_CLOUD_AT';
+  const LS_MIGRATED_FLAG = 'MMM_ERP_CLOUD_ONLY_MIGRATED';
 
   let cloudPushTimer = null;
   let cloudPollTimer = null;
   let cloudSyncInFlight = false;
+
+  function isCloudOnly() {
+    // Default ON for MMM JHS. Set window.ERP_CLOUD_ONLY = false only to re-enable hybrid.
+    return window.ERP_CLOUD_ONLY !== false;
+  }
 
   function getCloudSchoolId() {
     return String(localStorage.getItem(LS_SCHOOL_ID) || window.ERP_CLOUD_SCHOOL_ID || 'mmm-jhs').trim() || 'mmm-jhs';
@@ -416,6 +427,45 @@
     return data;
   }
 
+  function peekDormantLocalSchoolPayload() {
+    if (typeof window.peekLocalSchoolDataForCloudMigration === 'function') {
+      return window.peekLocalSchoolDataForCloudMigration();
+    }
+    try {
+      const raw = localStorage.getItem('MMM_SchoolData_v6');
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (parsed && Array.isArray(parsed.students) && parsed.students.length) return parsed;
+    } catch (e) {}
+    return null;
+  }
+
+  async function migrateLocalRosterToCloudOnce() {
+    if (localStorage.getItem(LS_MIGRATED_FLAG) === '1') {
+      return { ok: false, skipped: true, reason: 'already-migrated' };
+    }
+    const dormant = peekDormantLocalSchoolPayload();
+    if (!dormant || !Array.isArray(dormant.students) || !dormant.students.length) {
+      return { ok: false, skipped: true, reason: 'no-local' };
+    }
+    if (typeof applySchoolDataStoragePayload !== 'function') {
+      return { ok: false, error: 'ERP storage helpers missing.' };
+    }
+    const applied = applySchoolDataStoragePayload(dormant);
+    if (!applied) return { ok: false, error: 'Could not load local roster for migration.' };
+    const pushed = await pushSchoolDataToCloud({ skipMergePull: true, payload: dormant });
+    localStorage.setItem(LS_MIGRATED_FLAG, '1');
+    if (typeof window.clearLocalSchoolDataAuthorityStores === 'function') {
+      window.clearLocalSchoolDataAuthorityStores();
+    }
+    return {
+      ok: true,
+      migrated: true,
+      studentCount: pushed.studentCount || dormant.students.length,
+      savedAt: pushed.savedAt
+    };
+  }
+
   async function pullSchoolDataFromCloud(options) {
     const force = !!(options && options.force);
     if (cloudSyncInFlight) return { ok: false, skipped: true };
@@ -430,12 +480,43 @@
 
       const snapshot = data.snapshot;
       if (!snapshot || !snapshot.payload) {
+        if (isCloudOnly()) {
+          try {
+            const migrated = await migrateLocalRosterToCloudOnce();
+            if (migrated.migrated) {
+              refreshUiAfterCloudApply(options);
+              return {
+                ok: true,
+                configured: true,
+                applied: true,
+                migrated: true,
+                studentCount: migrated.studentCount,
+                message: 'Uploaded previous browser data to cloud (one-time). Cloud is now the source of truth.'
+              };
+            }
+          } catch (err) {
+            console.warn('Cloud-only local migrate failed:', err);
+          }
+        }
         return { ok: true, configured: true, empty: true, message: 'No cloud snapshot yet. Upload from phone/PC that has correct fees.' };
       }
 
       const localPayload = buildSchoolDataStoragePayload();
       const cloudPayload = snapshot.payload;
-      const merged = mergeSchoolPayloads(localPayload, cloudPayload, { remoteStudentsAuthoritative: true });
+      const cloudOnly = isCloudOnly();
+
+      // Cloud-only: replace memory with cloud. Do not union stale local students.
+      let merged;
+      if (cloudOnly) {
+        merged = {
+          ...cloudPayload,
+          cancelledReceipts: mergeCancelledReceipts(localPayload.cancelledReceipts, cloudPayload.cancelledReceipts),
+          savedAt: cloudPayload.savedAt || snapshot.saved_at || new Date().toISOString()
+        };
+        removeCancelledPayments(merged.students, merged.cancelledReceipts);
+      } else {
+        merged = mergeSchoolPayloads(localPayload, cloudPayload, { remoteStudentsAuthoritative: true });
+      }
 
       const localFees = countPayments(localPayload);
       const cloudFees = countPayments(cloudPayload);
@@ -447,8 +528,11 @@
       const cloudUpdatedSinceLastPull = cloudAt > lastKnownCloudAt;
       const cloudHasMoreFees = cloudFees.count > localFees.count || cloudFees.total > localFees.total;
       const localMissingFees = localFees.count === 0 && cloudFees.count > 0;
+      const memoryEmpty = !(localPayload.students || []).length;
 
       const shouldApply = force
+        || cloudOnly
+        || memoryEmpty
         || neverSyncedThisDevice
         || cloudUpdatedSinceLastPull
         || cloudAt > localAt
@@ -477,10 +561,13 @@
       const cloudStamp = snapshot.saved_at || cloudPayload.savedAt || new Date().toISOString();
       localStorage.setItem(LS_LAST_PULL, cloudStamp);
       localStorage.setItem(LS_LAST_CLOUD_AT, cloudStamp);
+      if (cloudOnly && typeof window.clearLocalSchoolDataAuthorityStores === 'function') {
+        window.clearLocalSchoolDataAuthorityStores();
+      }
       if (typeof saveSchoolDataToStorage === 'function') saveSchoolDataToStorage({ skipCloudPush: true });
 
-      // If this device had receipts cloud lacked (or vice versa), push merged truth back
-      if (payloadsDifferOnFees(merged, cloudPayload) || mergedFees.count > cloudFees.count) {
+      // Hybrid only: push merged fees back. Cloud-only never re-uploads local-only ghosts.
+      if (!cloudOnly && (payloadsDifferOnFees(merged, cloudPayload) || mergedFees.count > cloudFees.count)) {
         try {
           await pushSchoolDataToCloud({ skipMergePull: true, payload: merged });
         } catch (err) {
@@ -496,6 +583,7 @@
         ok: true,
         configured: true,
         applied: true,
+        cloudOnly,
         studentCount: (merged.students || []).length,
         savedAt: cloudStamp,
         localFees,
@@ -511,8 +599,12 @@
     if (typeof buildSchoolDataStoragePayload !== 'function') return { ok: false, error: 'ERP storage helpers missing.' };
     const schoolId = getCloudSchoolId();
     let payload = (options && options.payload) || buildSchoolDataStoragePayload();
+    const cloudOnly = isCloudOnly();
 
-    // Before overwrite, merge with current cloud so ₹0 PC cannot wipe ₹1900 phone
+    // Hybrid: merge with current cloud so ₹0 PC cannot wipe ₹1900 phone.
+    // Cloud-only: still soft-merge fees for admissions this device already has, so two
+    // open PCs do not clobber each other — but never resurrect students from cloud
+    // that this device deleted (localStudentsAuthoritative).
     if (!(options && options.skipMergePull)) {
       try {
         const remote = await fetchCloudSnapshot();
@@ -529,7 +621,6 @@
         console.warn('Cloud pre-push merge skipped:', err);
       }
     }
-
     const savedBy = (typeof getCurrentActiveUser === 'function' && getCurrentActiveUser()?.name) || 'ERP';
     const res = await fetchWithRetry(cloudPushUrl(), {
       method: 'POST',
@@ -544,6 +635,9 @@
     window._erpCloudLastPushAt = stamp;
     window._erpCloudLastPushCount = data.studentCount || (payload.students || []).length;
     window._erpCloudLastPushError = '';
+    if (cloudOnly && typeof window.clearLocalSchoolDataAuthorityStores === 'function') {
+      window.clearLocalSchoolDataAuthorityStores();
+    }
     return data;
   }
 
@@ -610,8 +704,12 @@
     wrapSaveSchoolDataToStorage();
     const cfg = await fetchCloudConfig();
     window._erpCloudServerConfig = cfg;
+    window._erpCloudOnly = isCloudOnly();
     if (!cfg.configured) {
       console.info('ERP cloud sync: server not configured yet (Supabase env on Render).');
+      if (isCloudOnly() && typeof showNotification === 'function') {
+        showNotification('Cloud ERP is required but server is not configured. Contact admin.', 'error');
+      }
       return { ok: false, configured: false };
     }
     if (cfg.requiresSecret && !getCloudSecret() && !cfg.siteTrusted) {
@@ -619,17 +717,33 @@
       return { ok: false, configured: true, error: 'Cloud secret not set in website config.' };
     }
     try {
-      // Always force-merge on startup so stale PC localStorage picks up phone fees
+      // Cloud-only: replace from Supabase. Hybrid: force-merge so stale PC picks up fees.
       const pull = await pullSchoolDataFromCloud({ silent: true, force: true });
       if (pull.applied && typeof showNotification === 'function') {
-        const feeNote = pull.mergedFees && pull.mergedFees.total
-          ? ` · fees ₹${Number(pull.mergedFees.total).toLocaleString('en-IN')}`
-          : '';
-        showNotification(`School data synced (${pull.studentCount} students${feeNote}).`, 'success');
+        if (pull.migrated) {
+          showNotification(`Moved ${pull.studentCount} students from this browser into cloud. Cloud is now the only copy.`, 'success');
+        } else {
+          const feeNote = pull.mergedFees && pull.mergedFees.total
+            ? ` · fees ₹${Number(pull.mergedFees.total).toLocaleString('en-IN')}`
+            : '';
+          const mode = isCloudOnly() ? 'Cloud ERP' : 'School data synced';
+          showNotification(`${mode} (${pull.studentCount} students${feeNote}).`, 'success');
+        }
+      } else if (pull.empty && isCloudOnly() && typeof showNotification === 'function') {
+        showNotification(pull.message || 'Cloud is empty. Add students — they will save to cloud only.', 'warning');
       }
     } catch (err) {
       console.warn('Initial cloud pull failed:', err);
       window._erpCloudLastPullError = err.message;
+      if (isCloudOnly()) {
+        const recovered = typeof window.loadEmergencyLocalSchoolCache === 'function'
+          && window.loadEmergencyLocalSchoolCache();
+        if (recovered && typeof showNotification === 'function') {
+          showNotification('Cloud unreachable — emergency local cache loaded. Reconnect soon; do not trust this copy long-term.', 'warning');
+        } else if (typeof showNotification === 'function') {
+          showNotification(`Cloud ERP failed to load: ${err.message}`, 'error');
+        }
+      }
     }
 
     clearInterval(cloudPollTimer);
@@ -645,18 +759,20 @@
       }
     });
 
-    return { ok: true, configured: true };
+    return { ok: true, configured: true, cloudOnly: isCloudOnly() };
   }
 
   function getCloudSyncStatusText() {
     const cfg = window._erpCloudServerConfig || {};
-    if (cfg.error) return `Cloud sync: ${cfg.error}`;
-    if (!cfg.configured) return 'Cloud sync: not configured on server (local only).';
+    const mode = isCloudOnly() ? 'Cloud-only (100%)' : 'Hybrid (local+cloud)';
+    if (cfg.error) return `${mode}: ${cfg.error}`;
+    if (!cfg.configured) return `${mode}: not configured on server.`;
     const push = window._erpCloudLastPushAt ? `Last upload: ${window._erpCloudLastPushAt}` : 'Not uploaded yet';
     const err = window._erpCloudLastPushError || window._erpCloudLastPullError;
-    return err ? `${push} | Error: ${err}` : `${push} · Auto-sync every 5s`;
+    return err ? `${mode} · ${push} | Error: ${err}` : `${mode} · ${push} · Auto-sync every 5s`;
   }
 
+  window.isErpCloudOnly = isCloudOnly;
   window.getCloudSchoolId = getCloudSchoolId;
   window.getCloudSecret = getCloudSecret;
   window.setCloudCredentials = setCloudCredentials;
@@ -669,4 +785,5 @@
   window.flushCloudPushNow = flushCloudPushNow;
   window.getCloudSyncStatusText = getCloudSyncStatusText;
   window.mergeSchoolPayloadsForCloud = mergeSchoolPayloads;
+  window.migrateLocalRosterToCloudOnce = migrateLocalRosterToCloudOnce;
 })();

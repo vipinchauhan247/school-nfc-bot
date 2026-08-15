@@ -1,8 +1,11 @@
-# Cloud-native ERP (safe) — @mmmjhschoolbot only
+# Cloud-native ERP — @mmmjhschoolbot only
 
 **Do not touch @Vipinbellbot / NFC.**
 
-## What this is now (Phase 2)
+> **Cloud-only (100%) is now the default.** See `CLOUD_ONLY.md`.
+> Browser localStorage is no longer the roster source of truth.
+
+## What this is now (Phase 2 + cloud-only)
 
 Supabase was already connected. Phase 2 makes the **database** hold real student and fee rows, not only one big snapshot.
 
@@ -12,7 +15,7 @@ Supabase was already connected. Phase 2 makes the **database** hold real student
 | `erp_students` | One row per admission (Chat ID, name, class) |
 | `erp_payments` | One row per receipt |
 | `erp_fee_sessions` | Due/paid months per student session |
-| Browser localStorage | Offline cache only — cloud wins on sync |
+| Browser localStorage | **Not used for students** when `ERP_CLOUD_ONLY` (printer/appearance only) |
 | Google Sheet | Still updated by `/link` (parents) |
 | Printer settings | Stay on each PC |
 
