@@ -40,6 +40,17 @@ Example:
 
 No new SQL required if Phase 2 tables are already live. Keep Render env + site origin trust as before.
 
+## Empty snapshot / “Cloud snapshot could not be applied”
+
+If `erp_snapshots.payload.students` is `[]` but `erp_students` still has ~824 rows:
+
+1. **Render first:** deploy updated `api/erp-cloud.js` (auto-rebuilds snapshot from native tables on pull; rejects empty uploads).
+2. **Vercel:** upload PR `#8` website files (`app.js`, `cloudSync.js`, `erp-cloud-config.js`) and bump `?v=`.
+3. Optional force rebuild:
+   `POST /api/mmmjhs-bot?action=rebuildSnapshot&schoolId=mmm-jhs` (with secret or from school site).
+
+Then reopen the website — roster should load ~824 students again.
+
 ## Faster open (display cache)
 
 After the first successful cloud load, the next open shows the **last cloud copy** instantly from IndexedDB (`cloudDisplay`), then refreshes from Supabase in the background. That cache is **never** uploaded as authority — cloud pull always wins.

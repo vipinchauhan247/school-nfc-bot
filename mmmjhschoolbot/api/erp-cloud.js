@@ -283,7 +283,7 @@ async function listNativePayments(schoolId) {
   const sid = encodeURIComponent(schoolId || schoolIdDefault());
   const rows = await supabaseRequest(
     'GET',
-    `erp_payments?school_id=eq.${sid}&select=admission_no,receipt_no,session_name,amount,paid_on,month,mode,cancelled,payload,updated_at&order=paid_on.asc`
+    `erp_payments?school_id=eq.${sid}&select=admission_no,receipt_no,session_name,amount,paid_on,month,mode,cancelled,payload,updated_at&order=paid_on.asc&limit=20000`
   );
   return Array.isArray(rows) ? rows : [];
 }
@@ -369,9 +369,185 @@ async function listNativeStudents(schoolId) {
   const sid = encodeURIComponent(schoolId || schoolIdDefault());
   const rows = await supabaseRequest(
     'GET',
-    `erp_students?school_id=eq.${sid}&select=admission_no,name,current_class,current_section,parent_name,parent_phone,nfc_uid,school_bot_chat_id,telegram_user_name,status,updated_at&order=admission_no.asc`
+    `erp_students?school_id=eq.${sid}&select=admission_no,name,current_class,current_section,parent_name,parent_phone,nfc_uid,school_bot_chat_id,telegram_user_name,status,payload,updated_at&order=admission_no.asc&limit=5000`
   );
   return Array.isArray(rows) ? rows : [];
+}
+
+async function listNativeFeeSessions(schoolId) {
+  const sid = encodeURIComponent(schoolId || schoolIdDefault());
+  const rows = await supabaseRequest(
+    'GET',
+    `erp_fee_sessions?school_id=eq.${sid}&select=admission_no,session_name,monthly_tuition,due_months,paid_months,wallet_balance,payload,updated_at&order=admission_no.asc&limit=10000`
+  );
+  return Array.isArray(rows) ? rows : [];
+}
+
+function studentFromNativeRow(row) {
+  const fromPayload = row?.payload && typeof row.payload === 'object' ? { ...row.payload } : {};
+  const admissionNo = normalizeAdmission(row?.admission_no || fromPayload.admissionNo || fromPayload.AdmissionNo);
+  if (!admissionNo) return null;
+  const chatId = String(fromPayload.telegramChatId || fromPayload.schoolBotChatId || row.school_bot_chat_id || '').trim();
+  const username = String(fromPayload.telegramUserName || row.telegram_user_name || '').trim();
+  const student = {
+    ...fromPayload,
+    admissionNo,
+    name: String(fromPayload.name || row.name || '').trim(),
+    currentClass: String(fromPayload.currentClass || fromPayload.class || row.current_class || '').trim(),
+    currentSection: String(fromPayload.currentSection || fromPayload.section || row.current_section || '').trim(),
+    parentName: String(fromPayload.parentName || row.parent_name || '').trim(),
+    parentPhone: String(fromPayload.parentPhone || fromPayload.phone || row.parent_phone || '').trim(),
+    phone: String(fromPayload.phone || fromPayload.parentPhone || row.parent_phone || '').trim(),
+    nfcUid: String(fromPayload.nfcUid || fromPayload.cardUid || row.nfc_uid || '').trim(),
+    cardUid: String(fromPayload.cardUid || fromPayload.nfcUid || row.nfc_uid || '').trim(),
+    status: String(fromPayload.status || row.status || '').trim(),
+    feeRecords: (fromPayload.feeRecords && typeof fromPayload.feeRecords === 'object') ? fromPayload.feeRecords : {}
+  };
+  if (chatId) {
+    student.telegramChatId = chatId;
+    student.schoolBotChatId = chatId;
+    student.SchoolBotChatId = chatId;
+  }
+  if (username) {
+    student.telegramUserName = username;
+    student.TelegramUserName = username;
+  }
+  return student;
+}
+
+function applyNativeFeeSessionsToPayload(payload, sessions) {
+  if (!payload || !Array.isArray(payload.students) || !Array.isArray(sessions) || !sessions.length) {
+    return payload;
+  }
+  const byAdmission = new Map();
+  payload.students.forEach((student) => {
+    const key = normalizeAdmission(student.admissionNo || student.AdmissionNo).toLowerCase();
+    if (key) byAdmission.set(key, student);
+  });
+  sessions.forEach((row) => {
+    const student = byAdmission.get(String(row.admission_no || '').trim().toLowerCase());
+    if (!student) return;
+    if (!student.feeRecords || typeof student.feeRecords !== 'object') student.feeRecords = {};
+    const sessionName = String(row.session_name || 'current');
+    const fromPayload = row.payload && typeof row.payload === 'object' ? row.payload : {};
+    const prev = student.feeRecords[sessionName] && typeof student.feeRecords[sessionName] === 'object'
+      ? student.feeRecords[sessionName]
+      : {};
+    student.feeRecords[sessionName] = {
+      ...fromPayload,
+      ...prev,
+      session: sessionName,
+      monthlyTuition: Number(prev.monthlyTuition || fromPayload.monthlyTuition || row.monthly_tuition || 0),
+      dueMonths: Array.isArray(prev.dueMonths) ? prev.dueMonths
+        : (Array.isArray(fromPayload.dueMonths) ? fromPayload.dueMonths
+          : (Array.isArray(row.due_months) ? row.due_months : [])),
+      paidMonths: Array.isArray(prev.paidMonths) ? prev.paidMonths
+        : (Array.isArray(fromPayload.paidMonths) ? fromPayload.paidMonths
+          : (Array.isArray(row.paid_months) ? row.paid_months : [])),
+      walletBalance: Math.max(
+        Number(prev.walletBalance || 0),
+        Number(fromPayload.walletBalance || 0),
+        Number(row.wallet_balance || 0)
+      ),
+      payments: Array.isArray(prev.payments) ? prev.payments
+        : (Array.isArray(fromPayload.payments) ? fromPayload.payments : [])
+    };
+  });
+  return payload;
+}
+
+async function rebuildPayloadFromNative(schoolId, basePayload) {
+  const nativeRows = await listNativeStudents(schoolId);
+  const students = [];
+  nativeRows.forEach((row) => {
+    const student = studentFromNativeRow(row);
+    if (student) students.push(student);
+  });
+  if (!students.length) {
+    return {
+      ok: false,
+      studentCount: 0,
+      payload: null,
+      message: 'Native erp_students table is empty; cannot rebuild snapshot.'
+    };
+  }
+
+  let payload = {
+    version: (basePayload && basePayload.version) || '2.1',
+    savedAt: new Date().toISOString(),
+    activeSession: (basePayload && basePayload.activeSession) || '2026-27',
+    classes: (basePayload && basePayload.classes) || [],
+    students,
+    classFeeMaster: (basePayload && basePayload.classFeeMaster) || {},
+    feeScheduleRules: (basePayload && basePayload.feeScheduleRules) || {},
+    weightageRules: (basePayload && basePayload.weightageRules) || {},
+    userPermissions: (basePayload && basePayload.userPermissions) || {},
+    signatures: (basePayload && basePayload.signatures) || {},
+    sessions: (basePayload && basePayload.sessions) || {},
+    teachers: (basePayload && basePayload.teachers) || [],
+    subjects: (basePayload && basePayload.subjects) || {},
+    staffUsers: (basePayload && basePayload.staffUsers) || [],
+    examSubjectConfigs: (basePayload && basePayload.examSubjectConfigs) || {},
+    schoolProfile: (basePayload && basePayload.schoolProfile) || {},
+    periodSettings: (basePayload && basePayload.periodSettings) || {},
+    telegramLogs: (basePayload && basePayload.telegramLogs) || [],
+    cancelledReceipts: (basePayload && basePayload.cancelledReceipts) || [],
+    printSettings: (basePayload && basePayload.printSettings) || {},
+    rebuiltFromNative: true
+  };
+
+  try {
+    const sessions = await listNativeFeeSessions(schoolId);
+    payload = applyNativeFeeSessionsToPayload(payload, sessions);
+  } catch (err) {
+    console.error('[ERP-CLOUD] fee session rebuild overlay failed:', err.message);
+  }
+  try {
+    const payments = await listNativePayments(schoolId);
+    payload = applyNativePaymentsToPayload(payload, payments);
+  } catch (err) {
+    console.error('[ERP-CLOUD] payment rebuild overlay failed:', err.message);
+  }
+
+  return { ok: true, studentCount: students.length, payload };
+}
+
+function snapshotStudentCount(snapshot) {
+  const students = snapshot?.payload?.students;
+  return Array.isArray(students) ? students.length : 0;
+}
+
+async function ensureSnapshotHasStudents(schoolId) {
+  const snapshot = await readSnapshot(schoolId);
+  const count = snapshotStudentCount(snapshot);
+  if (count > 0) {
+    return { snapshot, rebuilt: false, studentCount: count };
+  }
+
+  const rebuilt = await rebuildPayloadFromNative(schoolId, snapshot?.payload || {});
+  if (!rebuilt.ok || !rebuilt.payload) {
+    return {
+      snapshot: snapshot || null,
+      rebuilt: false,
+      studentCount: 0,
+      error: rebuilt.message || 'Native rebuild failed.'
+    };
+  }
+
+  const written = await writeSnapshot(schoolId, rebuilt.payload, 'native-rebuild');
+  const saved = written?.snapshot || {
+    school_id: schoolId,
+    payload: rebuilt.payload,
+    saved_at: rebuilt.payload.savedAt,
+    saved_by: 'native-rebuild',
+    version: rebuilt.payload.version
+  };
+  if (!saved.payload) saved.payload = rebuilt.payload;
+  return {
+    snapshot: saved,
+    rebuilt: true,
+    studentCount: rebuilt.studentCount
+  };
 }
 
 async function readSnapshot(schoolId) {
@@ -462,7 +638,7 @@ async function route(req, res, action) {
     await handleCloudConfig(req, res);
     return true;
   }
-  if (['cloudPull', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments'].includes(act)) {
+  if (['cloudPull', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments', 'rebuildSnapshot'].includes(act)) {
     await erpCloudHandler(req, res);
     return true;
   }
@@ -529,9 +705,34 @@ async function erpCloudHandler(req, res) {
       });
     }
 
+    if ((req.method === 'POST' || req.method === 'GET') && action === 'rebuildSnapshot') {
+      const ensured = await ensureSnapshotHasStudents(schoolId);
+      if (!ensured.studentCount) {
+        return json(res, 200, {
+          ok: false,
+          configured: true,
+          schoolId,
+          error: ensured.error || 'No students in snapshot or native tables.',
+          studentCount: 0
+        });
+      }
+      return json(res, 200, {
+        ok: true,
+        configured: true,
+        schoolId,
+        rebuilt: !!ensured.rebuilt,
+        studentCount: ensured.studentCount,
+        snapshot: ensured.snapshot,
+        native: true,
+        feesNative: true
+      });
+    }
+
     if (req.method === 'GET') {
-      const snapshot = await readSnapshot(schoolId);
-      if (snapshot && snapshot.payload) {
+      // Auto-heal empty snapshot from native erp_students (824) + fees
+      const ensured = await ensureSnapshotHasStudents(schoolId);
+      let snapshot = ensured.snapshot;
+      if (snapshot && snapshot.payload && snapshotStudentCount(snapshot) > 0) {
         try {
           const payments = await listNativePayments(schoolId);
           snapshot.payload = applyNativePaymentsToPayload(snapshot.payload, payments);
@@ -544,8 +745,11 @@ async function erpCloudHandler(req, res) {
         configured: true,
         schoolId,
         snapshot: snapshot || null,
+        rebuiltFromNative: !!ensured.rebuilt,
+        studentCount: ensured.studentCount || snapshotStudentCount(snapshot),
         native: true,
-        feesNative: true
+        feesNative: true,
+        error: ensured.error || undefined
       });
     }
 
@@ -557,6 +761,17 @@ async function erpCloudHandler(req, res) {
       }
       if (!Array.isArray(payload.students)) {
         return json(res, 400, { ok: false, error: 'payload.students array is required.' });
+      }
+      // Never allow an empty browser upload to wipe a healthy native roster
+      if (payload.students.length === 0) {
+        const nativeCount = (await listNativeStudents(schoolId)).length;
+        if (nativeCount > 0) {
+          return json(res, 409, {
+            ok: false,
+            error: `Refusing empty roster upload: native tables still have ${nativeCount} students. Open the site after rebuildSnapshot.`,
+            nativeStudentCount: nativeCount
+          });
+        }
       }
       const savedBy = String(body.savedBy || '').trim();
       const written = await writeSnapshot(schoolId, payload, savedBy);

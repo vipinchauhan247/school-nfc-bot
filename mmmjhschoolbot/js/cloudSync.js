@@ -482,6 +482,22 @@
     };
   }
 
+  function cloudRebuildUrl() {
+    const schoolId = getCloudSchoolId();
+    return withCloudSecret(`${getErpCloudApiBase()}?action=rebuildSnapshot&schoolId=${encodeURIComponent(schoolId)}`);
+  }
+
+  async function rebuildCloudSnapshotFromNative() {
+    const res = await fetchWithRetry(cloudRebuildUrl(), {
+      method: 'POST',
+      headers: { ...cloudHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ schoolId: getCloudSchoolId() })
+    });
+    const data = await parseCloudResponse(res);
+    if (!data.ok) throw new Error(data.error || 'Native snapshot rebuild failed.');
+    return data;
+  }
+
   async function pullSchoolDataFromCloud(options) {
     const force = !!(options && options.force);
     if (cloudSyncInFlight) return { ok: false, skipped: true };
@@ -491,11 +507,28 @@
 
     cloudSyncInFlight = true;
     try {
-      const data = await fetchCloudSnapshot();
+      let data = await fetchCloudSnapshot();
       if (!data.configured) return data;
 
-      const snapshot = data.snapshot;
-      if (!snapshot || !snapshot.payload) {
+      let snapshot = data.snapshot;
+      let cloudPayload = snapshot && snapshot.payload;
+      const snapshotCount = Array.isArray(cloudPayload?.students) ? cloudPayload.students.length : 0;
+
+      // Empty snapshot while native tables still have students → rebuild once
+      if (!snapshot || !cloudPayload || snapshotCount === 0) {
+        try {
+          const rebuilt = await rebuildCloudSnapshotFromNative();
+          if (rebuilt.snapshot && Array.isArray(rebuilt.snapshot.payload?.students) && rebuilt.snapshot.payload.students.length) {
+            snapshot = rebuilt.snapshot;
+            cloudPayload = snapshot.payload;
+            data = { ...data, ...rebuilt, rebuiltFromNative: true };
+          }
+        } catch (err) {
+          console.warn('Native rebuild attempt failed:', err);
+        }
+      }
+
+      if (!snapshot || !cloudPayload) {
         if (isCloudOnly()) {
           try {
             const migrated = await migrateLocalRosterToCloudOnce();
@@ -526,8 +559,11 @@
         return { ok: true, configured: true, empty: true, message: 'No cloud snapshot yet. Upload from phone/PC that has correct fees.' };
       }
 
+      if (!Array.isArray(cloudPayload.students) || cloudPayload.students.length === 0) {
+        throw new Error('Cloud snapshot has 0 students while native tables may still hold the roster. Deploy updated api/erp-cloud.js to Render and open Backup → Download from Cloud, or call rebuildSnapshot.');
+      }
+
       const localPayload = buildSchoolDataStoragePayload();
-      const cloudPayload = snapshot.payload;
       const cloudOnly = isCloudOnly();
       const memoryDirty = !!window._erpCloudMemoryDirty;
 
@@ -632,6 +668,7 @@
         configured: true,
         applied: true,
         cloudOnly,
+        rebuiltFromNative: !!data.rebuiltFromNative,
         studentCount: (merged.students || []).length,
         savedAt: cloudStamp,
         localFees,
@@ -649,6 +686,10 @@
     let payload = (options && options.payload) || buildSchoolDataStoragePayload();
     const cloudOnly = isCloudOnly();
 
+    if (!Array.isArray(payload.students) || payload.students.length === 0) {
+      throw new Error('Refusing to upload an empty student roster to cloud.');
+    }
+
     // Hybrid: merge with current cloud so ₹0 PC cannot wipe ₹1900 phone.
     // Cloud-only: still soft-merge fees for admissions this device already has, so two
     // open PCs do not clobber each other — but never resurrect students from cloud
@@ -657,11 +698,19 @@
       try {
         const remote = await fetchCloudSnapshot();
         if (remote.configured && remote.snapshot && remote.snapshot.payload) {
-          payload = mergeSchoolPayloads(payload, remote.snapshot.payload, { localStudentsAuthoritative: true });
-          if (typeof applySchoolDataStoragePayload === 'function') {
-            applySchoolDataStoragePayload(payload);
-            if (typeof saveSchoolDataToStorage === 'function') {
-              saveSchoolDataToStorage({ skipCloudPush: true });
+          const remoteCount = Array.isArray(remote.snapshot.payload.students)
+            ? remote.snapshot.payload.students.length
+            : 0;
+          // Never merge/push when cloud already looks empty — rebuild first
+          if (remoteCount === 0 && payload.students.length > 0) {
+            // keep local payload as-is
+          } else {
+            payload = mergeSchoolPayloads(payload, remote.snapshot.payload, { localStudentsAuthoritative: true });
+            if (typeof applySchoolDataStoragePayload === 'function') {
+              applySchoolDataStoragePayload(payload);
+              if (typeof saveSchoolDataToStorage === 'function') {
+                saveSchoolDataToStorage({ skipCloudPush: true });
+              }
             }
           }
         }
@@ -877,6 +926,7 @@
   window.mergeSchoolPayloadsForCloud = mergeSchoolPayloads;
   window.migrateLocalRosterToCloudOnce = migrateLocalRosterToCloudOnce;
   window.startCloudPrefetch = startCloudPrefetch;
+  window.rebuildCloudSnapshotFromNative = rebuildCloudSnapshotFromNative;
 
   // Start download immediately — do not wait for DOMContentLoaded
   try { startCloudPrefetch(); } catch (e) {}
