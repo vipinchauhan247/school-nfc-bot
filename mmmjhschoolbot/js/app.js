@@ -1529,18 +1529,21 @@ function setCloudLoadingOverlay(show, message) {
 window.setCloudLoadingOverlay = setCloudLoadingOverlay;
 
 async function initApp() {
-  // Cloud-only: do NOT treat localStorage as authority. Use a display-cache for instant
-  // paint, then replace from Supabase. Printer + appearance stay on their own local keys.
+  // Cloud-only: do NOT treat localStorage as authority. Strip mockData seed immediately
+  // so demo staff/students never flash before Supabase loads.
   if (isErpCloudOnly()) {
     window._erpCloudPushDisabled = true;
     window._erpCloudBootReady = false;
     mergeLocalCancelledReceiptsFromTinyStore();
-    SchoolData.students = [];
+    stripMockRosterForCloudBoot();
     setCloudLoadingOverlay(true, 'Loading school data from cloud…');
     try {
       const cached = await loadCloudDisplayCache();
-      if (cached && Array.isArray(cached.students) && cached.students.length) {
-        applySchoolDataStoragePayload(cached);
+      if (cached && (
+        (Array.isArray(cached.students) && cached.students.length) ||
+        (Array.isArray(cached.staffUsers) && cached.staffUsers.length)
+      )) {
+        applySchoolDataStoragePayload(cached, { allowEmpty: true });
         setCloudLoadingOverlay(true, 'Updating from cloud…');
       }
     } catch (err) {
@@ -1573,13 +1576,12 @@ async function initApp() {
   setupGlobalHardwareScannerDriver();
   setupEsp8266HardwarePoller();
 
-  handleRouting();
   window.addEventListener('hashchange', handleRouting);
 
+  // Cloud-only: wait for Supabase BEFORE first paint of users/students
   if (typeof initCloudSync === 'function') {
     try {
       await initCloudSync();
-      if (isErpCloudOnly()) handleRouting();
     } catch (err) {
       console.warn('Cloud sync init:', err);
     } finally {
@@ -1592,6 +1594,19 @@ async function initApp() {
       showNotification('Cloud sync file missing. Re-upload js/cloudSync.js (not a copy of app.js) or staff/student edits will not save.', 'error');
     }
   }
+
+  handleRouting();
+}
+
+function stripMockRosterForCloudBoot() {
+  // mockData.js seeds demo staff/teachers/students before app.js runs.
+  // Clear them so they cannot appear as real school data.
+  SchoolData.students = [];
+  SchoolData.staffUsers = [];
+  SchoolData.teachers = Array.isArray(SchoolData.teachers) ? [] : [];
+  SchoolData.cancelledReceipts = Array.isArray(SchoolData.cancelledReceipts)
+    ? SchoolData.cancelledReceipts
+    : [];
 }
 
 function handleRouting() {
@@ -5787,7 +5802,18 @@ function applySchoolDataStoragePayload(parsed, options) {
   if (parsed.sessions) SchoolData.sessions = parsed.sessions;
   if (Array.isArray(parsed.teachers) || parsed.teachers) SchoolData.teachers = parsed.teachers || [];
   if (parsed.subjects) SchoolData.subjects = parsed.subjects;
-  if (Array.isArray(parsed.staffUsers)) SchoolData.staffUsers = parsed.staffUsers;
+  if (Array.isArray(parsed.staffUsers)) {
+    const prevByKey = new Map(
+      (SchoolData.staffUsers || []).map((u) => [String(u.username || u.id || '').toLowerCase(), u])
+    );
+    SchoolData.staffUsers = parsed.staffUsers.map((u) => {
+      const key = String(u.username || u.id || '').toLowerCase();
+      const prev = prevByKey.get(key);
+      // Never blank an existing password just because cloud row omitted it
+      if (prev && prev.password && !u.password) return { ...u, password: prev.password };
+      return u;
+    });
+  }
   if (parsed.examSubjectConfigs) SchoolData.examSubjectConfigs = parsed.examSubjectConfigs;
   if (parsed.schoolProfile) {
     const prev = SchoolData.schoolProfile || {};
@@ -5904,8 +5930,11 @@ async function hydrateSchoolDataFromIndexedDb() {
 
 /** Fast paint only — never treated as authority; cloud pull always replaces. */
 function saveCloudDisplayCache(payload) {
-  if (!payload || !Array.isArray(payload.students)) return Promise.resolve(false);
-  if (!payload.students.length) return clearCloudDisplayCache();
+  if (!payload || typeof payload !== 'object') return Promise.resolve(false);
+  const hasStudents = Array.isArray(payload.students) && payload.students.length > 0;
+  const hasStaff = Array.isArray(payload.staffUsers) && payload.staffUsers.length > 0;
+  // Keep staff-only cache after student wipe so mockData does not flash on next open
+  if (!hasStudents && !hasStaff) return clearCloudDisplayCache();
   const record = {
     savedAt: payload.savedAt || new Date().toISOString(),
     source: 'cloud',
@@ -5940,8 +5969,11 @@ function loadCloudDisplayCache() {
     const req = tx.objectStore(ERP_IDB_STORE).get(ERP_IDB_DISPLAY_KEY);
     req.onsuccess = () => {
       const row = req.result;
-      if (row && row.payload && Array.isArray(row.payload.students) && row.payload.students.length) {
-        resolve(row.payload);
+      if (row && row.payload && typeof row.payload === 'object') {
+        const p = row.payload;
+        const hasStudents = Array.isArray(p.students) && p.students.length;
+        const hasStaff = Array.isArray(p.staffUsers) && p.staffUsers.length;
+        resolve(hasStudents || hasStaff ? p : null);
       } else if (row && Array.isArray(row.students) && row.students.length) {
         resolve(row);
       } else {

@@ -504,16 +504,20 @@
       students: [],
       savedAt: (cloudPayload && cloudPayload.savedAt) || (snapshot && snapshot.saved_at) || new Date().toISOString()
     };
+    // Always apply staff/teachers from cloud even when students are empty
+    if (!Array.isArray(payload.staffUsers)) payload.staffUsers = [];
+    if (!Array.isArray(payload.teachers)) payload.teachers = [];
     const applied = applySchoolDataStoragePayload(payload, { allowEmpty: true });
     if (!applied) {
       SchoolData.students = [];
+      if (Array.isArray(payload.staffUsers)) SchoolData.staffUsers = payload.staffUsers;
+      if (Array.isArray(payload.teachers)) SchoolData.teachers = payload.teachers;
     }
     if (typeof window.clearLocalSchoolDataAuthorityStores === 'function') {
       window.clearLocalSchoolDataAuthorityStores();
     }
-    // Do not keep a stale display cache of deleted students
     if (typeof window.saveCloudDisplayCache === 'function') {
-      try { window.saveCloudDisplayCache({ ...payload, students: [] }); } catch (e) {}
+      try { window.saveCloudDisplayCache(payload); } catch (e) {}
     }
     window._erpCloudBootReady = true;
     window._erpCloudPushDisabled = false;
@@ -527,6 +531,7 @@
       applied: true,
       empty: true,
       studentCount: 0,
+      staffCount: (payload.staffUsers || []).length,
       message: 'Cloud roster is empty — ready for a fresh student upload.'
     };
   }
@@ -887,14 +892,16 @@
     }
 
     clearInterval(cloudPollTimer);
-    // Live poll ~every 5s so PC1 / PC2 / laptop see new receipts without manual Download
+    // Live poll ~every 5s — skip while this device has unsaved edits (prevents wiping a new teacher)
     cloudPollTimer = setInterval(() => {
+      if (window._erpCloudMemoryDirty) return;
       pullSchoolDataFromCloud({ silent: true }).catch(() => {});
     }, 5000);
 
     // Also sync when tab becomes visible again
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
+        if (window._erpCloudMemoryDirty) return;
         pullSchoolDataFromCloud({ silent: true }).catch(() => {});
       }
     });
