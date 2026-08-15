@@ -2432,7 +2432,7 @@ function getSubjectsForClass(className) {
 
   if (SchoolData.subjects && Array.isArray(SchoolData.subjects)) {
     SchoolData.subjects.forEach(s => {
-      if (s.code && (s.class === className || s.class === 'ALL CLASSES' || s.class === 'ALL' || !s.class)) {
+      if (s.code && subjectAppliesToClass(s, className)) {
         const code = s.code.toUpperCase();
         if (!addedCodes.has(code)) {
           addedCodes.add(code);
@@ -4175,34 +4175,123 @@ function isUniversalSubjectClass(cls) {
   return !c || c === 'ALL' || c === 'ALL CLASSES';
 }
 
+/** Resolve which classes a subject applies to (supports All / multi-select / legacy single). */
+function getSubjectAppliesToClasses(sub) {
+  if (!sub) return ['ALL CLASSES'];
+  if (Array.isArray(sub.classes) && sub.classes.length) {
+    const cleaned = sub.classes.map((c) => String(c || '').trim()).filter(Boolean);
+    if (!cleaned.length || cleaned.some((c) => isUniversalSubjectClass(c))) return ['ALL CLASSES'];
+    return Array.from(new Set(cleaned));
+  }
+  const legacy = String(sub.class || '').trim();
+  if (!legacy || isUniversalSubjectClass(legacy)) return ['ALL CLASSES'];
+  if (legacy.includes(',')) {
+    return Array.from(new Set(legacy.split(',').map((s) => s.trim()).filter(Boolean)));
+  }
+  return [legacy];
+}
+
+function subjectAppliesToClass(sub, className) {
+  const want = String(className || '').trim().toLowerCase();
+  if (!want) return true;
+  const classes = getSubjectAppliesToClasses(sub);
+  if (classes.some((c) => isUniversalSubjectClass(c))) return true;
+  return classes.some((c) => String(c).trim().toLowerCase() === want);
+}
+
+function isSubjectUniversal(sub) {
+  return getSubjectAppliesToClasses(sub).some((c) => isUniversalSubjectClass(c));
+}
+
+function applySubjectClassScope(sub, mode, selectedClasses) {
+  if (!sub) return;
+  if (mode === 'all') {
+    sub.class = 'ALL CLASSES';
+    sub.classes = ['ALL CLASSES'];
+    return;
+  }
+  const list = Array.from(new Set((selectedClasses || []).map((c) => String(c || '').trim()).filter(Boolean)));
+  sub.classes = list;
+  if (list.length === 0) {
+    sub.class = 'ALL CLASSES';
+    sub.classes = ['ALL CLASSES'];
+  } else if (list.length === 1) {
+    sub.class = list[0];
+  } else {
+    sub.class = list.join(', ');
+  }
+}
+
 function getSubjectClassLabel(sub) {
-  return isUniversalSubjectClass(sub?.class) ? 'All Classes' : String(sub?.class || '').trim();
+  if (isSubjectUniversal(sub)) return 'All Classes';
+  return getSubjectAppliesToClasses(sub).join(', ');
 }
 
 function getSubjectClassBadgeHtml(sub) {
-  if (isUniversalSubjectClass(sub?.class)) {
-    return '<span class="badge badge-success" title="Appears in every class exams &amp; timetable">All Classes</span>';
+  if (isSubjectUniversal(sub)) {
+    return '<span class="badge badge-success" title="Appears in every class">All Classes</span>';
   }
-  return `<span class="badge badge-purple">${escapeHtml(String(sub?.class || ''))}</span>`;
+  const classes = getSubjectAppliesToClasses(sub);
+  if (classes.length <= 2) {
+    return classes.map((c) => `<span class="badge badge-purple" style="margin:2px;">${escapeHtml(c)}</span>`).join(' ');
+  }
+  return `<span class="badge badge-purple" title="${escapeHtml(classes.join(', '))}">${classes.length} classes</span>`;
 }
 
-/** One-click: Class 5-only English/Maths/etc. → All Classes (no re-add per class). */
-function promoteAllSubjectsToAllClasses() {
-  const locked = (SchoolData.subjects || []).filter((s) => !isUniversalSubjectClass(s.class));
-  if (!locked.length) {
-    showNotification('All subjects already apply to All Classes.', 'info');
-    return;
-  }
-  const ok = window.confirm(
-    `Convert ${locked.length} subject(s) to ALL CLASSES?\n\n` +
-    'Example: English once covers Class 1–8. You do not need to add English again for each class.\n\n' +
-    'Marks are still entered only in Exams & Report Cards — not here.'
+function getSubjectClassPickerHtml(sub) {
+  const schoolClasses = getSchoolClassNames();
+  const universal = !sub || isSubjectUniversal(sub);
+  const selected = new Set(
+    universal ? [] : getSubjectAppliesToClasses(sub).map((c) => String(c).trim().toLowerCase())
   );
-  if (!ok) return;
-  locked.forEach((s) => { s.class = 'ALL CLASSES'; });
-  saveSchoolDataToStorage();
-  showNotification(`Updated ${locked.length} subject(s) to All Classes.`, 'success');
-  renderSubjectsPage(document.getElementById('contentBody'));
+  const checks = schoolClasses.map((cls) => {
+    const checked = selected.has(String(cls).trim().toLowerCase()) ? 'checked' : '';
+    return `
+      <label style="display:inline-flex; align-items:center; gap:6px; padding:6px 10px; background:#1e293b; border-radius:8px; border:1px solid #334155; cursor:pointer; font-size:0.8rem;">
+        <input type="checkbox" class="sub-class-check" value="${escapeHtml(cls)}" ${checked} ${universal ? 'disabled' : ''}>
+        ${escapeHtml(cls)}
+      </label>`;
+  }).join('');
+
+  return `
+    <div>
+      <label style="font-size:0.8rem; font-weight:600;">Applies To *</label>
+      <div style="display:flex; flex-direction:column; gap:8px; margin-top:6px;">
+        <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.88rem;">
+          <input type="radio" name="subClassMode" value="all" ${universal ? 'checked' : ''} onchange="toggleSubjectClassModeUi()">
+          <strong>All Classes</strong> <span style="color:#94a3b8;">(English, Maths, …)</span>
+        </label>
+        <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.88rem;">
+          <input type="radio" name="subClassMode" value="selected" ${universal ? '' : 'checked'} onchange="toggleSubjectClassModeUi()">
+          <strong>Selected classes only</strong> <span style="color:#94a3b8;">(e.g. Computer for Class 5–8)</span>
+        </label>
+        <div id="subClassChecks" style="display:${universal ? 'none' : 'flex'}; flex-wrap:wrap; gap:8px; padding:10px; background:#0f172a; border-radius:10px; border:1px solid #334155;">
+          ${checks}
+        </div>
+      </div>
+      <p style="font-size:0.75rem; color:#94a3b8; margin:8px 0 0 0;">
+        Not every subject is for every class — pick All Classes or tick only the classes that teach it. One row is enough; no re-adding per class.
+      </p>
+    </div>
+  `;
+}
+
+function toggleSubjectClassModeUi() {
+  const mode = document.querySelector('input[name="subClassMode"]:checked')?.value || 'all';
+  const box = document.getElementById('subClassChecks');
+  if (!box) return;
+  const selected = mode === 'selected';
+  box.style.display = selected ? 'flex' : 'none';
+  box.querySelectorAll('.sub-class-check').forEach((el) => {
+    el.disabled = !selected;
+  });
+}
+
+function readSubjectClassScopeFromForm() {
+  const mode = document.querySelector('input[name="subClassMode"]:checked')?.value || 'all';
+  if (mode === 'all') return { mode: 'all', classes: ['ALL CLASSES'] };
+  const classes = Array.from(document.querySelectorAll('.sub-class-check:checked')).map((el) => el.value);
+  return { mode: 'selected', classes };
 }
 
 /** Dropdown: only Teacher-role ERP users (no free-text / demo names). */
@@ -4245,9 +4334,9 @@ function applyTeacherMappingsToSubjectsDirectory(teacher, mappings) {
     const key = `${codeKey}|${String(sub.class || '').trim().toLowerCase()}`;
     const wasThisTeacher =
       String(sub.teacher || '').trim().toLowerCase() === teacherName.toLowerCase();
-    const matched = isUniversalSubjectClass(sub.class)
+    const matched = isSubjectUniversal(sub)
       ? mappedCodes.has(codeKey)
-      : mapKeys.has(key);
+      : getSubjectAppliesToClasses(sub).some((cls) => mapKeys.has(`${codeKey}|${String(cls).trim().toLowerCase()}`));
     if (matched) {
       if (String(sub.teacher || '').trim() !== teacherName) {
         sub.teacher = teacherName;
@@ -9547,20 +9636,14 @@ function renderSubjectsPage(container) {
   }
   const subjects = SchoolData.subjects || [];
   const teacherUsers = getTeacherRoleUsersForSubjectAssign();
-  const classLockedCount = subjects.filter((s) => !isUniversalSubjectClass(s.class)).length;
 
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-book-open" style="color:var(--accent-primary)"></i> Subjects Directory</h2>
-        <p class="page-subtitle">Add English / Maths once with <strong>All Classes</strong> — no need to repeat for each class. Marks are entered in <strong>Exams &amp; Report Cards</strong>, not here.</p>
+        <p class="page-subtitle">Per subject: <strong>All Classes</strong> or <strong>selected classes only</strong>. No need to re-add the same subject for each class. Marks stay in <strong>Exams &amp; Report Cards</strong>.</p>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
-        ${classLockedCount > 0 ? `
-          <button class="btn btn-secondary" onclick="promoteAllSubjectsToAllClasses()" title="Convert Class-only rows to All Classes">
-            <i class="fa-solid fa-layer-group"></i> Convert ${classLockedCount} to All Classes
-          </button>
-        ` : ''}
         <button class="btn btn-secondary" onclick="window.location.hash='exams-entry'"><i class="fa-solid fa-table-cells"></i> Open Exams &amp; Marks</button>
         <button class="btn btn-primary" onclick="openCreateSubjectModal()"><i class="fa-solid fa-plus"></i> Add New Subject</button>
       </div>
@@ -9605,7 +9688,7 @@ function renderSubjectsPage(container) {
                 </td>
               </tr>
             `).join('') : `
-              <tr><td colspan="7" style="text-align:center; color:var(--text-muted); padding:24px;">No subjects yet. Add English once with All Classes.</td></tr>
+              <tr><td colspan="7" style="text-align:center; color:var(--text-muted); padding:24px;">No subjects yet. Add a subject and choose All Classes or selected classes.</td></tr>
             `}
           </tbody>
         </table>
@@ -9620,7 +9703,7 @@ function openCreateSubjectModal() {
 
   const modalHtml = `
     <div class="modal-overlay active" id="subjectModal" style="z-index:99999;">
-      <div class="modal-box" style="max-width:550px;">
+      <div class="modal-box" style="max-width:580px;">
         <div class="modal-header">
           <h3><i class="fa-solid fa-book-medical"></i> Add New Subject</h3>
           <button class="close-modal-btn" onclick="document.getElementById('subjectModal').remove()"><i class="fa-solid fa-xmark"></i></button>
@@ -9633,17 +9716,9 @@ function openCreateSubjectModal() {
             </div>
             <div>
               <label style="font-size:0.8rem; font-weight:600;">Subject Code *</label>
-              <input type="text" id="subCode" class="session-dropdown" placeholder="e.g. ENG (same code for all classes)">
+              <input type="text" id="subCode" class="session-dropdown" placeholder="e.g. ENG">
             </div>
-            <div>
-              <label style="font-size:0.8rem; font-weight:600;">Applies To *</label>
-              <select id="subClass" class="session-dropdown" style="font-weight:700;">
-                ${getClassSelectOptionsHtml('ALL CLASSES', { includeUniversal: true })}
-              </select>
-              <p style="font-size:0.75rem; color:#94a3b8; margin:6px 0 0 0;">
-                Choose <strong>ALL CLASSES</strong> for English/Maths/etc. so you add the subject once. Use a single class only for rare class-specific subjects.
-              </p>
-            </div>
+            ${getSubjectClassPickerHtml(null)}
             <div>
               <label style="font-size:0.8rem; font-weight:600;">Weekly Periods Count (For Timetable) *</label>
               <input type="number" id="subPeriods" class="session-dropdown" value="5">
@@ -9678,18 +9753,23 @@ function openCreateSubjectModal() {
     </div>
   `;
   document.body.insertAdjacentHTML('beforeend', modalHtml);
+  toggleSubjectClassModeUi();
 }
 
 function saveNewSubject() {
   const name = document.getElementById('subName').value.trim();
   const code = document.getElementById('subCode').value.trim();
-  const cls = document.getElementById('subClass').value;
   const periods = parseInt(document.getElementById('subPeriods').value) || 5;
   const cat = document.getElementById('subCategory').value;
   const teacherRaw = document.getElementById('subTeacher')?.value?.trim() || '';
+  const scope = readSubjectClassScopeFromForm();
 
   if (!name || !code) {
     showNotification('Warning: Subject Name and Code are required!', 'error');
+    return;
+  }
+  if (scope.mode === 'selected' && !scope.classes.length) {
+    showNotification('Tick at least one class, or choose All Classes.', 'error');
     return;
   }
   if (teacherRaw && !isSubjectTeacherAUser(teacherRaw)) {
@@ -9701,11 +9781,11 @@ function saveNewSubject() {
     id: "sub_" + Date.now(),
     code: code,
     name: name,
-    class: cls,
     teacher: teacherRaw || 'Unassigned',
     periodsPerWeek: periods,
     category: cat
   };
+  applySubjectClassScope(newSub, scope.mode, scope.classes);
 
   SchoolData.subjects.push(newSub);
 
@@ -9713,9 +9793,9 @@ function saveNewSubject() {
   if (modal) modal.remove();
 
   showNotification(
-    isUniversalSubjectClass(cls)
+    isSubjectUniversal(newSub)
       ? `Done: Subject '${name}' added for All Classes.`
-      : `Done: Subject '${name}' added for ${cls} only.`,
+      : `Done: Subject '${name}' added for ${getSubjectClassLabel(newSub)}.`,
     'success'
   );
   renderSubjectsPage(document.getElementById('contentBody'));
@@ -9732,29 +9812,18 @@ function openEditSubjectModal(subId) {
 
   const modalHtml = `
     <div class="modal-overlay active" id="subjectModal" style="z-index:99999;">
-      <div class="modal-box" style="max-width:550px;">
+      <div class="modal-box" style="max-width:580px;">
         <div class="modal-header">
-          <h3><i class="fa-solid fa-pen-to-square"></i> Edit Subject: ${sub.name}</h3>
+          <h3><i class="fa-solid fa-pen-to-square"></i> Edit Subject: ${escapeHtml(sub.name)}</h3>
           <button class="close-modal-btn" onclick="document.getElementById('subjectModal').remove()"><i class="fa-solid fa-xmark"></i></button>
         </div>
         <div style="padding:20px;">
           <div style="display:flex; flex-direction:column; gap:12px; margin-bottom:20px;">
             <div>
               <label style="font-size:0.8rem; font-weight:600;">Subject Name *</label>
-              <input type="text" id="subName" class="session-dropdown" value="${sub.name}">
+              <input type="text" id="subName" class="session-dropdown" value="${escapeHtml(sub.name)}">
             </div>
-            <div>
-              <label style="font-size:0.8rem; font-weight:600;">Applies To *</label>
-              <select id="subClass" class="session-dropdown" style="font-weight:700;">
-                ${getClassSelectOptionsHtml(
-                  isUniversalSubjectClass(sub.class) ? 'ALL CLASSES' : (sub.class || 'ALL CLASSES'),
-                  { includeUniversal: true }
-                )}
-              </select>
-              <p style="font-size:0.75rem; color:#94a3b8; margin:6px 0 0 0;">
-                Switch to <strong>ALL CLASSES</strong> if this subject is taught in every class (no need to duplicate rows).
-              </p>
-            </div>
+            ${getSubjectClassPickerHtml(sub)}
             <div>
               <label style="font-size:0.8rem; font-weight:600;">Weekly Periods Count *</label>
               <input type="number" id="subPeriods" class="session-dropdown" value="${sub.periodsPerWeek}">
@@ -9783,6 +9852,7 @@ function openEditSubjectModal(subId) {
     </div>
   `;
   document.body.insertAdjacentHTML('beforeend', modalHtml);
+  toggleSubjectClassModeUi();
 }
 
 function saveSubjectEdit(subId) {
@@ -9794,9 +9864,14 @@ function saveSubjectEdit(subId) {
     showNotification('Subject teacher must be an ERP user with a Teacher role.', 'error');
     return;
   }
+  const scope = readSubjectClassScopeFromForm();
+  if (scope.mode === 'selected' && !scope.classes.length) {
+    showNotification('Tick at least one class, or choose All Classes.', 'error');
+    return;
+  }
 
   sub.name = document.getElementById('subName').value.trim();
-  sub.class = document.getElementById('subClass')?.value || sub.class;
+  applySubjectClassScope(sub, scope.mode, scope.classes);
   sub.periodsPerWeek = parseInt(document.getElementById('subPeriods').value) || 5;
   sub.teacher = teacherRaw || 'Unassigned';
 
