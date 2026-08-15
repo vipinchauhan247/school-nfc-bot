@@ -742,12 +742,15 @@ async function erpCloudHandler(req, res) {
       };
       const existing = await readSnapshot(schoolId);
       const base = existing?.payload && typeof existing.payload === 'object' ? existing.payload : {};
+      // Keep staffUsers + teachers — wiping students must not delete school logins
       const payload = {
         ...base,
         ...emptyPayload,
         students: [],
-        cancelledReceipts: Array.isArray(base.cancelledReceipts) ? [] : [],
-        intentionalEmpty: true
+        cancelledReceipts: [],
+        intentionalEmpty: true,
+        staffUsers: Array.isArray(base.staffUsers) ? base.staffUsers : [],
+        teachers: Array.isArray(base.teachers) ? base.teachers : []
       };
       const cleared = await clearNativeRoster(schoolId);
       const written = await writeSnapshot(schoolId, payload, 'wipe-roster');
@@ -757,6 +760,7 @@ async function erpCloudHandler(req, res) {
         schoolId,
         wiped: true,
         studentCount: 0,
+        staffCount: (payload.staffUsers || []).length,
         cleared,
         savedAt: written?.snapshot?.saved_at || payload.savedAt
       });

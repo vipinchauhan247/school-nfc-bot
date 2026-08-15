@@ -347,6 +347,24 @@
     const students = Array.from(byAdmission.values());
     removeCancelledPayments(students, cancelledReceipts);
 
+    // Staff logins + teachers: same membership rule as students.
+    // Prefer-non-empty + savedAt resurrected deleted users from stale PCs and
+    // could wipe custom staff when an empty/newer side won incorrectly.
+    let staffUsers;
+    let teachers;
+    if (localStudentsAuthoritative) {
+      staffUsers = Array.isArray(local.staffUsers) ? local.staffUsers : (remote.staffUsers || []);
+      teachers = Array.isArray(local.teachers) ? local.teachers : (remote.teachers || []);
+    } else if (remoteStudentsAuthoritative) {
+      staffUsers = Array.isArray(remote.staffUsers) ? remote.staffUsers : (local.staffUsers || []);
+      teachers = Array.isArray(remote.teachers) ? remote.teachers : (local.teachers || []);
+    } else {
+      staffUsers = Array.isArray(newerMeta.staffUsers) ? newerMeta.staffUsers
+        : (Array.isArray(olderMeta.staffUsers) ? olderMeta.staffUsers : []);
+      teachers = Array.isArray(newerMeta.teachers) ? newerMeta.teachers
+        : (Array.isArray(olderMeta.teachers) ? olderMeta.teachers : []);
+    }
+
     return {
       ...olderMeta,
       ...newerMeta,
@@ -355,10 +373,10 @@
       students,
       cancelledReceipts,
       classes: (newerMeta.classes && newerMeta.classes.length) ? newerMeta.classes : (olderMeta.classes || []),
-      staffUsers: (newerMeta.staffUsers && newerMeta.staffUsers.length) ? newerMeta.staffUsers : (olderMeta.staffUsers || []),
+      staffUsers,
       schoolProfile: newerMeta.schoolProfile || olderMeta.schoolProfile,
       signatures: newerMeta.signatures || olderMeta.signatures,
-      teachers: (newerMeta.teachers && newerMeta.teachers.length) ? newerMeta.teachers : (olderMeta.teachers || []),
+      teachers,
       subjects: newerMeta.subjects || olderMeta.subjects,
       sessions: newerMeta.sessions || olderMeta.sessions,
       classFeeMaster: newerMeta.classFeeMaster || olderMeta.classFeeMaster,
@@ -499,14 +517,37 @@
   }
 
   async function applyEmptyCloudRoster(cloudPayload, snapshot, options) {
+    const src = cloudPayload && typeof cloudPayload === 'object' ? cloudPayload : {};
     const payload = {
-      ...(cloudPayload && typeof cloudPayload === 'object' ? cloudPayload : {}),
+      ...src,
       students: [],
-      savedAt: (cloudPayload && cloudPayload.savedAt) || (snapshot && snapshot.saved_at) || new Date().toISOString()
+      savedAt: src.savedAt || (snapshot && snapshot.saved_at) || new Date().toISOString()
     };
-    // Always apply staff/teachers from cloud even when students are empty
-    if (!Array.isArray(payload.staffUsers)) payload.staffUsers = [];
-    if (!Array.isArray(payload.teachers)) payload.teachers = [];
+
+    // Empty student roster must NEVER invent empty staff/teachers.
+    // Missing arrays → keep what is already in memory (or last display cache).
+    // That bug wiped real logins when students were cleared / snapshot missing.
+    const memStaff = (typeof SchoolData !== 'undefined' && Array.isArray(SchoolData.staffUsers))
+      ? SchoolData.staffUsers
+      : null;
+    const memTeachers = (typeof SchoolData !== 'undefined' && Array.isArray(SchoolData.teachers))
+      ? SchoolData.teachers
+      : null;
+    if (Array.isArray(src.staffUsers)) {
+      payload.staffUsers = src.staffUsers;
+    } else if (memStaff && memStaff.length) {
+      payload.staffUsers = memStaff;
+    } else {
+      delete payload.staffUsers;
+    }
+    if (Array.isArray(src.teachers)) {
+      payload.teachers = src.teachers;
+    } else if (memTeachers && memTeachers.length) {
+      payload.teachers = memTeachers;
+    } else {
+      delete payload.teachers;
+    }
+
     const applied = applySchoolDataStoragePayload(payload, { allowEmpty: true });
     if (!applied) {
       SchoolData.students = [];
@@ -517,7 +558,7 @@
       window.clearLocalSchoolDataAuthorityStores();
     }
     if (typeof window.saveCloudDisplayCache === 'function') {
-      try { window.saveCloudDisplayCache(payload); } catch (e) {}
+      try { window.saveCloudDisplayCache(buildSchoolDataStoragePayload()); } catch (e) {}
     }
     window._erpCloudBootReady = true;
     window._erpCloudPushDisabled = false;
@@ -531,7 +572,7 @@
       applied: true,
       empty: true,
       studentCount: 0,
-      staffCount: (payload.staffUsers || []).length,
+      staffCount: (SchoolData.staffUsers || []).length,
       message: 'Cloud roster is empty — ready for a fresh student upload.'
     };
   }
@@ -764,6 +805,23 @@
     }, wait);
   }
 
+  function cancelScheduledCloudPush() {
+    clearTimeout(cloudPushTimer);
+    cloudPushTimer = null;
+  }
+
+  /** Staff create/delete: cancel debounced merge-push, upload exact memory list, refresh cache. */
+  async function pushStaffAuthorityToCloud() {
+    cancelScheduledCloudPush();
+    window._erpCloudMemoryDirty = true;
+    const data = await pushSchoolDataToCloud({ skipMergePull: true });
+    window._erpCloudMemoryDirty = false;
+    if (typeof window.saveCloudDisplayCache === 'function' && typeof buildSchoolDataStoragePayload === 'function') {
+      try { window.saveCloudDisplayCache(buildSchoolDataStoragePayload()); } catch (e) {}
+    }
+    return data;
+  }
+
   function flushCloudPushNow() {
     scheduleCloudPush(0);
   }
@@ -929,6 +987,8 @@
   window.pushSchoolDataToCloud = pushSchoolDataToCloud;
   window.applyNativeStudentLinks = applyNativeStudentLinks;
   window.scheduleCloudPush = scheduleCloudPush;
+  window.cancelScheduledCloudPush = cancelScheduledCloudPush;
+  window.pushStaffAuthorityToCloud = pushStaffAuthorityToCloud;
   window.flushCloudPushNow = flushCloudPushNow;
   window.getCloudSyncStatusText = getCloudSyncStatusText;
   window.mergeSchoolPayloadsForCloud = mergeSchoolPayloads;

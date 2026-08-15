@@ -3417,14 +3417,10 @@ function renderExamsReportCardsSubdirectoryPage(container) {
   `;
 }
 
-if (!SchoolData.staffUsers) {
-  SchoolData.staffUsers = [
-    { id: "USR-001", name: "Vipin Chauhan", role: "Super Admin", mobile: "9876543210", email: "vipin@mmm.edu.in", username: "admin", password: "admin123", hideFees: false, viewTotalRevenue: true, viewDueBalance: true, weightage: true, teachers: true, students: true, reportCards: true, canAdmitStudents: true, canEditStudents: true },
-    { id: "USR-002", name: "Neha Verma", role: "Receptionist", mobile: "9856789012", email: "reception@mmm.edu.in", username: "receptionist", password: "rec123", hideFees: false, viewTotalRevenue: false, viewDueBalance: true, weightage: false, teachers: false, students: true, reportCards: true, canAdmitStudents: true, canEditStudents: true },
-    { id: "USR-003", name: "Dr. Rajesh Kumar", role: "Principal", mobile: "9823456789", email: "principal@mmm.edu.in", username: "principal", password: "prc123", hideFees: false, viewTotalRevenue: true, viewDueBalance: true, weightage: true, teachers: true, students: true, reportCards: true, canAdmitStudents: true, canEditStudents: true },
-    { id: "USR-004", name: "Suresh Verma", role: "Accountant", mobile: "9834567890", email: "accountant@mmm.edu.in", username: "accountant", password: "acc123", hideFees: false, viewTotalRevenue: true, viewDueBalance: true, weightage: false, teachers: false, students: true, reportCards: false, canAdmitStudents: false, canEditStudents: false },
-    { id: "USR-005", name: "Pooja Sharma", role: "Senior Teacher", mobile: "9845678901", email: "pooja@mmm.edu.in", username: "pooja_teacher", password: "tch123", hideFees: true, viewTotalRevenue: false, viewDueBalance: false, weightage: false, teachers: false, students: true, reportCards: true, canAdmitStudents: false, canEditStudents: false }
-  ];
+// Demo staff seed removed — cloud is the only source of staff logins.
+// If staffUsers is missing, use an empty list (never invent USR-001…005).
+if (!Array.isArray(SchoolData.staffUsers)) {
+  SchoolData.staffUsers = [];
 }
 
 function ensureStaffUserIds() {
@@ -4323,11 +4319,18 @@ function saveNewStaffUser() {
   SchoolData.staffUsers.push(newUser);
 
   document.getElementById('addUserModal')?.remove();
-  saveSchoolDataToStorage();
+  // Skip debounced merge-push — staff list must upload exactly as in memory
+  saveSchoolDataToStorage({ skipCloudPush: true });
   renderUsersPage(document.getElementById('contentBody'));
 
-  if (typeof pushSchoolDataToCloud === 'function') {
-    pushSchoolDataToCloud({ skipMergePull: true })
+  const pushStaff = typeof pushStaffAuthorityToCloud === 'function'
+    ? pushStaffAuthorityToCloud
+    : (typeof pushSchoolDataToCloud === 'function'
+      ? () => pushSchoolDataToCloud({ skipMergePull: true })
+      : null);
+
+  if (pushStaff) {
+    pushStaff()
       .then(() => {
         showNotification(`Created ${name} [${username}] and saved to cloud.`, 'success');
       })
@@ -4349,14 +4352,20 @@ function deleteStaffUser(uid) {
         String(t.name || '').trim().toLowerCase() === String(user.name || '').trim().toLowerCase())
     );
   }
-  saveSchoolDataToStorage();
+  // Skip debounced merge-push so a stale cloud list cannot resurrect this user
+  saveSchoolDataToStorage({ skipCloudPush: true });
   renderUsersPage(document.getElementById('contentBody'));
 
-  // Cloud-only: memory delete is not enough — must upload staffUsers to Supabase
-  if (typeof pushSchoolDataToCloud === 'function') {
-    pushSchoolDataToCloud({ skipMergePull: true })
+  const pushStaff = typeof pushStaffAuthorityToCloud === 'function'
+    ? pushStaffAuthorityToCloud
+    : (typeof pushSchoolDataToCloud === 'function'
+      ? () => pushSchoolDataToCloud({ skipMergePull: true })
+      : null);
+
+  if (pushStaff) {
+    pushStaff()
       .then((data) => {
-        showNotification(`Staff removed and saved to cloud (${data.studentCount || 0} students in snapshot).`, 'success');
+        showNotification(`Staff removed and saved to cloud (${(SchoolData.staffUsers || []).length} logins left).`, 'success');
       })
       .catch((err) => {
         showNotification(`Staff removed on screen, but cloud save failed: ${err.message}. They will come back on refresh until cloud sync works.`, 'error');
@@ -8822,7 +8831,14 @@ function deleteTeacher(tchId) {
   showNotification('Teacher profile deleted from directory.', 'info');
   renderTeachersPage(document.getElementById('contentBody'));
 
-  saveSchoolDataToStorage();
+  saveSchoolDataToStorage({ skipCloudPush: true });
+  if (typeof pushStaffAuthorityToCloud === 'function') {
+    pushStaffAuthorityToCloud().catch((err) => {
+      showNotification(`Teacher removed on screen, but cloud save failed: ${err.message}`, 'error');
+    });
+  } else if (typeof pushSchoolDataToCloud === 'function') {
+    pushSchoolDataToCloud({ skipMergePull: true }).catch(() => {});
+  }
 }
 
 /* ============================================================================
