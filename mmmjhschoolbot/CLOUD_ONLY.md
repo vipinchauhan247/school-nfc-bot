@@ -40,7 +40,11 @@ Example:
 
 No new SQL required if Phase 2 tables are already live. Keep Render env + site origin trust as before.
 
-## First open after deploy
+## Faster open (display cache)
+
+After the first successful cloud load, the next open shows the **last cloud copy** instantly from IndexedDB (`cloudDisplay`), then refreshes from Supabase in the background. That cache is **never** uploaded as authority — cloud pull always wins.
+
+You will still see a short teal bar: “Updating from cloud…”
 
 - If cloud already has students (your migrate did): site shows cloud count; local cache is wiped.
 - If somehow cloud were empty but a browser still had old `MMM_SchoolData_v6`: that browser uploads once, then switches to cloud-only.

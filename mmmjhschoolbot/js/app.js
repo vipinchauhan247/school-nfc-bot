@@ -1500,12 +1500,52 @@ function isErpCloudOnly() {
   return window.ERP_CLOUD_ONLY !== false;
 }
 
+function setCloudLoadingOverlay(show, message) {
+  let el = document.getElementById('erpCloudLoadingOverlay');
+  if (!show) {
+    if (el) el.remove();
+    return;
+  }
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'erpCloudLoadingOverlay';
+    el.setAttribute('role', 'status');
+    el.style.cssText = [
+      'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:99999',
+      'display:flex', 'align-items:center', 'justify-content:center', 'gap:10px',
+      'padding:10px 16px', 'background:#0f766e', 'color:#fff',
+      'font:600 13px/1.3 system-ui,sans-serif', 'box-shadow:0 2px 12px rgba(0,0,0,.25)'
+    ].join(';');
+    document.body.appendChild(el);
+  }
+  el.innerHTML = `<span style="width:14px;height:14px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;display:inline-block;animation:erpCloudSpin .7s linear infinite"></span><span>${message || 'Loading school data from cloud…'}</span>`;
+  if (!document.getElementById('erpCloudSpinStyle')) {
+    const style = document.createElement('style');
+    style.id = 'erpCloudSpinStyle';
+    style.textContent = '@keyframes erpCloudSpin{to{transform:rotate(360deg)}}';
+    document.head.appendChild(style);
+  }
+}
+window.setCloudLoadingOverlay = setCloudLoadingOverlay;
+
 async function initApp() {
-  // Cloud-only: do NOT load students from localStorage/IndexedDB (stale PCs caused duplicates).
-  // Printer + appearance stay on their own local keys.
+  // Cloud-only: do NOT treat localStorage as authority. Use a display-cache for instant
+  // paint, then replace from Supabase. Printer + appearance stay on their own local keys.
   if (isErpCloudOnly()) {
+    window._erpCloudPushDisabled = true;
+    window._erpCloudBootReady = false;
     mergeLocalCancelledReceiptsFromTinyStore();
     SchoolData.students = [];
+    setCloudLoadingOverlay(true, 'Loading school data from cloud…');
+    try {
+      const cached = await loadCloudDisplayCache();
+      if (cached && Array.isArray(cached.students) && cached.students.length) {
+        applySchoolDataStoragePayload(cached);
+        setCloudLoadingOverlay(true, 'Updating from cloud…');
+      }
+    } catch (err) {
+      console.warn('Display cache skipped:', err);
+    }
   } else {
     loadSchoolDataFromStorage();
     try {
@@ -1542,7 +1582,11 @@ async function initApp() {
       if (isErpCloudOnly()) handleRouting();
     } catch (err) {
       console.warn('Cloud sync init:', err);
+    } finally {
+      setCloudLoadingOverlay(false);
     }
+  } else {
+    setCloudLoadingOverlay(false);
   }
 }
 
@@ -5700,6 +5744,7 @@ function applySchoolDataStoragePayload(parsed) {
 const ERP_IDB_NAME = 'MMM_ERP_DB';
 const ERP_IDB_STORE = 'kv';
 const ERP_IDB_SNAPSHOT_KEY = 'snapshot';
+const ERP_IDB_DISPLAY_KEY = 'cloudDisplay';
 let _storageSaveToastAt = 0;
 
 function isHeavyDataUrl(value) {
@@ -5774,6 +5819,46 @@ async function hydrateSchoolDataFromIndexedDb() {
   return applySchoolDataStoragePayload(merged);
 }
 
+/** Fast paint only — never treated as authority; cloud pull always replaces. */
+function saveCloudDisplayCache(payload) {
+  if (!payload || !Array.isArray(payload.students) || !payload.students.length) return Promise.resolve(false);
+  const record = {
+    savedAt: payload.savedAt || new Date().toISOString(),
+    source: 'cloud',
+    payload
+  };
+  return openErpIndexedDb().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(ERP_IDB_STORE, 'readwrite');
+    tx.objectStore(ERP_IDB_STORE).put(record, ERP_IDB_DISPLAY_KEY);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error || new Error('display cache write failed'));
+  })).catch(err => {
+    console.warn('Display cache save skipped:', err);
+    return false;
+  });
+}
+
+function loadCloudDisplayCache() {
+  return openErpIndexedDb().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(ERP_IDB_STORE, 'readonly');
+    const req = tx.objectStore(ERP_IDB_STORE).get(ERP_IDB_DISPLAY_KEY);
+    req.onsuccess = () => {
+      const row = req.result;
+      if (row && row.payload && Array.isArray(row.payload.students) && row.payload.students.length) {
+        resolve(row.payload);
+      } else if (row && Array.isArray(row.students) && row.students.length) {
+        resolve(row);
+      } else {
+        resolve(null);
+      }
+    };
+    req.onerror = () => reject(req.error || new Error('display cache read failed'));
+  })).catch(err => {
+    console.warn('Display cache load skipped:', err);
+    return null;
+  });
+}
+
 function clearLocalSchoolDataAuthorityStores() {
   try { localStorage.removeItem('MMM_SchoolData_v6'); } catch (e) {}
   try { localStorage.removeItem('MMM_SchoolData_students'); } catch (e) {}
@@ -5786,6 +5871,7 @@ function clearLocalSchoolDataAuthorityStores() {
         try {
           const db = req.result;
           if (!db.objectStoreNames.contains(ERP_IDB_STORE)) return;
+          // Clear old authority snapshot only — keep cloudDisplay for fast next open
           db.transaction(ERP_IDB_STORE, 'readwrite').objectStore(ERP_IDB_STORE).delete(ERP_IDB_SNAPSHOT_KEY);
         } catch (e) {}
       };
@@ -5817,6 +5903,8 @@ function loadEmergencyLocalSchoolCache() {
 window.clearLocalSchoolDataAuthorityStores = clearLocalSchoolDataAuthorityStores;
 window.peekLocalSchoolDataForCloudMigration = peekLocalSchoolDataForCloudMigration;
 window.loadEmergencyLocalSchoolCache = loadEmergencyLocalSchoolCache;
+window.saveCloudDisplayCache = saveCloudDisplayCache;
+window.loadCloudDisplayCache = loadCloudDisplayCache;
 
 function freeDuplicateLocalStorageCopies() {
   try { localStorage.removeItem('MMM_SchoolData_students'); } catch (e) {}

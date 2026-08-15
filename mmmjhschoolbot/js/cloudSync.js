@@ -419,12 +419,28 @@
     return { ok: true, applied, count: data.students.length };
   }
 
-  async function fetchCloudSnapshot() {
+  async function fetchCloudSnapshotRaw() {
     const res = await fetchWithRetry(cloudPullUrl(), { headers: cloudHeaders(), cache: 'no-store' });
     const data = await parseCloudResponse(res);
     if (!data.ok) throw new Error(data.error || 'Cloud pull failed.');
     if (!data.configured) return { ok: false, configured: false, error: data.error };
     return data;
+  }
+
+  async function fetchCloudSnapshot() {
+    // Use boot prefetch when available (starts as soon as cloudSync.js loads)
+    if (window._erpCloudPrefetchPromise && !window._erpCloudPrefetchConsumed) {
+      window._erpCloudPrefetchConsumed = true;
+      try {
+        const prefetched = await window._erpCloudPrefetchPromise;
+        window._erpCloudPrefetchPromise = null;
+        if (prefetched) return prefetched;
+      } catch (err) {
+        window._erpCloudPrefetchPromise = null;
+        console.warn('Cloud prefetch missed, fetching again:', err);
+      }
+    }
+    return fetchCloudSnapshotRaw();
   }
 
   function peekDormantLocalSchoolPayload() {
@@ -484,6 +500,13 @@
           try {
             const migrated = await migrateLocalRosterToCloudOnce();
             if (migrated.migrated) {
+              window._erpCloudBootReady = true;
+              window._erpCloudPushDisabled = false;
+              window._erpCloudMemoryDirty = false;
+              if (typeof window.saveCloudDisplayCache === 'function' && typeof buildSchoolDataStoragePayload === 'function') {
+                try { window.saveCloudDisplayCache(buildSchoolDataStoragePayload()); } catch (e) {}
+              }
+              if (typeof window.setCloudLoadingOverlay === 'function') window.setCloudLoadingOverlay(false);
               refreshUiAfterCloudApply(options);
               return {
                 ok: true,
@@ -498,16 +521,23 @@
             console.warn('Cloud-only local migrate failed:', err);
           }
         }
+        window._erpCloudBootReady = true;
+        window._erpCloudPushDisabled = false;
         return { ok: true, configured: true, empty: true, message: 'No cloud snapshot yet. Upload from phone/PC that has correct fees.' };
       }
 
       const localPayload = buildSchoolDataStoragePayload();
       const cloudPayload = snapshot.payload;
       const cloudOnly = isCloudOnly();
+      const memoryDirty = !!window._erpCloudMemoryDirty;
 
       // Cloud-only: replace memory with cloud. Do not union stale local students.
+      // Exception: if the user already edited while a display-cache was showing,
+      // keep this device's membership/edits and soft-merge fees from cloud.
       let merged;
-      if (cloudOnly) {
+      if (cloudOnly && memoryDirty) {
+        merged = mergeSchoolPayloads(localPayload, cloudPayload, { localStudentsAuthoritative: true });
+      } else if (cloudOnly) {
         merged = {
           ...cloudPayload,
           cancelledReceipts: mergeCancelledReceipts(localPayload.cancelledReceipts, cloudPayload.cancelledReceipts),
@@ -564,6 +594,12 @@
       if (cloudOnly && typeof window.clearLocalSchoolDataAuthorityStores === 'function') {
         window.clearLocalSchoolDataAuthorityStores();
       }
+      if (typeof window.saveCloudDisplayCache === 'function') {
+        try { window.saveCloudDisplayCache(merged); } catch (e) { console.warn('display cache', e); }
+      }
+      window._erpCloudBootReady = true;
+      window._erpCloudPushDisabled = false;
+      window._erpCloudMemoryDirty = false;
       if (typeof saveSchoolDataToStorage === 'function') saveSchoolDataToStorage({ skipCloudPush: true });
 
       // Hybrid only: push merged fees back. Cloud-only never re-uploads local-only ghosts.
@@ -573,10 +609,22 @@
         } catch (err) {
           console.warn('Cloud merge push failed:', err);
         }
+      } else if (cloudOnly && memoryDirty) {
+        try {
+          await pushSchoolDataToCloud({ skipMergePull: true, payload: merged });
+        } catch (err) {
+          console.warn('Cloud dirty-boot push failed:', err);
+        }
       }
 
-      // Cloud-native: overlay Chat IDs / usernames from erp_students when available
-      try { await applyNativeStudentLinks({ silent: true }); } catch (e) { console.warn('native links', e); }
+      // Overlay Chat IDs after first paint — do not block UI on this second request
+      setTimeout(() => {
+        applyNativeStudentLinks({ silent: true }).catch((e) => console.warn('native links', e));
+      }, 0);
+
+      if (typeof window.setCloudLoadingOverlay === 'function') {
+        window.setCloudLoadingOverlay(false);
+      }
 
       refreshUiAfterCloudApply(options);
       return {
@@ -643,6 +691,8 @@
 
   function scheduleCloudPush(delayMs) {
     if (window._erpCloudPushDisabled) return;
+    // Cloud-only: never upload until the first cloud pull finished (prevents empty wipe)
+    if (isCloudOnly() && !window._erpCloudBootReady) return;
     // Allow first upload even before a successful pull (fixes phone→PC fee mismatch)
     if (!getCloudSecret() && !(window._erpCloudServerConfig && window._erpCloudServerConfig.configured)) return;
     clearTimeout(cloudPushTimer);
@@ -652,6 +702,9 @@
         await pushSchoolDataToCloud();
         window._erpCloudLastPushError = '';
         window._erpCloudSyncState = 'live';
+        if (typeof window.saveCloudDisplayCache === 'function' && typeof buildSchoolDataStoragePayload === 'function') {
+          try { window.saveCloudDisplayCache(buildSchoolDataStoragePayload()); } catch (e) {}
+        }
       } catch (err) {
         window._erpCloudLastPushError = err.message;
         window._erpCloudSyncState = 'error';
@@ -683,6 +736,7 @@
     function wrappedSave(options) {
       const opts = Object.assign({}, options || {});
       if (opts.skipCloudPush) opts.silent = true;
+      else if (isCloudOnly() && !opts.skipCloudPush) window._erpCloudMemoryDirty = true;
       const result = original.call(this, opts);
       if (!opts.skipCloudPush) scheduleCloudPush();
       return result;
@@ -699,9 +753,28 @@
     if (schoolId || secret) setCloudCredentials(schoolId, secret);
   }
 
+  function startCloudPrefetch() {
+    if (window._erpCloudPrefetchPromise || window.ERP_CLOUD_ONLY === false) return;
+    ensureCloudCredentials();
+    window._erpCloudPrefetchConsumed = false;
+    window._erpCloudPrefetchPromise = fetchCloudSnapshotRaw().catch((err) => {
+      console.warn('Cloud prefetch failed:', err);
+      return null;
+    });
+  }
+
   async function initCloudSync() {
     ensureCloudCredentials();
     wrapSaveSchoolDataToStorage();
+    if (isCloudOnly()) {
+      // Block uploads until pull finishes; display-cache may already be on screen
+      if (!window._erpCloudBootReady) window._erpCloudPushDisabled = true;
+      if (typeof window.setCloudLoadingOverlay === 'function') {
+        const hasStudents = Array.isArray(window.SchoolData?.students) && window.SchoolData.students.length > 0;
+        window.setCloudLoadingOverlay(true, hasStudents ? 'Updating from cloud…' : 'Loading school data from cloud…');
+      }
+    }
+    startCloudPrefetch();
     const cfg = await fetchCloudConfig();
     window._erpCloudServerConfig = cfg;
     window._erpCloudOnly = isCloudOnly();
@@ -710,10 +783,12 @@
       if (isCloudOnly() && typeof showNotification === 'function') {
         showNotification('Cloud ERP is required but server is not configured. Contact admin.', 'error');
       }
+      if (typeof window.setCloudLoadingOverlay === 'function') window.setCloudLoadingOverlay(false);
       return { ok: false, configured: false };
     }
     if (cfg.requiresSecret && !getCloudSecret() && !cfg.siteTrusted) {
       window._erpCloudLastPullError = 'Admin: set window.ERP_CLOUD_SECRET in js/erp-cloud-config.js';
+      if (typeof window.setCloudLoadingOverlay === 'function') window.setCloudLoadingOverlay(false);
       return { ok: false, configured: true, error: 'Cloud secret not set in website config.' };
     }
     try {
@@ -722,12 +797,17 @@
       if (pull.applied && typeof showNotification === 'function') {
         if (pull.migrated) {
           showNotification(`Moved ${pull.studentCount} students from this browser into cloud. Cloud is now the only copy.`, 'success');
-        } else {
+        } else if (!pull.silentToast) {
           const feeNote = pull.mergedFees && pull.mergedFees.total
             ? ` · fees ₹${Number(pull.mergedFees.total).toLocaleString('en-IN')}`
             : '';
           const mode = isCloudOnly() ? 'Cloud ERP' : 'School data synced';
-          showNotification(`${mode} (${pull.studentCount} students${feeNote}).`, 'success');
+          // Quiet toast when display-cache already showed the same roster
+          const alreadyShown = Array.isArray(window.SchoolData?.students)
+            && window.SchoolData.students.length === pull.studentCount;
+          if (!(isCloudOnly() && alreadyShown)) {
+            showNotification(`${mode} (${pull.studentCount} students${feeNote}).`, 'success');
+          }
         }
       } else if (pull.empty && isCloudOnly() && typeof showNotification === 'function') {
         showNotification(pull.message || 'Cloud is empty. Add students — they will save to cloud only.', 'warning');
@@ -736,14 +816,24 @@
       console.warn('Initial cloud pull failed:', err);
       window._erpCloudLastPullError = err.message;
       if (isCloudOnly()) {
-        const recovered = typeof window.loadEmergencyLocalSchoolCache === 'function'
-          && window.loadEmergencyLocalSchoolCache();
-        if (recovered && typeof showNotification === 'function') {
-          showNotification('Cloud unreachable — emergency local cache loaded. Reconnect soon; do not trust this copy long-term.', 'warning');
+        const hasCache = Array.isArray(window.SchoolData?.students) && window.SchoolData.students.length > 0;
+        if (!hasCache) {
+          const recovered = typeof window.loadEmergencyLocalSchoolCache === 'function'
+            && window.loadEmergencyLocalSchoolCache();
+          if (recovered && typeof showNotification === 'function') {
+            showNotification('Cloud unreachable — emergency local cache loaded. Reconnect soon; do not trust this copy long-term.', 'warning');
+          } else if (typeof showNotification === 'function') {
+            showNotification(`Cloud ERP failed to load: ${err.message}`, 'error');
+          }
         } else if (typeof showNotification === 'function') {
-          showNotification(`Cloud ERP failed to load: ${err.message}`, 'error');
+          showNotification('Cloud refresh failed — showing last cloud copy from this device.', 'warning');
+          // Allow working from display-cache until reconnect
+          window._erpCloudBootReady = true;
+          window._erpCloudPushDisabled = false;
         }
       }
+    } finally {
+      if (typeof window.setCloudLoadingOverlay === 'function') window.setCloudLoadingOverlay(false);
     }
 
     clearInterval(cloudPollTimer);
@@ -786,4 +876,8 @@
   window.getCloudSyncStatusText = getCloudSyncStatusText;
   window.mergeSchoolPayloadsForCloud = mergeSchoolPayloads;
   window.migrateLocalRosterToCloudOnce = migrateLocalRosterToCloudOnce;
+  window.startCloudPrefetch = startCloudPrefetch;
+
+  // Start download immediately — do not wait for DOMContentLoaded
+  try { startCloudPrefetch(); } catch (e) {}
 })();
