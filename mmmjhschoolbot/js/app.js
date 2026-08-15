@@ -2476,7 +2476,7 @@ function getDirectorySubjectsUnique(options = {}) {
       id: s.id,
       code,
       name,
-      teacher: typeof getSubjectTeacherDisplayName === 'function' ? getSubjectTeacherDisplayName(s) : (s.teacher || 'Unassigned'),
+      teacher: typeof getSubjectTeacherDisplayName === 'function' ? getSubjectTeacherDisplayName(s, forClass) : (s.teacher || 'Unassigned'),
       maxMarks: s.maxMarks || 100,
       periodsPerWeek: s.periodsPerWeek,
       category: s.category,
@@ -3148,7 +3148,7 @@ function renderExamsWeightageSubdirectoryPage(container) {
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-sliders" style="color:#f59e0b"></i> Subject Exam Marks & Weightage</h2>
-        <p class="page-subtitle">Subjects come from <strong>Subjects Directory</strong> only (All Classes or selected classes). Teachers must be ERP users.</p>
+        <p class="page-subtitle">Subjects come from Subjects Directory. Teacher column is for <strong>this class</strong> (mapped in Teachers Directory) — English can be school-wide with different teachers per class.</p>
       </div>
       <button class="btn btn-primary" onclick="window.location.hash='exams-entry'"><i class="fa-solid fa-table-cells"></i> Open Marks Sheet</button>
     </div>
@@ -3208,7 +3208,7 @@ function renderExamsWeightageSubdirectoryPage(container) {
             ${subjects.length ? subjects.map(sub => {
               const code = sub.code || sub.name;
               const checked = isSubjectIncluded(code);
-              const teacherLabel = escapeHtml(sub.teacher || getSubjectTeacherDisplayName(sub) || 'Unassigned');
+              const teacherLabel = escapeHtml(getSubjectTeacherDisplayName(sub, selectedClass) || 'Unassigned');
               return `
                 <tr class="subject-weightage-row" data-code="${escapeHtml(code)}" data-name="${escapeHtml(sub.name)}" data-teacher="${teacherLabel}" style="border-bottom:1px solid #1e293b;">
                   <td style="padding:12px; text-align:center;">
@@ -4239,13 +4239,110 @@ function isSubjectTeacherAUser(teacherName) {
   return !!(user && isTeacherRoleUser(user));
 }
 
-function getSubjectTeacherDisplayName(sub) {
+/**
+ * Teachers mapped to a subject (from Teachers Directory), optionally for one class.
+ * English can be All Classes while Class 5 and Class 6 have different teachers.
+ */
+function getSubjectTeacherAssignments(sub, className = null) {
+  const codeBase = normalizeSubjectCodeBase(sub?.code || sub?.name);
+  if (!codeBase) return [];
+  const wantClass = String(className || '').trim().toLowerCase();
+  const rows = [];
+
+  (SchoolData.teachers || []).forEach((teacher) => {
+    const linked = findStaffUserForTeacher(teacher);
+    if (!linked || !isTeacherRoleUser(linked)) return;
+    (teacher.subjectMappings || []).forEach((m) => {
+      if (normalizeSubjectCodeBase(m.subjectCode || m.subjectName) !== codeBase) return;
+      const classes = Array.isArray(m.classes) && m.classes.length
+        ? m.classes
+        : String(m.class || '').split(',').map((s) => s.trim()).filter(Boolean);
+      const effective = (!classes.length || classes.some((c) => isUniversalSubjectClass(c)))
+        ? ['ALL CLASSES']
+        : classes;
+      effective.forEach((cls) => {
+        if (wantClass) {
+          const ok = isUniversalSubjectClass(cls) || String(cls).trim().toLowerCase() === wantClass;
+          if (!ok) return;
+        }
+        rows.push({
+          teacherName: String(teacher.name || linked.name || '').trim(),
+          username: linked.username || '',
+          class: cls,
+          section: m.section || 'ALL',
+          subjectCode: m.subjectCode || sub.code
+        });
+      });
+    });
+  });
+  return rows;
+}
+
+function getSubjectTeacherForClass(sub, className) {
+  const assignments = getSubjectTeacherAssignments(sub, className);
+  if (assignments.length) {
+    // Prefer exact class match over ALL CLASSES mapping when both exist
+    const exact = assignments.find((a) =>
+      String(a.class).trim().toLowerCase() === String(className || '').trim().toLowerCase()
+    );
+    return (exact || assignments[0]).teacherName;
+  }
+  // Single-class subject may still store one teacher on the subject row
+  if (!isSubjectUniversal(sub) && getSubjectAppliesToClasses(sub).length === 1) {
+    const raw = String(sub?.teacher || '').trim();
+    if (isSubjectTeacherAUser(raw)) return raw;
+  }
+  return '';
+}
+
+/**
+ * Display teacher for a subject.
+ * Pass className (e.g. on Weightage Class 5) to resolve the teacher for that class.
+ * Without className, multi-teacher All-Classes subjects show "per class".
+ */
+function getSubjectTeacherDisplayName(sub, className = null) {
+  if (className) {
+    return getSubjectTeacherForClass(sub, className) || 'Unassigned';
+  }
+
+  const assignments = getSubjectTeacherAssignments(sub);
+  if (assignments.length) {
+    const unique = Array.from(new Set(assignments.map((a) => a.teacherName).filter(Boolean)));
+    if (unique.length > 1) return `${unique.length} teachers (per class)`;
+    if (unique.length === 1) {
+      const classes = Array.from(new Set(assignments.map((a) => a.class)));
+      if (classes.length > 1 || isSubjectUniversal(sub)) {
+        return `${unique[0]} (mapped per class)`;
+      }
+      return unique[0];
+    }
+  }
+
+  if (isSubjectUniversal(sub) || getSubjectAppliesToClasses(sub).length > 1) {
+    return 'Assign per class in Teachers Directory';
+  }
+
   const raw = String(sub?.teacher || '').trim();
-  if (!raw || raw.toLowerCase() === 'unassigned' || raw.toLowerCase().includes('managed in teachers')) {
+  if (!raw || raw.toLowerCase() === 'unassigned' || raw.toLowerCase().includes('managed in teachers') ||
+      raw.toLowerCase().includes('per class') || raw.toLowerCase().includes('teachers directory')) {
     return 'Unassigned';
   }
   if (isSubjectTeacherAUser(raw)) return raw;
   return 'Unassigned';
+}
+
+function getSubjectTeacherAssignOptionsHtml(selectedName = '') {
+  const users = getTeacherRoleUsersForSubjectAssign();
+  const sel = String(selectedName || '').trim();
+  const selOk = isSubjectTeacherAUser(sel) ? sel : '';
+  let html = '<option value="">Unassigned</option>';
+  users.forEach((u) => {
+    const name = String(u.name || '').trim();
+    if (!name) return;
+    const selected = name.toLowerCase() === selOk.toLowerCase() ? 'selected' : '';
+    html += `<option value="${escapeHtml(name)}" ${selected}>${escapeHtml(name)} (@${escapeHtml(u.username || '')})</option>`;
+  });
+  return html;
 }
 
 function getTeacherRoleUsersForSubjectAssign() {
@@ -4309,6 +4406,26 @@ function getSubjectClassLabel(sub) {
   return getSubjectAppliesToClasses(sub).join(', ');
 }
 
+function getSubjectTeacherCellHtml(sub) {
+  const label = getSubjectTeacherDisplayName(sub);
+  const assignments = getSubjectTeacherAssignments(sub);
+  if (assignments.length > 1 || (isSubjectUniversal(sub) && assignments.length)) {
+    const detail = assignments
+      .slice(0, 6)
+      .map((a) => `${escapeHtml(a.teacherName)} · ${escapeHtml(isUniversalSubjectClass(a.class) ? 'All Classes' : a.class)}`)
+      .join('<br>');
+    const more = assignments.length > 6 ? `<br><span style="color:#94a3b8;">+${assignments.length - 6} more</span>` : '';
+    return `
+      <div style="font-size:0.82rem; line-height:1.35;">
+        <div style="color:var(--text-main); font-weight:600; margin-bottom:4px;">
+          <i class="fa-solid fa-user-tie" style="color:var(--accent-primary);"></i> ${escapeHtml(label)}
+        </div>
+        <div style="color:#94a3b8;">${detail}${more}</div>
+      </div>`;
+  }
+  return `<i class="fa-solid fa-user-tie" style="color:var(--accent-primary);"></i> ${escapeHtml(label)}`;
+}
+
 function getSubjectClassBadgeHtml(sub) {
   if (isSubjectUniversal(sub)) {
     return '<span class="badge badge-success" title="Appears in every class">All Classes</span>';
@@ -4330,7 +4447,7 @@ function getSubjectClassPickerHtml(sub) {
     const checked = selected.has(String(cls).trim().toLowerCase()) ? 'checked' : '';
     return `
       <label style="display:inline-flex; align-items:center; gap:6px; padding:6px 10px; background:#1e293b; border-radius:8px; border:1px solid #334155; cursor:pointer; font-size:0.8rem;">
-        <input type="checkbox" class="sub-class-check" value="${escapeHtml(cls)}" ${checked} ${universal ? 'disabled' : ''}>
+        <input type="checkbox" class="sub-class-check" value="${escapeHtml(cls)}" ${checked} ${universal ? 'disabled' : ''} onchange="toggleSubjectClassModeUi()">
         ${escapeHtml(cls)}
       </label>`;
   }).join('');
@@ -4352,7 +4469,8 @@ function getSubjectClassPickerHtml(sub) {
         </div>
       </div>
       <p style="font-size:0.75rem; color:#94a3b8; margin:8px 0 0 0;">
-        Not every subject is for every class — pick All Classes or tick only the classes that teach it. One row is enough; no re-adding per class.
+        Subject scope (where it is taught) is separate from who teaches it.
+        English can be All Classes while each class has a different teacher — map teachers per class in Teachers Directory.
       </p>
     </div>
   `;
@@ -4361,12 +4479,21 @@ function getSubjectClassPickerHtml(sub) {
 function toggleSubjectClassModeUi() {
   const mode = document.querySelector('input[name="subClassMode"]:checked')?.value || 'all';
   const box = document.getElementById('subClassChecks');
-  if (!box) return;
-  const selected = mode === 'selected';
-  box.style.display = selected ? 'flex' : 'none';
-  box.querySelectorAll('.sub-class-check').forEach((el) => {
-    el.disabled = !selected;
-  });
+  if (box) {
+    const selected = mode === 'selected';
+    box.style.display = selected ? 'flex' : 'none';
+    box.querySelectorAll('.sub-class-check').forEach((el) => {
+      el.disabled = !selected;
+    });
+  }
+  const checkedCount = mode === 'selected'
+    ? document.querySelectorAll('.sub-class-check:checked').length
+    : 0;
+  const singleClass = mode === 'selected' && checkedCount === 1;
+  const teacherBlock = document.getElementById('subTeacherBlock');
+  const perClassNote = document.getElementById('subTeacherPerClassNote');
+  if (teacherBlock) teacherBlock.style.display = singleClass ? 'block' : 'none';
+  if (perClassNote) perClassNote.style.display = singleClass ? 'none' : 'block';
 }
 
 function readSubjectClassScopeFromForm() {
@@ -4376,24 +4503,10 @@ function readSubjectClassScopeFromForm() {
   return { mode: 'selected', classes };
 }
 
-/** Dropdown: only Teacher-role ERP users (no free-text / demo names). */
-function getSubjectTeacherAssignOptionsHtml(selectedName = '') {
-  const users = getTeacherRoleUsersForSubjectAssign();
-  const sel = String(selectedName || '').trim();
-  const selOk = isSubjectTeacherAUser(sel) ? sel : '';
-  let html = '<option value="">Unassigned</option>';
-  users.forEach((u) => {
-    const name = String(u.name || '').trim();
-    if (!name) return;
-    const selected = name.toLowerCase() === selOk.toLowerCase() ? 'selected' : '';
-    html += `<option value="${escapeHtml(name)}" ${selected}>${escapeHtml(name)} (@${escapeHtml(u.username || '')})</option>`;
-  });
-  return html;
-}
-
 /**
- * Keep Subject Directory teacher column in sync with Teachers Directory mappings
- * (only when the faculty row is linked to a real staff login).
+ * Sync subject.teacher only for single-class subjects.
+ * All-Classes / multi-class subjects keep teachers per class in Teachers Directory
+ * (English school-wide ≠ one teacher for every class).
  */
 function applyTeacherMappingsToSubjectsDirectory(teacher, mappings) {
   if (!teacher || !Array.isArray(SchoolData.subjects)) return false;
@@ -4402,39 +4515,49 @@ function applyTeacherMappingsToSubjectsDirectory(teacher, mappings) {
   const teacherName = String(teacher.name || linked.name || '').trim();
   if (!teacherName) return false;
 
-  const mappedCodes = new Set(
-    (mappings || []).map((m) => normalizeSubjectCodeBase(m.subjectCode || m.subjectName)).filter(Boolean)
-  );
-  const mapKeys = new Set(
-    (mappings || []).flatMap((m) => {
-      const codeKey = normalizeSubjectCodeBase(m.subjectCode || m.subjectName);
-      const classes = Array.isArray(m.classes) && m.classes.length
-        ? m.classes
-        : String(m.class || '').split(',').map((s) => s.trim()).filter(Boolean);
-      if (!classes.length || classes.some((c) => isUniversalSubjectClass(c))) {
-        return [`${codeKey}|*`];
-      }
-      return classes.map((cls) => `${codeKey}|${String(cls).trim().toLowerCase()}`);
-    })
-  );
   let changed = false;
   SchoolData.subjects.forEach((sub) => {
     const codeKey = normalizeSubjectCodeBase(sub.code);
-    const wasThisTeacher =
-      String(sub.teacher || '').trim().toLowerCase() === teacherName.toLowerCase();
-    const matched = isSubjectUniversal(sub)
-      ? mappedCodes.has(codeKey) || mapKeys.has(`${codeKey}|*`)
-      : getSubjectAppliesToClasses(sub).some((cls) =>
-          mapKeys.has(`${codeKey}|*`) || mapKeys.has(`${codeKey}|${String(cls).trim().toLowerCase()}`)
-        );
-    if (matched) {
+    if (isSubjectUniversal(sub) || getSubjectAppliesToClasses(sub).length > 1) {
+      const pinned = String(sub.teacher || '').trim();
+      if (
+        pinned &&
+        pinned.toLowerCase() !== 'unassigned' &&
+        !pinned.toLowerCase().includes('per class') &&
+        !pinned.toLowerCase().includes('teachers directory')
+      ) {
+        sub.teacher = 'Unassigned';
+        changed = true;
+      }
+      return;
+    }
+
+    const subjectClass = getSubjectAppliesToClasses(sub)[0];
+    const matchedInSave = (mappings || []).some((m) => {
+      if (normalizeSubjectCodeBase(m.subjectCode || m.subjectName) !== codeKey) return false;
+      return mappingAppliesToClass(m, subjectClass);
+    });
+    const matchedByOthers = (SchoolData.teachers || []).some((t) => {
+      if (t.id === teacher.id) return false;
+      const otherLinked = findStaffUserForTeacher(t);
+      if (!otherLinked || !isTeacherRoleUser(otherLinked)) return false;
+      return (t.subjectMappings || []).some((m) =>
+        normalizeSubjectCodeBase(m.subjectCode || m.subjectName) === codeKey &&
+        mappingAppliesToClass(m, subjectClass)
+      );
+    });
+
+    if (matchedInSave) {
       if (String(sub.teacher || '').trim() !== teacherName) {
         sub.teacher = teacherName;
         changed = true;
       }
-    } else if (wasThisTeacher) {
-      sub.teacher = 'Unassigned';
-      changed = true;
+    } else if (!matchedByOthers) {
+      const raw = String(sub.teacher || '').trim();
+      if (raw && raw.toLowerCase() !== 'unassigned') {
+        sub.teacher = 'Unassigned';
+        changed = true;
+      }
     }
   });
   return changed;
@@ -9783,7 +9906,7 @@ function renderSubjectsPage(container) {
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-book-open" style="color:var(--accent-primary)"></i> Subjects Directory</h2>
-        <p class="page-subtitle">Per subject: <strong>All Classes</strong> or <strong>selected classes only</strong>. No need to re-add the same subject for each class. Marks stay in <strong>Exams &amp; Report Cards</strong>.</p>
+        <p class="page-subtitle">Subject scope can be All Classes; teachers are assigned <strong>per class</strong> in Teachers Directory (English school-wide ≠ one teacher everywhere). Marks stay in Exams.</p>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
         <button class="btn btn-secondary" onclick="window.location.hash='exams-entry'"><i class="fa-solid fa-table-cells"></i> Open Exams &amp; Marks</button>
@@ -9808,7 +9931,7 @@ function renderSubjectsPage(container) {
               <th>Subject Code</th>
               <th>Subject Name</th>
               <th>Applies To</th>
-              <th>Assigned Subject Teacher</th>
+              <th>Teachers (per class)</th>
               <th>Weekly Periods</th>
               <th>Category</th>
               <th>Actions</th>
@@ -9820,7 +9943,7 @@ function renderSubjectsPage(container) {
                 <td><code>${escapeHtml(sub.code)}</code></td>
                 <td><strong style="color:var(--text-main);">${escapeHtml(sub.name)}</strong></td>
                 <td>${getSubjectClassBadgeHtml(sub)}</td>
-                <td><i class="fa-solid fa-user-tie" style="color:var(--accent-primary);"></i> ${escapeHtml(getSubjectTeacherDisplayName(sub))}</td>
+                <td>${getSubjectTeacherCellHtml(sub)}</td>
                 <td><span class="badge badge-info"><i class="fa-solid fa-clock"></i> ${sub.periodsPerWeek} Periods / Wk</span></td>
                 <td><span class="badge badge-success">${escapeHtml(sub.category || '')}</span></td>
                 <td>
@@ -9874,14 +9997,18 @@ function openCreateSubjectModal() {
                 <option value="Co-Curricular">Co-Curricular</option>
               </select>
             </div>
-            <div>
-              <label style="font-size:0.8rem; font-weight:600;">Assigned Subject Teacher (ERP user only)</label>
+            <div id="subTeacherBlock" style="display:none;">
+              <label style="font-size:0.8rem; font-weight:600;">Subject Teacher (only when one class is selected)</label>
               <select id="subTeacher" class="session-dropdown">
                 ${getSubjectTeacherAssignOptionsHtml('')}
               </select>
             </div>
+            <p id="subTeacherPerClassNote" style="font-size:0.78rem; color:#94a3b8; margin:0; background:#1e293b; padding:8px 12px; border-radius:6px;">
+              English can be <strong>All Classes</strong> while each class has a different teacher.
+              Map Sonam → English → Class 5 and another teacher → English → Class 6 in <strong>Teachers Directory</strong>.
+            </p>
             <p style="font-size:0.78rem; color:#94a3b8; margin:0; background:#1e293b; padding:8px 12px; border-radius:6px;">
-              Marks entry is in <strong>Exams &amp; Report Cards</strong>. This page only defines subjects / teachers / periods.
+              Marks entry is in <strong>Exams &amp; Report Cards</strong>.
             </p>
           </div>
 
@@ -9928,6 +10055,11 @@ function saveNewSubject() {
     category: cat
   };
   applySubjectClassScope(newSub, scope.mode, scope.classes);
+  if (isSubjectUniversal(newSub) || getSubjectAppliesToClasses(newSub).length !== 1) {
+    newSub.teacher = 'Unassigned';
+  } else {
+    newSub.teacher = teacherRaw || 'Unassigned';
+  }
 
   SchoolData.subjects.push(newSub);
 
@@ -9970,12 +10102,15 @@ function openEditSubjectModal(subId) {
               <label style="font-size:0.8rem; font-weight:600;">Weekly Periods Count *</label>
               <input type="number" id="subPeriods" class="session-dropdown" value="${sub.periodsPerWeek}">
             </div>
-            <div>
-              <label style="font-size:0.8rem; font-weight:600;">Assigned Subject Teacher (ERP user only)</label>
+            <div id="subTeacherBlock" style="display:none;">
+              <label style="font-size:0.8rem; font-weight:600;">Subject Teacher (only when one class is selected)</label>
               <select id="subTeacher" class="session-dropdown">
                 ${getSubjectTeacherAssignOptionsHtml(sub.teacher || '')}
               </select>
             </div>
+            <p id="subTeacherPerClassNote" style="font-size:0.78rem; color:#94a3b8; margin:0; background:#1e293b; padding:8px 12px; border-radius:6px;">
+              For All Classes / multi-class subjects, assign teachers <strong>per class</strong> in Teachers Directory — not one teacher for every class.
+            </p>
             <p style="font-size:0.78rem; color:#94a3b8; margin:0; background:#1e293b; padding:8px 12px; border-radius:6px;">
               Marks are entered in <strong>Exams &amp; Report Cards</strong> only.
             </p>
@@ -10015,7 +10150,11 @@ function saveSubjectEdit(subId) {
   sub.name = document.getElementById('subName').value.trim();
   applySubjectClassScope(sub, scope.mode, scope.classes);
   sub.periodsPerWeek = parseInt(document.getElementById('subPeriods').value) || 5;
-  sub.teacher = teacherRaw || 'Unassigned';
+  if (isSubjectUniversal(sub) || getSubjectAppliesToClasses(sub).length !== 1) {
+    sub.teacher = 'Unassigned';
+  } else {
+    sub.teacher = teacherRaw || 'Unassigned';
+  }
 
   const modal = document.getElementById('subjectModal');
   if (modal) modal.remove();
