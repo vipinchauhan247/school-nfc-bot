@@ -2002,6 +2002,24 @@ function switchActiveUser(uid, sessionToken) {
   handleRouting();
 }
 
+function mappingAppliesToClass(mapping, activeClass) {
+  if (!activeClass) return true;
+  if (!mapping) return false;
+  if (typeof isUniversalSubjectClass === 'function' && isUniversalSubjectClass(mapping.class)) return true;
+  if (Array.isArray(mapping.classes) && mapping.classes.length) {
+    if (mapping.classes.some((c) => typeof isUniversalSubjectClass === 'function' && isUniversalSubjectClass(c))) return true;
+    const want = String(activeClass).trim().toLowerCase();
+    return mapping.classes.some((c) => String(c).trim().toLowerCase() === want);
+  }
+  const legacy = String(mapping.class || '').trim();
+  if (!legacy) return true;
+  if (legacy.includes(',')) {
+    const want = String(activeClass).trim().toLowerCase();
+    return legacy.split(',').map((s) => s.trim().toLowerCase()).includes(want);
+  }
+  return legacy.toLowerCase() === String(activeClass).trim().toLowerCase();
+}
+
 function isSubjectEditableForActiveUser(subjectCode, activeClass = null, activeSection = null) {
   const user = getCurrentActiveUser();
   if (user.role === 'Receptionist') return false;
@@ -2020,8 +2038,11 @@ function isSubjectEditableForActiveUser(subjectCode, activeClass = null, activeS
   // Check granular subjectMappings array if present AND NOT EMPTY
   if (teacher.subjectMappings && Array.isArray(teacher.subjectMappings) && teacher.subjectMappings.length > 0) {
     const isMatched = teacher.subjectMappings.some(m => {
-      const matchSub = !subjectCode || m.subjectCode === subjectCode || (m.subjectName && m.subjectName.toLowerCase().includes((subjectCode || '').toLowerCase()));
-      const matchCls = !activeClass || m.class === activeClass;
+      const wantCode = normalizeSubjectCodeBase(subjectCode);
+      const mapCode = normalizeSubjectCodeBase(m.subjectCode || m.subjectName);
+      const matchSub = !subjectCode || mapCode === wantCode ||
+        (m.subjectName && String(m.subjectName).toLowerCase().includes(String(subjectCode || '').toLowerCase()));
+      const matchCls = mappingAppliesToClass(m, activeClass);
       const matchSec = !activeSection || activeSection === 'ALL' || m.section === 'ALL' || m.section === activeSection;
       return matchSub && matchCls && matchSec;
     });
@@ -2426,42 +2447,74 @@ function runPreLiveVerificationTests() {
 /* ============================================================================
    CLASS-WISE EXAM SUBJECTS & MAX MARKS CONFIGURATION ENGINE
    ============================================================================ */
+
+/** Strip class suffix so ENG-5 / ENG-6 / ENG collapse to one real subject. */
+function normalizeSubjectCodeBase(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_]+/g, '')
+    .replace(/-\d+$/g, '');
+}
+
+/**
+ * Real Subjects Directory only — no mock ENG/MAT seeds, no duplicate Mathematics rows.
+ * Optional forClass filters by All Classes / selected-classes scope.
+ */
+function getDirectorySubjectsUnique(options = {}) {
+  const forClass = options.forClass || null;
+  const byBase = new Map();
+
+  (SchoolData.subjects || []).forEach((s) => {
+    const code = String(s?.code || '').trim();
+    const name = String(s?.name || '').trim();
+    if (!code || !name) return;
+    if (forClass && typeof subjectAppliesToClass === 'function' && !subjectAppliesToClass(s, forClass)) return;
+
+    const base = normalizeSubjectCodeBase(code) || code.toLowerCase();
+    const candidate = {
+      id: s.id,
+      code,
+      name,
+      teacher: typeof getSubjectTeacherDisplayName === 'function' ? getSubjectTeacherDisplayName(s) : (s.teacher || 'Unassigned'),
+      maxMarks: s.maxMarks || 100,
+      periodsPerWeek: s.periodsPerWeek,
+      category: s.category,
+      raw: s
+    };
+    const existing = byBase.get(base);
+    if (!existing) {
+      byBase.set(base, candidate);
+      return;
+    }
+    const preferNew =
+      (typeof isSubjectUniversal === 'function' && isSubjectUniversal(s) && !isSubjectUniversal(existing.raw)) ||
+      (code.length < existing.code.length);
+    if (preferNew) byBase.set(base, candidate);
+  });
+
+  // Collapse same display name with different bases (MAT vs MTH both "Mathematics")
+  const byName = new Map();
+  Array.from(byBase.values()).forEach((item) => {
+    const nk = item.name.toLowerCase().replace(/\s+/g, ' ').trim();
+    const prev = byName.get(nk);
+    if (!prev || item.code.length < prev.code.length) byName.set(nk, item);
+  });
+
+  return Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+}
+
 function getSubjectsForClass(className) {
-  const list = [];
-  const addedCodes = new Set();
-
-  if (SchoolData.subjects && Array.isArray(SchoolData.subjects)) {
-    SchoolData.subjects.forEach(s => {
-      if (s.code && subjectAppliesToClass(s, className)) {
-        const code = s.code.toUpperCase();
-        if (!addedCodes.has(code)) {
-          addedCodes.add(code);
-          list.push({
-            code: code,
-            name: s.name.toUpperCase(),
-            maxMarks: s.maxMarks || 100,
-            teacher: getSubjectTeacherDisplayName(s)
-          });
-        }
-      }
-    });
-  }
-
-  // Fallback defaults if Subjects Directory (#subjects) is empty
-  if (list.length === 0) {
-    list.push(
-      { code: "ENG", name: "ENGLISH", maxMarks: 100 },
-      { code: "MAT", name: "MATHEMATICS", maxMarks: 100 },
-      { code: "HIN", name: "HINDI", maxMarks: 100 },
-      { code: "SCI", name: "SCIENCE", maxMarks: 100 },
-      { code: "SST", name: "SOCIAL STUDIES", maxMarks: 100 },
-      { code: "CMP", name: "COMPUTER", maxMarks: 100 }
-    );
-  }
-  return list;
+  return getDirectorySubjectsUnique({ forClass: className }).map((s) => ({
+    code: String(s.code).toUpperCase(),
+    name: String(s.name).toUpperCase(),
+    maxMarks: s.maxMarks || 100,
+    teacher: s.teacher || 'Unassigned'
+  }));
 }
 
 function getSubjectsForClassAndExam(className, examTerm) {
+  let list = null;
   if (examTerm === 'consolidated' && SchoolData.examSubjectConfigs && SchoolData.examSubjectConfigs[className]) {
     const componentTerms = ['ut1', 'ut2', 'half_yearly', 'ut3', 'ut4', 'final_annual'];
     const merged = [];
@@ -2478,12 +2531,32 @@ function getSubjectsForClassAndExam(className, examTerm) {
         });
       }
     });
-    if (merged.length > 0) return merged;
+    if (merged.length > 0) list = merged;
+  } else if (SchoolData.examSubjectConfigs && SchoolData.examSubjectConfigs[className] && SchoolData.examSubjectConfigs[className][examTerm]) {
+    list = SchoolData.examSubjectConfigs[className][examTerm];
   }
-  if (SchoolData.examSubjectConfigs && SchoolData.examSubjectConfigs[className] && SchoolData.examSubjectConfigs[className][examTerm]) {
-    return SchoolData.examSubjectConfigs[className][examTerm];
-  }
-  return getSubjectsForClass(className);
+
+  const directory = getSubjectsForClass(className);
+  if (!list || !list.length) return directory;
+  if (!directory.length) return [];
+
+  // Keep saved max/weightage, but only real Subjects Directory rows (no mocks / orphans).
+  const byBase = new Map(directory.map((s) => [normalizeSubjectCodeBase(s.code), s]));
+  const out = [];
+  const seenBase = new Set();
+  list.forEach((sub) => {
+    const base = normalizeSubjectCodeBase(sub.code || sub.name);
+    const dir = byBase.get(base);
+    if (!dir || seenBase.has(base)) return;
+    seenBase.add(base);
+    out.push({
+      ...sub,
+      code: dir.code,
+      name: dir.name,
+      teacher: dir.teacher || sub.teacher || 'Unassigned'
+    });
+  });
+  return out.length ? out : directory;
 }
 
 function startVisibleTextCleaner() {
@@ -3075,7 +3148,7 @@ function renderExamsWeightageSubdirectoryPage(container) {
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-sliders" style="color:#f59e0b"></i> Subject Exam Marks & Weightage</h2>
-        <p class="page-subtitle">Set subject-wise raw max marks and scaled weightage for each exam component.</p>
+        <p class="page-subtitle">Subjects come from <strong>Subjects Directory</strong> only (All Classes or selected classes). Teachers must be ERP users.</p>
       </div>
       <button class="btn btn-primary" onclick="window.location.hash='exams-entry'"><i class="fa-solid fa-table-cells"></i> Open Marks Sheet</button>
     </div>
@@ -3132,28 +3205,37 @@ function renderExamsWeightageSubdirectoryPage(container) {
             </tr>
           </thead>
           <tbody>
-            ${subjects.map(sub => {
+            ${subjects.length ? subjects.map(sub => {
               const code = sub.code || sub.name;
               const checked = isSubjectIncluded(code);
+              const teacherLabel = escapeHtml(sub.teacher || getSubjectTeacherDisplayName(sub) || 'Unassigned');
               return `
-                <tr class="subject-weightage-row" data-code="${code}" data-name="${sub.name}" data-teacher="${getSubjectTeacherDisplayName(sub)}" style="border-bottom:1px solid #1e293b;">
+                <tr class="subject-weightage-row" data-code="${escapeHtml(code)}" data-name="${escapeHtml(sub.name)}" data-teacher="${teacherLabel}" style="border-bottom:1px solid #1e293b;">
                   <td style="padding:12px; text-align:center;">
-                    <input type="checkbox" class="subject-weightage-include" data-code="${code}" ${checked ? 'checked' : ''} style="width:18px; height:18px; cursor:pointer;">
+                    <input type="checkbox" class="subject-weightage-include" data-code="${escapeHtml(code)}" ${checked ? 'checked' : ''} style="width:18px; height:18px; cursor:pointer;">
                   </td>
-                  <td style="padding:12px;"><code>${sub.code}</code></td>
-                  <td style="padding:12px;"><strong style="color:#ffffff;">${sub.name}</strong></td>
-                  <td style="padding:12px; color:#cbd5e1;">${getSubjectTeacherDisplayName(sub)}</td>
+                  <td style="padding:12px;"><code>${escapeHtml(sub.code)}</code></td>
+                  <td style="padding:12px;"><strong style="color:#ffffff;">${escapeHtml(sub.name)}</strong></td>
+                  <td style="padding:12px; color:#cbd5e1;">${teacherLabel}</td>
                   ${components.map(c => `
                     <td style="padding:10px; text-align:center;">
-                      <input type="number" class="subject-weightage-max session-dropdown" data-code="${code}" data-name="${sub.name}" data-component="${c.key}" value="${getSubjectExamComponentMax(selectedClass, code, c.key)}" style="width:84px; text-align:center; font-weight:800; color:#34d399; border:1px solid #34d399;">
+                      <input type="number" class="subject-weightage-max session-dropdown" data-code="${escapeHtml(code)}" data-name="${escapeHtml(sub.name)}" data-component="${c.key}" value="${getSubjectExamComponentMax(selectedClass, code, c.key)}" style="width:84px; text-align:center; font-weight:800; color:#34d399; border:1px solid #34d399;">
                     </td>
                     <td style="padding:10px; text-align:center;">
-                      <input type="number" class="subject-weightage-value session-dropdown" data-code="${code}" data-name="${sub.name}" data-component="${c.key}" value="${getSubjectExamComponentWeightage(selectedClass, code, c.key)}" style="width:84px; text-align:center; font-weight:800; color:#fbbf24; border:1px solid #fbbf24;">
+                      <input type="number" class="subject-weightage-value session-dropdown" data-code="${escapeHtml(code)}" data-name="${escapeHtml(sub.name)}" data-component="${c.key}" value="${getSubjectExamComponentWeightage(selectedClass, code, c.key)}" style="width:84px; text-align:center; font-weight:800; color:#fbbf24; border:1px solid #fbbf24;">
                     </td>
                   `).join('')}
                 </tr>
               `;
-            }).join('')}
+            }).join('') : `
+              <tr>
+                <td colspan="${4 + components.length * 2}" style="padding:28px; text-align:center; color:#94a3b8;">
+                  No real subjects for <strong>${escapeHtml(selectedClass)}</strong> yet.
+                  Open <a href="#subjects" style="color:#38bdf8;">Subjects Directory</a> and add subjects with
+                  <strong>All Classes</strong> or include this class in <strong>Selected classes</strong>.
+                </td>
+              </tr>
+            `}
           </tbody>
         </table>
       </div>
@@ -4321,22 +4403,30 @@ function applyTeacherMappingsToSubjectsDirectory(teacher, mappings) {
   if (!teacherName) return false;
 
   const mappedCodes = new Set(
-    (mappings || []).map((m) => normalizeSubjectCodeKey(m.subjectCode)).filter(Boolean)
+    (mappings || []).map((m) => normalizeSubjectCodeBase(m.subjectCode || m.subjectName)).filter(Boolean)
   );
   const mapKeys = new Set(
-    (mappings || []).map((m) =>
-      `${normalizeSubjectCodeKey(m.subjectCode)}|${String(m.class || '').trim().toLowerCase()}`
-    )
+    (mappings || []).flatMap((m) => {
+      const codeKey = normalizeSubjectCodeBase(m.subjectCode || m.subjectName);
+      const classes = Array.isArray(m.classes) && m.classes.length
+        ? m.classes
+        : String(m.class || '').split(',').map((s) => s.trim()).filter(Boolean);
+      if (!classes.length || classes.some((c) => isUniversalSubjectClass(c))) {
+        return [`${codeKey}|*`];
+      }
+      return classes.map((cls) => `${codeKey}|${String(cls).trim().toLowerCase()}`);
+    })
   );
   let changed = false;
   SchoolData.subjects.forEach((sub) => {
-    const codeKey = normalizeSubjectCodeKey(sub.code);
-    const key = `${codeKey}|${String(sub.class || '').trim().toLowerCase()}`;
+    const codeKey = normalizeSubjectCodeBase(sub.code);
     const wasThisTeacher =
       String(sub.teacher || '').trim().toLowerCase() === teacherName.toLowerCase();
     const matched = isSubjectUniversal(sub)
-      ? mappedCodes.has(codeKey)
-      : getSubjectAppliesToClasses(sub).some((cls) => mapKeys.has(`${codeKey}|${String(cls).trim().toLowerCase()}`));
+      ? mappedCodes.has(codeKey) || mapKeys.has(`${codeKey}|*`)
+      : getSubjectAppliesToClasses(sub).some((cls) =>
+          mapKeys.has(`${codeKey}|*`) || mapKeys.has(`${codeKey}|${String(cls).trim().toLowerCase()}`)
+        );
     if (matched) {
       if (String(sub.teacher || '').trim() !== teacherName) {
         sub.teacher = teacherName;
@@ -8894,9 +8984,12 @@ function renderTeachersPage(container) {
               <div><i class="fa-solid fa-chalkboard"></i> <strong>Classes Taught:</strong> ${(t.classesTaught || []).join(', ') || '-'}</div>
               <div>
                 <i class="fa-solid fa-list-check" style="color:#38bdf8;"></i> <strong>Assigned Subject Mappings:</strong><br>
-                ${(t.subjectMappings && t.subjectMappings.length > 0) ? t.subjectMappings.map(m => `
-                  <span class="badge badge-purple" style="font-size:0.75rem; margin:2px;">${m.subjectName} (${m.class} - Sec ${m.section})</span>
-                `).join('') : `<span style="color:#94a3b8; font-style:italic;">No custom subject mappings configured</span>`}
+                ${(t.subjectMappings && t.subjectMappings.length > 0) ? t.subjectMappings.map(m => {
+                  const classLabel = (Array.isArray(m.classes) && m.classes.length)
+                    ? (m.classes.some((c) => isUniversalSubjectClass(c)) ? 'All Classes' : m.classes.join(', '))
+                    : (isUniversalSubjectClass(m.class) ? 'All Classes' : (m.class || ''));
+                  return `<span class="badge badge-purple" style="font-size:0.75rem; margin:2px;">${escapeHtml(m.subjectName || m.subjectCode)} (${escapeHtml(classLabel)} · Sec ${escapeHtml(m.section || 'ALL')})</span>`;
+                }).join('') : `<span style="color:#94a3b8; font-style:italic;">No custom subject mappings configured</span>`}
               </div>
               <div><i class="fa-solid fa-clock" style="color:var(--accent-warning);"></i> <strong>Weekly Workload:</strong> ${t.weeklyPeriods || 0} Periods / Week</div>
             </div>
@@ -8927,36 +9020,102 @@ function renderTeachersPage(container) {
 }
 
 function getSubjectSelectOptionsHtml(selectedCode = '') {
-  const subjectMap = new Map();
-  
-  const defaultSubs = [
-    { code: 'SCI', name: 'Science' },
-    { code: 'MAT', name: 'Mathematics' },
-    { code: 'ENG', name: 'English' },
-    { code: 'HIN', name: 'Hindi' },
-    { code: 'SNK', name: 'Sanskrit' },
-    { code: 'SST', name: 'Social Studies' },
-    { code: 'CMP', name: 'Computer Science' },
-    { code: 'GK',  name: 'General Knowledge (GK)' },
-    { code: 'ART', name: 'Drawing & Art' }
-  ];
-
-  defaultSubs.forEach(s => subjectMap.set(s.code, s.name));
-
-  if (SchoolData.subjects && Array.isArray(SchoolData.subjects)) {
-    SchoolData.subjects.forEach(s => {
-      if (s.code && s.name) {
-        subjectMap.set(s.code, s.name);
-      }
-    });
+  const subjects = getDirectorySubjectsUnique();
+  if (!subjects.length) {
+    return '<option value="">No subjects yet — add them in Subjects Directory</option>';
   }
+  const selBase = normalizeSubjectCodeBase(selectedCode);
+  const selRaw = String(selectedCode || '').trim().toLowerCase();
+  return subjects.map((s) => {
+    const selected =
+      normalizeSubjectCodeBase(s.code) === selBase ||
+      String(s.code).trim().toLowerCase() === selRaw ||
+      String(s.name).trim().toLowerCase() === selRaw
+        ? 'selected'
+        : '';
+    return `<option value="${escapeHtml(s.code)}" ${selected}>${escapeHtml(s.name)}</option>`;
+  }).join('');
+}
 
-  let optionsHtml = '';
-  subjectMap.forEach((name, code) => {
-    const isSel = (selectedCode === code || selectedCode.toLowerCase() === name.toLowerCase() || code.toLowerCase() === selectedCode.toLowerCase()) ? 'selected' : '';
-    optionsHtml += `<option value="${code}" ${isSel}>${name}</option>`;
+function getMappingClassChecksHtml(mapping) {
+  const schoolClasses = getSchoolClassNames();
+  const universal = !mapping || (typeof isUniversalSubjectClass === 'function' && isUniversalSubjectClass(mapping.class)) ||
+    (Array.isArray(mapping.classes) && mapping.classes.some((c) => isUniversalSubjectClass(c)));
+  const selected = new Set();
+  if (!universal && mapping) {
+    const list = Array.isArray(mapping.classes) && mapping.classes.length
+      ? mapping.classes
+      : String(mapping.class || '').split(',').map((s) => s.trim()).filter(Boolean);
+    list.forEach((c) => selected.add(String(c).trim().toLowerCase()));
+  }
+  return schoolClasses.map((cls) => {
+    const checked = selected.has(String(cls).trim().toLowerCase()) ? 'checked' : '';
+    return `<label style="display:inline-flex; align-items:center; gap:6px; padding:5px 8px; background:#0f172a; border-radius:8px; border:1px solid #334155; font-size:0.75rem; cursor:pointer;">
+      <input type="checkbox" class="map-class-check" value="${escapeHtml(cls)}" ${checked} ${universal ? 'disabled' : ''}> ${escapeHtml(cls)}
+    </label>`;
+  }).join('');
+}
+
+function buildTeacherMappingRowHtml(mapping) {
+  const m = mapping || {};
+  const universal = !mapping || (typeof isUniversalSubjectClass === 'function' && isUniversalSubjectClass(m.class)) ||
+    (Array.isArray(m.classes) && m.classes.some((c) => isUniversalSubjectClass(c))) ||
+    (!m.class && !m.classes);
+  const sec = m.section || 'ALL';
+  return `
+    <div class="mapping-row" style="display:flex; flex-direction:column; gap:10px; background:#1e293b; padding:12px 14px; border-radius:10px; border:1px solid #334155;">
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <select class="map-sub session-dropdown" style="flex:1; min-width:180px;">
+          ${getSubjectSelectOptionsHtml(m.subjectCode || '')}
+        </select>
+        <select class="map-sec session-dropdown" style="width:120px;">
+          <option value="ALL" ${sec === 'ALL' ? 'selected' : ''}>All Secs</option>
+          <option value="A" ${sec === 'A' ? 'selected' : ''}>Sec A</option>
+          <option value="B" ${sec === 'B' ? 'selected' : ''}>Sec B</option>
+          <option value="C" ${sec === 'C' ? 'selected' : ''}>Sec C</option>
+        </select>
+        <button type="button" class="btn btn-secondary" onclick="this.closest('.mapping-row').remove()" style="background:#dc2626; color:#ffffff; border:none; padding:6px 10px;" title="Remove Mapping">
+          <i class="fa-solid fa-trash"></i>
+        </button>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:8px;">
+        <div style="display:flex; gap:14px; flex-wrap:wrap; font-size:0.82rem;">
+          <label style="display:inline-flex; align-items:center; gap:6px; cursor:pointer;">
+            <input type="radio" class="map-cls-mode" name="" value="all" ${universal ? 'checked' : ''} onchange="toggleMappingRowClassMode(this)">
+            <strong>All Classes</strong>
+          </label>
+          <label style="display:inline-flex; align-items:center; gap:6px; cursor:pointer;">
+            <input type="radio" class="map-cls-mode" name="" value="selected" ${universal ? '' : 'checked'} onchange="toggleMappingRowClassMode(this)">
+            <strong>Selected classes</strong>
+          </label>
+        </div>
+        <div class="map-class-checks" style="display:${universal ? 'none' : 'flex'}; flex-wrap:wrap; gap:6px;">
+          ${getMappingClassChecksHtml(m)}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function normalizeMappingRowRadioNames(container) {
+  const root = container || document.getElementById('subjectMappingsContainer');
+  if (!root) return;
+  Array.from(root.querySelectorAll('.mapping-row')).forEach((row, idx) => {
+    row.querySelectorAll('.map-cls-mode').forEach((radio) => {
+      radio.name = `mapClsMode_${idx}`;
+    });
   });
-  return optionsHtml;
+}
+
+function toggleMappingRowClassMode(radioEl) {
+  const row = radioEl?.closest('.mapping-row');
+  if (!row) return;
+  const mode = row.querySelector('.map-cls-mode:checked')?.value || 'all';
+  const box = row.querySelector('.map-class-checks');
+  if (!box) return;
+  const selected = mode === 'selected';
+  box.style.display = selected ? 'flex' : 'none';
+  box.querySelectorAll('.map-class-check').forEach((el) => { el.disabled = !selected; });
 }
 
 function openTeacherSubjectAssignmentsModal(teacherId) {
@@ -8974,68 +9133,40 @@ function openTeacherSubjectAssignmentsModal(teacherId) {
 
   if (!teacher.subjectMappings) teacher.subjectMappings = [];
 
+  const realSubjects = getDirectorySubjectsUnique();
+  if (!realSubjects.length) {
+    showNotification('No real subjects yet. Add subjects in Subjects Directory first (All Classes or selected classes).', 'warning');
+    window.location.hash = 'subjects';
+    return;
+  }
+
+  const rowsHtml = teacher.subjectMappings.length > 0
+    ? teacher.subjectMappings.map((m) => buildTeacherMappingRowHtml(m)).join('')
+    : buildTeacherMappingRowHtml(null);
+
   const modalHtml = `
     <div class="modal-overlay active" id="tchSubjectModal" style="z-index:999999; backdrop-filter:blur(8px);">
-      <div class="modal-box" style="max-width:650px; width:95%; background:#0f172a; color:#ffffff; padding:24px; border-radius:18px; border:2px solid #38bdf8; box-shadow:0 25px 50px -12px rgba(56,189,248,0.3);">
+      <div class="modal-box" style="max-width:720px; width:95%; background:#0f172a; color:#ffffff; padding:24px; border-radius:18px; border:2px solid #38bdf8; box-shadow:0 25px 50px -12px rgba(56,189,248,0.3);">
         <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; padding-bottom:14px; margin-bottom:18px;">
           <h3 style="margin:0; color:#38bdf8; font-size:1.2rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
-            <i class="fa-solid fa-book-open"></i> Configure Subject & Class Mappings: ${teacher.name}
+            <i class="fa-solid fa-book-open"></i> Configure Subject & Class Mappings: ${escapeHtml(teacher.name)}
           </h3>
           <button onclick="document.getElementById('tchSubjectModal').remove()" style="background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer; font-size:1rem;">X</button>
         </div>
 
         <p style="font-size:0.85rem; color:#cbd5e1; margin-bottom:16px;">
-          Linked login: <strong>@${linkedUser.username}</strong>. ${teacher.name} can enter marks only for the subject-class rows below.
+          Linked login: <strong>@${escapeHtml(linkedUser.username)}</strong>.
+          Only subjects from <strong>Subjects Directory</strong> appear here (no mock list).
+          Choose <strong>All Classes</strong> or tick selected classes for each subject.
         </p>
 
-        <div id="subjectMappingsContainer" style="display:flex; flex-direction:column; gap:10px; max-height:350px; overflow-y:auto; margin-bottom:18px;">
-          ${teacher.subjectMappings.length > 0 ? teacher.subjectMappings.map((m, idx) => `
-            <div class="mapping-row" style="display:flex; gap:10px; align-items:center; background:#1e293b; padding:10px 14px; border-radius:10px; border:1px solid #334155;">
-              <select class="map-sub session-dropdown" style="flex:1;">
-                ${getSubjectSelectOptionsHtml(m.subjectCode)}
-              </select>
-
-              <select class="map-cls session-dropdown" style="width:130px;">
-                ${getClassSelectOptionsHtml(m.class || 'Class 5')}
-              </select>
-
-              <select class="map-sec session-dropdown" style="width:110px;">
-                <option value="A" ${m.section === 'A' ? 'selected' : ''}>Sec A</option>
-                <option value="B" ${m.section === 'B' ? 'selected' : ''}>Sec B</option>
-                <option value="C" ${m.section === 'C' ? 'selected' : ''}>Sec C</option>
-                <option value="ALL" ${m.section === 'ALL' ? 'selected' : ''}>All Secs</option>
-              </select>
-
-              <button class="btn btn-secondary" onclick="this.parentElement.remove()" style="background:#dc2626; color:#ffffff; border:none; padding:6px 10px;" title="Remove Mapping">
-                <i class="fa-solid fa-trash"></i>
-              </button>
-            </div>
-          `).join('') : `
-            <div class="mapping-row" style="display:flex; gap:10px; align-items:center; background:#1e293b; padding:10px 14px; border-radius:10px; border:1px solid #334155;">
-              <select class="map-sub session-dropdown" style="flex:1;">
-                ${getSubjectSelectOptionsHtml('')}
-              </select>
-
-              <select class="map-cls session-dropdown" style="width:130px;">
-                ${getClassSelectOptionsHtml('Class 5')}
-              </select>
-
-              <select class="map-sec session-dropdown" style="width:110px;">
-                <option value="A" selected>Sec A</option>
-                <option value="B">Sec B</option>
-                <option value="ALL">All Secs</option>
-              </select>
-
-              <button class="btn btn-secondary" onclick="this.parentElement.remove()" style="background:#dc2626; color:#ffffff; border:none; padding:6px 10px;">
-                <i class="fa-solid fa-trash"></i>
-              </button>
-            </div>
-          `}
+        <div id="subjectMappingsContainer" style="display:flex; flex-direction:column; gap:12px; max-height:420px; overflow-y:auto; margin-bottom:18px;">
+          ${rowsHtml}
         </div>
 
-        <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
           <button class="btn btn-secondary" onclick="addSubjectMappingRowToModal()" style="background:#0284c7; color:#ffffff; border:none; padding:8px 16px; font-weight:700;">
-            <i class="fa-solid fa-plus"></i> Add Another Class-Subject Mapping
+            <i class="fa-solid fa-plus"></i> Add Another Subject Mapping
           </button>
 
           <button class="btn btn-primary" onclick="saveTeacherSubjectAssignments('${teacher.id}')" style="background:linear-gradient(135deg, #10b981 0%, #059669 100%); border:none; padding:10px 22px; font-weight:800;">
@@ -9047,34 +9178,18 @@ function openTeacherSubjectAssignmentsModal(teacherId) {
   `;
 
   document.body.insertAdjacentHTML('beforeend', modalHtml);
+  normalizeMappingRowRadioNames();
 }
 
 function addSubjectMappingRowToModal() {
   const container = document.getElementById('subjectMappingsContainer');
   if (!container) return;
-
-  const rowHtml = `
-    <div class="mapping-row" style="display:flex; gap:10px; align-items:center; background:#1e293b; padding:10px 14px; border-radius:10px; border:1px solid #334155;">
-      <select class="map-sub session-dropdown" style="flex:1;">
-        ${getSubjectSelectOptionsHtml('')}
-      </select>
-
-      <select class="map-cls session-dropdown" style="width:130px;">
-        ${getClassSelectOptionsHtml('Class 8')}
-      </select>
-
-      <select class="map-sec session-dropdown" style="width:110px;">
-        <option value="B" selected>Sec B</option>
-        <option value="A">Sec A</option>
-        <option value="ALL">All Secs</option>
-      </select>
-
-      <button class="btn btn-secondary" onclick="this.parentElement.remove()" style="background:#dc2626; color:#ffffff; border:none; padding:6px 10px;">
-        <i class="fa-solid fa-trash"></i>
-      </button>
-    </div>
-  `;
-  container.insertAdjacentHTML('beforeend', rowHtml);
+  if (!getDirectorySubjectsUnique().length) {
+    showNotification('Add real subjects in Subjects Directory first.', 'warning');
+    return;
+  }
+  container.insertAdjacentHTML('beforeend', buildTeacherMappingRowHtml(null));
+  normalizeMappingRowRadioNames(container);
 }
 
 function saveTeacherSubjectAssignments(teacherId) {
@@ -9087,31 +9202,59 @@ function saveTeacherSubjectAssignments(teacherId) {
     return;
   }
 
+  const realByCode = new Map(
+    getDirectorySubjectsUnique().map((s) => [normalizeSubjectCodeBase(s.code), s])
+  );
   const rows = document.querySelectorAll('#subjectMappingsContainer .mapping-row');
   const newMappings = [];
-  const classesTaughtSet = new Set(teacher.classesTaught || []);
+  const classesTaughtSet = new Set();
 
-  rows.forEach(r => {
+  for (const r of rows) {
     const mapSubSelect = r.querySelector('.map-sub');
-    const subCode = mapSubSelect?.value || 'ENG';
-    const rawText = mapSubSelect?.options[mapSubSelect.selectedIndex]?.text || subCode;
-    const subName = rawText.replace(/^[^\w]+/, '').trim();
+    const subCode = String(mapSubSelect?.value || '').trim();
+    if (!subCode) {
+      showNotification('Choose a real subject from Subjects Directory for each row.', 'error');
+      return;
+    }
+    const real = realByCode.get(normalizeSubjectCodeBase(subCode));
+    if (!real) {
+      showNotification(`"${subCode}" is not in Subjects Directory. Remove mock/old rows and pick a real subject.`, 'error');
+      return;
+    }
 
-    const cls = r.querySelector('.map-cls')?.value || 'Class 5';
-    const sec = r.querySelector('.map-sec')?.value || 'A';
+    const mode = r.querySelector('.map-cls-mode:checked')?.value || 'all';
+    let classes = [];
+    let classLabel = 'ALL CLASSES';
+    if (mode === 'all') {
+      classes = ['ALL CLASSES'];
+      classLabel = 'ALL CLASSES';
+      getSchoolClassNames().forEach((c) => classesTaughtSet.add(c));
+      classesTaughtSet.add('ALL');
+    } else {
+      classes = Array.from(r.querySelectorAll('.map-class-check:checked')).map((el) => el.value);
+      if (!classes.length) {
+        showNotification(`Select at least one class for ${real.name}, or choose All Classes.`, 'error');
+        return;
+      }
+      classLabel = classes.length === 1 ? classes[0] : classes.join(', ');
+      classes.forEach((c) => classesTaughtSet.add(c));
+    }
 
+    const sec = r.querySelector('.map-sec')?.value || 'ALL';
     newMappings.push({
-      subjectCode: subCode,
-      subjectName: subName || subCode,
-      class: cls,
+      subjectCode: real.code,
+      subjectName: real.name,
+      class: classLabel,
+      classes,
       section: sec
     });
-
-    classesTaughtSet.add(cls);
-  });
+  }
 
   teacher.subjectMappings = newMappings;
-  teacher.classesTaught = Array.from(classesTaughtSet);
+  teacher.classesTaught = Array.from(classesTaughtSet).filter((c) => c && c !== 'ALL');
+  if (classesTaughtSet.has('ALL') || newMappings.some((m) => isUniversalSubjectClass(m.class))) {
+    teacher.classesTaught = ['ALL', ...getSchoolClassNames()];
+  }
   teacher.linkedStaffUserId = linkedUser.id;
   linkedUser.assignedTeacherId = teacher.id;
   linkedUser.subjectMappings = newMappings;
@@ -9120,7 +9263,6 @@ function saveTeacherSubjectAssignments(teacherId) {
     linkedUser.assignedSubject = newMappings.map(m => m.subjectCode).join('/');
   }
 
-  // Subject Directory teacher column must show this user (not leftover demo names).
   applyTeacherMappingsToSubjectsDirectory(teacher, newMappings);
 
   saveSchoolDataToStorage();
