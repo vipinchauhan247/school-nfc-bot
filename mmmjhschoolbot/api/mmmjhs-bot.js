@@ -634,47 +634,30 @@ async function handleWhoAmI(chatId, from) {
   const wanted = String(chatId || '').trim();
   const byAdmission = new Map();
 
-  const addLinked = (rows) => {
-    (rows || []).forEach((row) => {
+  // Students tab is the source of truth for office Chat ID paste + /link.
+  try {
+    const students = await getRows('Students');
+    (students.rows || []).forEach((row) => {
       const data = normalizeRegistrationRow(row.data || row);
       const adm = normalizeAdmission(data.AdmissionNo);
       const rowChat = String(data.SchoolBotChatId || '').trim();
       if (!adm || !rowChat || rowChat !== wanted) return;
-      // Prefer the first hit; Students tab can fill name/class if Registrations is thin
-      if (!byAdmission.has(adm)) {
-        byAdmission.set(adm, data);
-        return;
-      }
-      const prev = byAdmission.get(adm);
       byAdmission.set(adm, {
-        ...prev,
-        ...data,
-        StudentName: data.StudentName || prev.StudentName,
-        Class: data.Class || prev.Class,
-        Section: data.Section || prev.Section,
+        AdmissionNo: data.AdmissionNo,
+        StudentName: data.StudentName,
+        Class: data.Class,
+        Section: data.Section,
         SchoolBotChatId: wanted,
-        Status: data.Status || prev.Status || 'Linked'
+        Status: data.Status || 'Linked'
       });
     });
-  };
-
-  try {
-    const regs = await getRows('Registrations');
-    addLinked(regs.rows);
-  } catch (error) {
-    console.error('Whoami registration lookup failed:', error.message);
-  }
-  try {
-    // Also include Students-tab links (/link writes Students first; Registrations can lag)
-    const students = await getRows('Students');
-    addLinked(students.rows);
   } catch (error) {
     console.error('Whoami students lookup failed:', error.message);
   }
 
   const linked = Array.from(byAdmission.values());
   if (!linked.length) {
-    await sendTelegram(chatId, `No Student Linked\n\nDear ${getTelegramName(from)}, this chat is not linked with any ERP student yet.\n\nSend /register <Admission No> to link.`);
+    await sendTelegram(chatId, `No Student Linked\n\nDear ${getTelegramName(from)}, this chat is not linked with any ERP student yet.\n\nSend /register <Admission No> to link, or ask the school office to paste your Chat ID on the Students sheet.`);
     return;
   }
   await sendTelegram(
