@@ -4234,7 +4234,7 @@ function toggleStaffPasswordVisible(userId) {
     el.setAttribute('data-showing', '0');
     if (btn) btn.textContent = 'Show';
   } else {
-    el.textContent = user.password || '(not set — use Reset Pass)';
+    el.textContent = user.password || '(hidden in cloud — login still works; Reset Pass to set/share a new one)';
     el.setAttribute('data-showing', '1');
     if (btn) btn.textContent = 'Hide';
   }
@@ -4268,26 +4268,41 @@ function resetStaffPassword(userId) {
   const u = SchoolData.staffUsers.find(x => x.id === userId);
   if (!u) return;
 
-  const newPass = prompt(`Set a new password for ${u.name} (${u.username}). Min 6 characters.`);
+  const newPass = prompt(`Set a new password for ${u.name} (${u.username}). Min 8 characters.`);
   if (newPass && newPass.trim()) {
-    if (newPass.trim().length < 6) {
-      showNotification('Password must be at least 6 characters.', 'warning');
+    if (newPass.trim().length < 8) {
+      showNotification('Password must be at least 8 characters (required for secure login).', 'warning');
       return;
     }
-    u.password = newPass.trim();
-    saveSchoolDataToStorage();
-    if (typeof pushSchoolDataToCloud === 'function') {
-      pushSchoolDataToCloud({ skipMergePull: true }).catch((err) => console.warn('Password cloud save:', err));
-    }
-    renderUsersPage(document.getElementById('contentBody'));
-    // Show once so Super Admin can share immediately
-    window.alert(
-      `Password updated for ${u.name}\n\n` +
-      `Username: ${u.username}\n` +
-      `Password: ${u.password}\n\n` +
-      `Share this privately (WhatsApp/SMS), or use Copy / Telegram on their row.`
-    );
-    showNotification(`Password reset for ${u.name}. Use Copy or Telegram to share.`, 'success');
+    const password = newPass.trim();
+    (async () => {
+      try {
+        // Real login uses erp_staff_credentials — must update that, not only the snapshot field.
+        await callErpSecurityApi('authAdminResetPassword', {
+          body: {
+            userId: u.id,
+            username: u.username,
+            newPassword: password
+          }
+        });
+        u.password = password;
+        saveSchoolDataToStorage({ skipCloudPush: true });
+        if (typeof pushSchoolDataToCloud === 'function') {
+          pushSchoolDataToCloud({ skipMergePull: true }).catch((err) => console.warn('Password snapshot mirror:', err));
+        }
+        renderUsersPage(document.getElementById('contentBody'));
+        window.alert(
+          `Password updated for ${u.name}\n\n` +
+          `Username: ${u.username}\n` +
+          `Password: ${password}\n\n` +
+          `This password now works for ERP login.\n` +
+          `After refresh, Show may say "not set" (passwords are hidden in cloud for security) — login still works.`
+        );
+        showNotification(`Password reset for ${u.name} and saved to secure login.`, 'success');
+      } catch (error) {
+        showNotification(error.message || 'Could not save password to secure login.', 'error');
+      }
+    })();
   }
 }
 
@@ -4456,8 +4471,15 @@ function saveNewStaffUser() {
 
   if (pushStaff) {
     pushStaff()
-      .then(() => {
-        showNotification(`Created ${name} [${username}] and saved to cloud.`, 'success');
+      .then(async () => {
+        try {
+          await callErpSecurityApi('authAdminResetPassword', {
+            body: { userId: newUser.id, username: newUser.username, newPassword: password }
+          });
+          showNotification(`Created ${name} [${username}] with secure login password.`, 'success');
+        } catch (err) {
+          showNotification(`User saved, but secure password setup failed: ${err.message}. Use Reset Pass.`, 'warning');
+        }
       })
       .catch((err) => {
         showNotification(`User created on screen, but cloud save failed: ${err.message}. They may disappear after refresh.`, 'error');

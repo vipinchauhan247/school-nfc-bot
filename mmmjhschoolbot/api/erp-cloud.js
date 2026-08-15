@@ -8,13 +8,15 @@
  * Does not replace snapshot sync.
  */
 
+const crypto = require('crypto');
+
 function json(res, status, body) {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-ERP-Cloud-Secret');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-ERP-Cloud-Secret,X-ERP-Session');
   res.end(JSON.stringify(body));
 }
 
@@ -22,7 +24,7 @@ function empty(res) {
   res.statusCode = 204;
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-ERP-Cloud-Secret');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-ERP-Cloud-Secret,X-ERP-Session');
   res.end();
 }
 
@@ -86,6 +88,42 @@ function authorize(req) {
   return provided === expected;
 }
 
+function safeEqual(a, b) {
+  const left = Buffer.from(String(a || ''), 'utf8');
+  const right = Buffer.from(String(b || ''), 'utf8');
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function normalizeUsername(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function hashSessionToken(token) {
+  return crypto.createHash('sha256').update(String(token || ''), 'utf8').digest('hex');
+}
+
+function hashPassword(password, salt, iterations) {
+  const rounds = Math.max(120000, Number(iterations || 210000));
+  return crypto.pbkdf2Sync(String(password || ''), String(salt || ''), rounds, 32, 'sha256').toString('hex');
+}
+
+function requestIpHash(req) {
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  const remote = forwarded || String(req.socket?.remoteAddress || '').trim();
+  if (!remote) return '';
+  const key = getEnv('ERP_AUDIT_HASH_KEY') || cloudSecret() || 'mmm-jhs-audit';
+  return crypto.createHmac('sha256', key).update(remote).digest('hex');
+}
+
+function requestUserAgent(req) {
+  return String(req.headers['user-agent'] || '').trim().slice(0, 500);
+}
+
+function isTcAdministrator(user) {
+  const role = String(user?.role || '').toLowerCase();
+  return role.includes('super admin') || role === 'admin' || user?.canIssueTC === true;
+}
+
 async function supabaseRequest(method, path, body, prefer) {
   const cfg = supabaseConfig();
   if (!cfg) throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are not set on Render.');
@@ -114,6 +152,522 @@ async function supabaseRequest(method, path, body, prefer) {
     throw new Error(msg || `Supabase HTTP ${response.status}`);
   }
   return data;
+}
+
+async function readSnapshotStaffUser(schoolId, usernameOrId) {
+  const snapshot = await readSnapshot(schoolId);
+  const staff = Array.isArray(snapshot?.payload?.staffUsers) ? snapshot.payload.staffUsers : [];
+  const key = normalizeUsername(usernameOrId);
+  return staff.find(user => (
+    normalizeUsername(user?.username) === key ||
+    normalizeUsername(user?.id) === key
+  )) || null;
+}
+
+async function readStaffCredential(schoolId, usernameOrId) {
+  const key = normalizeUsername(usernameOrId);
+  const rows = await supabaseRequest(
+    'GET',
+    `erp_staff_credentials?school_id=eq.${encodeURIComponent(schoolId)}&or=(username_lower.eq.${encodeURIComponent(key)},user_id.eq.${encodeURIComponent(String(usernameOrId || '').trim())})&select=*&limit=1`
+  );
+  return Array.isArray(rows) && rows.length ? rows[0] : null;
+}
+
+async function saveStaffCredential(schoolId, user, password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const iterations = 210000;
+  const row = {
+    school_id: schoolId,
+    user_id: String(user.id || user.username || '').trim(),
+    username_lower: normalizeUsername(user.username || user.id),
+    user_name: String(user.name || '').trim(),
+    role: String(user.role || '').trim(),
+    password_salt: salt,
+    password_hash: hashPassword(password, salt, iterations),
+    password_iterations: iterations,
+    active: user.active !== false && String(user.status || '').toLowerCase() !== 'inactive',
+    updated_at: new Date().toISOString()
+  };
+  const rows = await supabaseRequest(
+    'POST',
+    'erp_staff_credentials?on_conflict=school_id,user_id',
+    row,
+    'resolution=merge-duplicates,return=representation'
+  );
+  return Array.isArray(rows) ? rows[0] : rows;
+}
+
+function publicStaffUser(user) {
+  if (!user) return null;
+  const copy = { ...user };
+  delete copy.password;
+  delete copy.passwordHash;
+  delete copy.password_hash;
+  return copy;
+}
+
+function snapshotForBrowser(snapshot) {
+  if (!snapshot || !snapshot.payload || typeof snapshot.payload !== 'object') return snapshot;
+  const safe = {
+    ...snapshot,
+    payload: { ...snapshot.payload }
+  };
+  if (Array.isArray(snapshot.payload.staffUsers)) {
+    safe.payload.staffUsers = snapshot.payload.staffUsers.map(publicStaffUser);
+  }
+  return safe;
+}
+
+async function preserveSnapshotStaffPasswords(schoolId, payload) {
+  if (!payload || !Array.isArray(payload.staffUsers)) return payload;
+  const existing = await readSnapshot(schoolId);
+  const existingStaff = Array.isArray(existing?.payload?.staffUsers) ? existing.payload.staffUsers : [];
+  const byKey = new Map();
+  existingStaff.forEach(user => {
+    const keys = [normalizeUsername(user?.id), normalizeUsername(user?.username)].filter(Boolean);
+    keys.forEach(key => byKey.set(key, user));
+  });
+  const next = { ...payload };
+  next.staffUsers = payload.staffUsers.map(user => {
+    if (user?.password) return user;
+    const previous = byKey.get(normalizeUsername(user?.id)) || byKey.get(normalizeUsername(user?.username));
+    return previous?.password ? { ...user, password: previous.password } : user;
+  });
+  return next;
+}
+
+async function authenticateStaffPassword(schoolId, usernameOrId, password) {
+  const username = String(usernameOrId || '').trim();
+  const suppliedPassword = String(password || '');
+  if (!username || !suppliedPassword) return null;
+
+  const snapshotUser = await readSnapshotStaffUser(schoolId, username);
+  if (!snapshotUser) return null;
+  if (snapshotUser.active === false || String(snapshotUser.status || '').toLowerCase() === 'inactive') return null;
+
+  let credential = await readStaffCredential(schoolId, snapshotUser.username || snapshotUser.id);
+  if (credential) {
+    if (credential.active === false) return null;
+    const actual = hashPassword(suppliedPassword, credential.password_salt, credential.password_iterations);
+    return safeEqual(actual, credential.password_hash) ? publicStaffUser(snapshotUser) : null;
+  }
+
+  // One-time migration from the existing cloud snapshot. Once a credential row
+  // exists, the legacy snapshot password is never accepted again.
+  if (snapshotUser.password && safeEqual(snapshotUser.password, suppliedPassword)) {
+    credential = await saveStaffCredential(schoolId, snapshotUser, suppliedPassword);
+    return credential ? publicStaffUser(snapshotUser) : null;
+  }
+  return null;
+}
+
+async function writeAuditLog(entry) {
+  try {
+    await supabaseRequest('POST', 'erp_audit_logs', entry, 'return=minimal');
+  } catch (error) {
+    console.error('[ERP-AUDIT]', error.message);
+  }
+}
+
+async function createLoginSession(req, schoolId, user) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const tokenHash = hashSessionToken(token);
+  const rows = await supabaseRequest('POST', 'erp_login_sessions', {
+    school_id: schoolId,
+    user_id: String(user.id || user.username || ''),
+    username: String(user.username || user.id || ''),
+    user_name: String(user.name || ''),
+    role: String(user.role || ''),
+    token_hash: tokenHash,
+    status: 'active',
+    ip_hash: requestIpHash(req),
+    user_agent: requestUserAgent(req)
+  }, 'return=representation');
+  const session = Array.isArray(rows) ? rows[0] : rows;
+  return { token, session };
+}
+
+async function sessionFromToken(token, options) {
+  if (!token) return null;
+  const tokenHash = hashSessionToken(token);
+  const rows = await supabaseRequest(
+    'GET',
+    `erp_login_sessions?token_hash=eq.${encodeURIComponent(tokenHash)}&status=eq.active&select=*&limit=1`
+  );
+  const session = Array.isArray(rows) && rows.length ? rows[0] : null;
+  if (!session) return null;
+  const maxHours = Math.max(1, Number(getEnv('ERP_SESSION_HOURS') || 12));
+  const ageMs = Date.now() - new Date(session.logged_in_at).getTime();
+  if (!Number.isFinite(ageMs) || ageMs > maxHours * 60 * 60 * 1000) {
+    await supabaseRequest(
+      'PATCH',
+      `erp_login_sessions?id=eq.${encodeURIComponent(session.id)}`,
+      { status: 'expired', logged_out_at: new Date().toISOString() },
+      'return=minimal'
+    );
+    return null;
+  }
+  if (options?.touch !== false) {
+    await supabaseRequest(
+      'PATCH',
+      `erp_login_sessions?id=eq.${encodeURIComponent(session.id)}`,
+      { last_seen_at: new Date().toISOString() },
+      'return=minimal'
+    );
+  }
+  return session;
+}
+
+function requestSessionToken(req) {
+  return String(req.headers['x-erp-session'] || req.body?.sessionToken || req.query?.sessionToken || '').trim();
+}
+
+async function requireErpSession(req, res) {
+  const session = await sessionFromToken(requestSessionToken(req));
+  if (!session) {
+    json(res, 401, { ok: false, error: 'Your ERP session has expired. Please log in again.' });
+    return null;
+  }
+  return session;
+}
+
+async function handleAuthLogin(req, res, schoolId) {
+  if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST required.' });
+  if (!isTrustedSiteRequest(req)) return json(res, 403, { ok: false, error: 'Login is allowed only from the official ERP website.' });
+  const username = String(req.body?.username || '').trim();
+  const password = String(req.body?.password || '');
+  const user = await authenticateStaffPassword(schoolId, username, password);
+  if (!user) {
+    await writeAuditLog({
+      school_id: schoolId,
+      action: 'LOGIN_FAILED',
+      entity_type: 'staff_session',
+      entity_id: normalizeUsername(username),
+      metadata: { username: normalizeUsername(username), ipHash: requestIpHash(req), userAgent: requestUserAgent(req) }
+    });
+    return json(res, 401, { ok: false, error: 'Incorrect username or password.' });
+  }
+  const created = await createLoginSession(req, schoolId, user);
+  await writeAuditLog({
+    school_id: schoolId,
+    actor_user_id: String(user.id || user.username || ''),
+    actor_username: String(user.username || user.id || ''),
+    actor_name: String(user.name || ''),
+    actor_role: String(user.role || ''),
+    login_session_id: created.session.id,
+    action: 'LOGIN_SUCCESS',
+    entity_type: 'staff_session',
+    entity_id: created.session.id,
+    metadata: { loggedInAt: created.session.logged_in_at }
+  });
+  return json(res, 200, {
+    ok: true,
+    sessionToken: created.token,
+    session: {
+      id: created.session.id,
+      loggedInAt: created.session.logged_in_at,
+      expiresInHours: Math.max(1, Number(getEnv('ERP_SESSION_HOURS') || 12))
+    },
+    user
+  });
+}
+
+async function handleAuthLogout(req, res, schoolId) {
+  if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST required.' });
+  const session = await requireErpSession(req, res);
+  if (!session) return;
+  const loggedOutAt = new Date().toISOString();
+  await supabaseRequest(
+    'PATCH',
+    `erp_login_sessions?id=eq.${encodeURIComponent(session.id)}`,
+    { status: 'logged_out', logged_out_at: loggedOutAt, last_seen_at: loggedOutAt },
+    'return=minimal'
+  );
+  await writeAuditLog({
+    school_id: schoolId,
+    actor_user_id: session.user_id,
+    actor_username: session.username,
+    actor_name: session.user_name,
+    actor_role: session.role,
+    login_session_id: session.id,
+    action: 'LOGOUT',
+    entity_type: 'staff_session',
+    entity_id: session.id,
+    metadata: { loggedOutAt }
+  });
+  return json(res, 200, { ok: true, loggedOutAt });
+}
+
+async function handleAuthSession(req, res) {
+  const session = await requireErpSession(req, res);
+  if (!session) return;
+  return json(res, 200, {
+    ok: true,
+    session: {
+      id: session.id,
+      userId: session.user_id,
+      username: session.username,
+      userName: session.user_name,
+      role: session.role,
+      loggedInAt: session.logged_in_at,
+      lastSeenAt: session.last_seen_at
+    }
+  });
+}
+
+async function handleAuthChangePassword(req, res, schoolId) {
+  if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST required.' });
+  const session = await requireErpSession(req, res);
+  if (!session) return;
+  const currentPassword = String(req.body?.currentPassword || '');
+  const newPassword = String(req.body?.newPassword || '');
+  if (newPassword.length < 8) return json(res, 400, { ok: false, error: 'New password must be at least 8 characters.' });
+  const user = await authenticateStaffPassword(schoolId, session.username, currentPassword);
+  if (!user) return json(res, 403, { ok: false, error: 'Current password is incorrect.' });
+  await saveStaffCredential(schoolId, user, newPassword);
+  await writeAuditLog({
+    school_id: schoolId,
+    actor_user_id: session.user_id,
+    actor_username: session.username,
+    actor_name: session.user_name,
+    actor_role: session.role,
+    login_session_id: session.id,
+    action: 'PASSWORD_CHANGED',
+    entity_type: 'staff_user',
+    entity_id: session.user_id,
+    metadata: {}
+  });
+  return json(res, 200, { ok: true });
+}
+
+/** Super Admin / Principal resets another staff login password into erp_staff_credentials. */
+async function handleAuthAdminResetPassword(req, res, schoolId) {
+  if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST required.' });
+  const session = await requireErpSession(req, res);
+  if (!session) return;
+  const role = String(session.role || '').toLowerCase();
+  if (!(role.includes('super admin') || role.includes('principal') || role === 'admin')) {
+    return json(res, 403, { ok: false, error: 'Only Super Admin / Principal can reset staff passwords.' });
+  }
+  const targetKey = String(req.body?.userId || req.body?.username || '').trim();
+  const newPassword = String(req.body?.newPassword || '');
+  if (!targetKey) return json(res, 400, { ok: false, error: 'Target staff user is required.' });
+  if (newPassword.length < 8) return json(res, 400, { ok: false, error: 'New password must be at least 8 characters.' });
+
+  const target = await readSnapshotStaffUser(schoolId, targetKey);
+  if (!target) return json(res, 404, { ok: false, error: 'Staff user not found in cloud roster.' });
+
+  await saveStaffCredential(schoolId, target, newPassword);
+
+  // Keep snapshot password in sync for one-time migration / admin visibility before pull-strip.
+  try {
+    const snapshot = await readSnapshot(schoolId);
+    const payload = snapshot?.payload && typeof snapshot.payload === 'object' ? { ...snapshot.payload } : { version: '2.1', students: [] };
+    const staff = Array.isArray(payload.staffUsers) ? payload.staffUsers.slice() : [];
+    const idx = staff.findIndex(user =>
+      normalizeUsername(user?.id) === normalizeUsername(target.id) ||
+      normalizeUsername(user?.username) === normalizeUsername(target.username)
+    );
+    if (idx >= 0) {
+      staff[idx] = { ...staff[idx], password: newPassword };
+      payload.staffUsers = staff;
+      payload.savedAt = new Date().toISOString();
+      await writeSnapshot(schoolId, payload, `password-reset:${session.username}`);
+    }
+  } catch (error) {
+    console.error('[ERP-AUTH] snapshot password mirror failed:', error.message);
+  }
+
+  await writeAuditLog({
+    school_id: schoolId,
+    actor_user_id: session.user_id,
+    actor_username: session.username,
+    actor_name: session.user_name,
+    actor_role: session.role,
+    login_session_id: session.id,
+    action: 'PASSWORD_ADMIN_RESET',
+    entity_type: 'staff_user',
+    entity_id: String(target.id || target.username || ''),
+    metadata: { targetUsername: String(target.username || '') }
+  });
+
+  return json(res, 200, {
+    ok: true,
+    userId: target.id,
+    username: target.username,
+    name: target.name
+  });
+}
+
+async function handleAuthAudit(req, res, schoolId) {
+  const session = await requireErpSession(req, res);
+  if (!session) return;
+  if (!isTcAdministrator(session)) return json(res, 403, { ok: false, error: 'Administrator access required.' });
+  const rows = await supabaseRequest(
+    'GET',
+    `erp_login_sessions?school_id=eq.${encodeURIComponent(schoolId)}&select=id,user_id,username,user_name,role,logged_in_at,last_seen_at,logged_out_at,status,user_agent&order=logged_in_at.desc&limit=500`
+  );
+  return json(res, 200, { ok: true, sessions: Array.isArray(rows) ? rows : [] });
+}
+
+function certificatePublicView(row) {
+  if (!row) return null;
+  const student = row.student_snapshot || {};
+  return {
+    certificateNo: row.certificate_no,
+    status: String(row.status || '').toUpperCase(),
+    issuedAt: row.issued_at,
+    academicSession: row.academic_session,
+    student: {
+      name: student.name || '',
+      admissionNo: row.admission_no,
+      class: student.currentClass || student.class || student.lastClass || '',
+      section: student.currentSection || student.section || student.lastSection || ''
+    },
+    school: {
+      name: student.schoolName || 'Madan Mohan Malviya Junior High School',
+      address: student.schoolAddress || 'Sector 53, Noida'
+    },
+    revokedAt: row.revoked_at || null,
+    revocationReason: row.status === 'revoked' ? (row.revocation_reason || '') : ''
+  };
+}
+
+async function handleTcVerify(req, res) {
+  const token = String(req.query?.token || '').trim();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(token)) {
+    return json(res, 400, { ok: false, valid: false, error: 'Invalid verification code.' });
+  }
+  const rows = await supabaseRequest(
+    'GET',
+    `erp_tc_certificates?verification_token=eq.${encodeURIComponent(token)}&select=certificate_no,admission_no,academic_session,student_snapshot,issued_at,status,revoked_at,revocation_reason&limit=1`
+  );
+  const row = Array.isArray(rows) && rows.length ? rows[0] : null;
+  if (!row) return json(res, 404, { ok: false, valid: false, error: 'Certificate not found.' });
+  return json(res, 200, { ok: true, valid: row.status === 'valid', certificate: certificatePublicView(row) });
+}
+
+async function handleTcIssue(req, res, schoolId) {
+  if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST required.' });
+  const session = await requireErpSession(req, res);
+  if (!session) return;
+  if (!isTcAdministrator(session)) return json(res, 403, { ok: false, error: 'Super Admin access is required to issue a TC.' });
+
+  const adminPassword = String(req.body?.adminPassword || '');
+  const admin = await authenticateStaffPassword(schoolId, session.username, adminPassword);
+  if (!admin || !isTcAdministrator(admin)) {
+    await writeAuditLog({
+      school_id: schoolId,
+      actor_user_id: session.user_id,
+      actor_username: session.username,
+      actor_name: session.user_name,
+      actor_role: session.role,
+      login_session_id: session.id,
+      action: 'TC_ISSUE_DENIED',
+      entity_type: 'student',
+      entity_id: String(req.body?.admissionNo || ''),
+      metadata: { reason: 'Administrator password verification failed.' }
+    });
+    return json(res, 403, { ok: false, error: 'Administrator password is incorrect.' });
+  }
+
+  const admissionNo = normalizeAdmission(req.body?.admissionNo);
+  const snapshot = await readSnapshot(schoolId);
+  const students = Array.isArray(snapshot?.payload?.students) ? snapshot.payload.students : [];
+  const student = students.find(item => normalizeAdmission(item?.admissionNo || item?.AdmissionNo) === admissionNo);
+  if (!student) return json(res, 404, { ok: false, error: 'Student not found in the cloud roster.' });
+
+  const studentId = String(student.id || student.studentId || admissionNo);
+  const academicSession = String(req.body?.academicSession || snapshot?.payload?.activeSession || '').trim();
+  const certificateNo = String(req.body?.certificateNo || `TC-${academicSession}-${admissionNo}`).trim();
+  const profile = snapshot?.payload?.schoolProfile || {};
+  const officialSnapshot = {
+    id: studentId,
+    admissionNo,
+    name: student.name || '',
+    parentName: student.parentName || '',
+    motherName: student.motherName || '',
+    dob: student.dob || '',
+    gender: student.gender || '',
+    address: student.address || '',
+    currentClass: student.currentClass || student.class || '',
+    currentSection: student.currentSection || student.section || '',
+    academicSession,
+    schoolName: profile.name || 'Madan Mohan Malviya Junior High School',
+    schoolAddress: profile.address || 'Sector 53, Noida'
+  };
+  const rpcRows = await supabaseRequest('POST', 'rpc/erp_issue_tc', {
+    p_school_id: schoolId,
+    p_student_id: studentId,
+    p_admission_no: admissionNo,
+    p_certificate_no: certificateNo,
+    p_academic_session: academicSession,
+    p_student_snapshot: officialSnapshot,
+    p_issued_by_user_id: session.user_id,
+    p_issued_by_username: session.username,
+    p_issued_by_name: session.user_name,
+    p_login_session_id: session.id,
+    p_left_reason: String(req.body?.leftReason || "Parent's desire / Transfer to another school").trim()
+  });
+  const certificate = Array.isArray(rpcRows) ? rpcRows[0] : rpcRows;
+  return json(res, 200, {
+    ok: true,
+    certificate,
+    verificationUrl: `https://www.mmmjhschool.com/verify-tc.html?token=${encodeURIComponent(certificate.verification_token)}`
+  });
+}
+
+async function handleTcGet(req, res, schoolId) {
+  const session = await requireErpSession(req, res);
+  if (!session) return;
+  const admissionNo = normalizeAdmission(req.query?.admissionNo || req.body?.admissionNo);
+  const certificateNo = String(req.query?.certificateNo || req.body?.certificateNo || '').trim();
+  let filter = `school_id=eq.${encodeURIComponent(schoolId)}`;
+  if (certificateNo) filter += `&certificate_no=eq.${encodeURIComponent(certificateNo)}`;
+  else if (admissionNo) filter += `&admission_no=eq.${encodeURIComponent(admissionNo)}`;
+  else return json(res, 400, { ok: false, error: 'Admission or certificate number is required.' });
+  const rows = await supabaseRequest(
+    'GET',
+    `erp_tc_certificates?${filter}&select=*&order=issued_at.desc&limit=1`
+  );
+  const certificate = Array.isArray(rows) && rows.length ? rows[0] : null;
+  return json(res, 200, {
+    ok: true,
+    certificate,
+    verificationUrl: certificate ? `https://www.mmmjhschool.com/verify-tc.html?token=${encodeURIComponent(certificate.verification_token)}` : ''
+  });
+}
+
+async function handleTcList(req, res, schoolId) {
+  const session = await requireErpSession(req, res);
+  if (!session) return;
+  const rows = await supabaseRequest(
+    'GET',
+    `erp_tc_certificates?school_id=eq.${encodeURIComponent(schoolId)}&select=id,student_id,admission_no,certificate_no,academic_session,student_snapshot,issued_at,issued_by_name,status,revoked_at&order=issued_at.desc&limit=2000`
+  );
+  return json(res, 200, { ok: true, certificates: Array.isArray(rows) ? rows : [] });
+}
+
+async function handleTcRevoke(req, res, schoolId) {
+  if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST required.' });
+  const session = await requireErpSession(req, res);
+  if (!session) return;
+  if (!isTcAdministrator(session)) return json(res, 403, { ok: false, error: 'Super Admin access is required.' });
+  const admin = await authenticateStaffPassword(schoolId, session.username, String(req.body?.adminPassword || ''));
+  if (!admin || !isTcAdministrator(admin)) return json(res, 403, { ok: false, error: 'Administrator password is incorrect.' });
+  const certificateId = String(req.body?.certificateId || '').trim();
+  const reason = String(req.body?.reason || '').trim();
+  if (!certificateId || !reason) return json(res, 400, { ok: false, error: 'Certificate and revocation reason are required.' });
+  const result = await supabaseRequest('POST', 'rpc/erp_revoke_tc', {
+    p_school_id: schoolId,
+    p_certificate_id: certificateId,
+    p_revoked_by_user_id: session.user_id,
+    p_revoked_by_username: session.username,
+    p_revoked_by_name: session.user_name,
+    p_login_session_id: session.id,
+    p_reason: reason
+  });
+  return json(res, 200, { ok: true, certificate: Array.isArray(result) ? result[0] : result });
 }
 
 function normalizeAdmission(value) {
@@ -586,6 +1140,7 @@ async function readSnapshot(schoolId) {
 }
 
 async function writeSnapshot(schoolId, payload, savedBy) {
+  payload = await preserveSnapshotStaffPasswords(schoolId, payload);
   const row = {
     school_id: schoolId,
     payload,
@@ -665,7 +1220,11 @@ async function route(req, res, action) {
     await handleCloudConfig(req, res);
     return true;
   }
-  if (['cloudPull', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments', 'rebuildSnapshot', 'wipeRoster'].includes(act)) {
+  if ([
+    'cloudPull', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments',
+    'rebuildSnapshot', 'wipeRoster', 'authLogin', 'authLogout', 'authSession', 'authChangePassword',
+    'authAdminResetPassword', 'authAudit', 'tcIssue', 'tcGet', 'tcList', 'tcVerify', 'tcRevoke'
+  ].includes(act)) {
     await erpCloudHandler(req, res);
     return true;
   }
@@ -689,11 +1248,26 @@ async function erpCloudHandler(req, res) {
       });
     }
 
+    const schoolId = String(req.query.schoolId || req.body?.schoolId || schoolIdDefault()).trim() || schoolIdDefault();
+
+    // These actions have their own authentication rules. Public verification is
+    // token-scoped; login is restricted to the official site; all others require
+    // a valid short-lived ERP session.
+    if (action === 'tcVerify' && req.method === 'GET') return handleTcVerify(req, res);
+    if (action === 'authLogin') return handleAuthLogin(req, res, schoolId);
+    if (action === 'authLogout') return handleAuthLogout(req, res, schoolId);
+    if (action === 'authSession') return handleAuthSession(req, res);
+    if (action === 'authChangePassword') return handleAuthChangePassword(req, res, schoolId);
+    if (action === 'authAdminResetPassword') return handleAuthAdminResetPassword(req, res, schoolId);
+    if (action === 'authAudit') return handleAuthAudit(req, res, schoolId);
+    if (action === 'tcIssue') return handleTcIssue(req, res, schoolId);
+    if (action === 'tcGet') return handleTcGet(req, res, schoolId);
+    if (action === 'tcList') return handleTcList(req, res, schoolId);
+    if (action === 'tcRevoke') return handleTcRevoke(req, res, schoolId);
+
     if (!authorize(req)) {
       return json(res, 403, { ok: false, error: 'Invalid cloud sync secret.' });
     }
-
-    const schoolId = String(req.query.schoolId || req.body?.schoolId || schoolIdDefault()).trim() || schoolIdDefault();
 
     if (req.method === 'GET' && action === 'nativeStudents') {
       const students = await listNativeStudents(schoolId);
@@ -742,7 +1316,6 @@ async function erpCloudHandler(req, res) {
       };
       const existing = await readSnapshot(schoolId);
       const base = existing?.payload && typeof existing.payload === 'object' ? existing.payload : {};
-      // Keep staffUsers + teachers — wiping students must not delete school logins
       const payload = {
         ...base,
         ...emptyPayload,
@@ -783,7 +1356,7 @@ async function erpCloudHandler(req, res) {
         schoolId,
         rebuilt: !!ensured.rebuilt,
         studentCount: ensured.studentCount,
-        snapshot: ensured.snapshot,
+        snapshot: snapshotForBrowser(ensured.snapshot),
         native: true,
         feesNative: true
       });
@@ -805,7 +1378,7 @@ async function erpCloudHandler(req, res) {
         ok: true,
         configured: true,
         schoolId,
-        snapshot: snapshot || null,
+        snapshot: snapshotForBrowser(snapshot) || null,
         studentCount: snapshotStudentCount(snapshot),
         native: true,
         feesNative: true
