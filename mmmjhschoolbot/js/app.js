@@ -5720,10 +5720,10 @@ function applySchoolDataStoragePayload(parsed, options) {
     });
   }
   if (parsed.sessions) SchoolData.sessions = parsed.sessions;
-  if (parsed.teachers) SchoolData.teachers = parsed.teachers;
+  if (Array.isArray(parsed.teachers) || parsed.teachers) SchoolData.teachers = parsed.teachers || [];
   if (parsed.subjects) SchoolData.subjects = parsed.subjects;
   if (Array.isArray(parsed.staffUsers)) SchoolData.staffUsers = parsed.staffUsers;
-  if (Array.isArray(parsed.teachers)) SchoolData.teachers = parsed.teachers;
+  if (parsed.examSubjectConfigs) SchoolData.examSubjectConfigs = parsed.examSubjectConfigs;
   if (parsed.schoolProfile) {
     const prev = SchoolData.schoolProfile || {};
     const next = parsed.schoolProfile;
