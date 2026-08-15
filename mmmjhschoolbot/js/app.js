@@ -5686,8 +5686,10 @@ function buildSchoolDataStoragePayload() {
   };
 }
 
-function applySchoolDataStoragePayload(parsed) {
-  if (!parsed || !Array.isArray(parsed.students) || parsed.students.length === 0) return false;
+function applySchoolDataStoragePayload(parsed, options) {
+  const allowEmpty = !!(options && options.allowEmpty);
+  if (!parsed || !Array.isArray(parsed.students)) return false;
+  if (parsed.students.length === 0 && !allowEmpty) return false;
   if (parsed.students) SchoolData.students = parsed.students;
   if (parsed.classes) SchoolData.classes = parsed.classes;
   if (parsed.classFeeMaster) SchoolData.classFeeMaster = parsed.classFeeMaster;
@@ -5821,7 +5823,8 @@ async function hydrateSchoolDataFromIndexedDb() {
 
 /** Fast paint only — never treated as authority; cloud pull always replaces. */
 function saveCloudDisplayCache(payload) {
-  if (!payload || !Array.isArray(payload.students) || !payload.students.length) return Promise.resolve(false);
+  if (!payload || !Array.isArray(payload.students)) return Promise.resolve(false);
+  if (!payload.students.length) return clearCloudDisplayCache();
   const record = {
     savedAt: payload.savedAt || new Date().toISOString(),
     source: 'cloud',
@@ -5834,6 +5837,18 @@ function saveCloudDisplayCache(payload) {
     tx.onerror = () => reject(tx.error || new Error('display cache write failed'));
   })).catch(err => {
     console.warn('Display cache save skipped:', err);
+    return false;
+  });
+}
+
+function clearCloudDisplayCache() {
+  return openErpIndexedDb().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(ERP_IDB_STORE, 'readwrite');
+    tx.objectStore(ERP_IDB_STORE).delete(ERP_IDB_DISPLAY_KEY);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error || new Error('display cache clear failed'));
+  })).catch(err => {
+    console.warn('Display cache clear skipped:', err);
     return false;
   });
 }
@@ -5904,6 +5919,7 @@ window.clearLocalSchoolDataAuthorityStores = clearLocalSchoolDataAuthorityStores
 window.peekLocalSchoolDataForCloudMigration = peekLocalSchoolDataForCloudMigration;
 window.loadEmergencyLocalSchoolCache = loadEmergencyLocalSchoolCache;
 window.saveCloudDisplayCache = saveCloudDisplayCache;
+window.clearCloudDisplayCache = clearCloudDisplayCache;
 window.loadCloudDisplayCache = loadCloudDisplayCache;
 
 function freeDuplicateLocalStorageCopies() {

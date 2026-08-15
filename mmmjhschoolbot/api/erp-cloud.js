@@ -517,6 +517,33 @@ function snapshotStudentCount(snapshot) {
   return Array.isArray(students) ? students.length : 0;
 }
 
+async function clearNativeRoster(schoolId) {
+  const sid = encodeURIComponent(schoolId || schoolIdDefault());
+  const results = {};
+  try {
+    await supabaseRequest('DELETE', `erp_payments?school_id=eq.${sid}`, undefined, 'return=minimal');
+    results.payments = true;
+  } catch (err) {
+    console.error('[ERP-CLOUD] clear payments failed:', err.message);
+    results.payments = err.message;
+  }
+  try {
+    await supabaseRequest('DELETE', `erp_fee_sessions?school_id=eq.${sid}`, undefined, 'return=minimal');
+    results.feeSessions = true;
+  } catch (err) {
+    console.error('[ERP-CLOUD] clear fee sessions failed:', err.message);
+    results.feeSessions = err.message;
+  }
+  try {
+    await supabaseRequest('DELETE', `erp_students?school_id=eq.${sid}`, undefined, 'return=minimal');
+    results.students = true;
+  } catch (err) {
+    console.error('[ERP-CLOUD] clear students failed:', err.message);
+    results.students = err.message;
+  }
+  return results;
+}
+
 async function ensureSnapshotHasStudents(schoolId) {
   const snapshot = await readSnapshot(schoolId);
   const count = snapshotStudentCount(snapshot);
@@ -638,7 +665,7 @@ async function route(req, res, action) {
     await handleCloudConfig(req, res);
     return true;
   }
-  if (['cloudPull', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments', 'rebuildSnapshot'].includes(act)) {
+  if (['cloudPull', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments', 'rebuildSnapshot', 'wipeRoster'].includes(act)) {
     await erpCloudHandler(req, res);
     return true;
   }
@@ -705,6 +732,36 @@ async function erpCloudHandler(req, res) {
       });
     }
 
+    if ((req.method === 'POST' || req.method === 'GET') && action === 'wipeRoster') {
+      const emptyPayload = {
+        version: '2.1',
+        savedAt: new Date().toISOString(),
+        students: [],
+        cancelledReceipts: [],
+        intentionalEmpty: true
+      };
+      const existing = await readSnapshot(schoolId);
+      const base = existing?.payload && typeof existing.payload === 'object' ? existing.payload : {};
+      const payload = {
+        ...base,
+        ...emptyPayload,
+        students: [],
+        cancelledReceipts: Array.isArray(base.cancelledReceipts) ? [] : [],
+        intentionalEmpty: true
+      };
+      const cleared = await clearNativeRoster(schoolId);
+      const written = await writeSnapshot(schoolId, payload, 'wipe-roster');
+      return json(res, 200, {
+        ok: true,
+        configured: true,
+        schoolId,
+        wiped: true,
+        studentCount: 0,
+        cleared,
+        savedAt: written?.snapshot?.saved_at || payload.savedAt
+      });
+    }
+
     if ((req.method === 'POST' || req.method === 'GET') && action === 'rebuildSnapshot') {
       const ensured = await ensureSnapshotHasStudents(schoolId);
       if (!ensured.studentCount) {
@@ -729,9 +786,9 @@ async function erpCloudHandler(req, res) {
     }
 
     if (req.method === 'GET') {
-      // Auto-heal empty snapshot from native erp_students (824) + fees
-      const ensured = await ensureSnapshotHasStudents(schoolId);
-      let snapshot = ensured.snapshot;
+      // Do NOT auto-rebuild deleted/empty rosters from native leftovers.
+      // Empty snapshot is a valid fresh-start state. Use rebuildSnapshot only if asked.
+      let snapshot = await readSnapshot(schoolId);
       if (snapshot && snapshot.payload && snapshotStudentCount(snapshot) > 0) {
         try {
           const payments = await listNativePayments(schoolId);
@@ -745,11 +802,9 @@ async function erpCloudHandler(req, res) {
         configured: true,
         schoolId,
         snapshot: snapshot || null,
-        rebuiltFromNative: !!ensured.rebuilt,
-        studentCount: ensured.studentCount || snapshotStudentCount(snapshot),
+        studentCount: snapshotStudentCount(snapshot),
         native: true,
-        feesNative: true,
-        error: ensured.error || undefined
+        feesNative: true
       });
     }
 
@@ -762,16 +817,11 @@ async function erpCloudHandler(req, res) {
       if (!Array.isArray(payload.students)) {
         return json(res, 400, { ok: false, error: 'payload.students array is required.' });
       }
-      // Never allow an empty browser upload to wipe a healthy native roster
+      // Intentional empty = fresh start: clear native leftovers so old 824 cannot return
+      let wipedNative = null;
       if (payload.students.length === 0) {
-        const nativeCount = (await listNativeStudents(schoolId)).length;
-        if (nativeCount > 0) {
-          return json(res, 409, {
-            ok: false,
-            error: `Refusing empty roster upload: native tables still have ${nativeCount} students. Open the site after rebuildSnapshot.`,
-            nativeStudentCount: nativeCount
-          });
-        }
+        wipedNative = await clearNativeRoster(schoolId);
+        payload.intentionalEmpty = true;
       }
       const savedBy = String(body.savedBy || '').trim();
       const written = await writeSnapshot(schoolId, payload, savedBy);
@@ -782,6 +832,7 @@ async function erpCloudHandler(req, res) {
         schoolId,
         savedAt: snapshot?.saved_at || payload.savedAt,
         studentCount: payload.students.length,
+        wipedNative,
         native: true,
         nativePayments: written?.fees?.payments || 0,
         nativeFeeSessions: written?.fees?.sessions || 0

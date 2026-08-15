@@ -482,20 +482,53 @@
     };
   }
 
-  function cloudRebuildUrl() {
+  function cloudWipeUrl() {
     const schoolId = getCloudSchoolId();
-    return withCloudSecret(`${getErpCloudApiBase()}?action=rebuildSnapshot&schoolId=${encodeURIComponent(schoolId)}`);
+    return withCloudSecret(`${getErpCloudApiBase()}?action=wipeRoster&schoolId=${encodeURIComponent(schoolId)}`);
   }
 
-  async function rebuildCloudSnapshotFromNative() {
-    const res = await fetchWithRetry(cloudRebuildUrl(), {
+  async function wipeCloudRoster() {
+    const res = await fetchWithRetry(cloudWipeUrl(), {
       method: 'POST',
       headers: { ...cloudHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ schoolId: getCloudSchoolId() })
     });
     const data = await parseCloudResponse(res);
-    if (!data.ok) throw new Error(data.error || 'Native snapshot rebuild failed.');
+    if (!data.ok) throw new Error(data.error || 'Cloud wipe failed.');
     return data;
+  }
+
+  async function applyEmptyCloudRoster(cloudPayload, snapshot, options) {
+    const payload = {
+      ...(cloudPayload && typeof cloudPayload === 'object' ? cloudPayload : {}),
+      students: [],
+      savedAt: (cloudPayload && cloudPayload.savedAt) || (snapshot && snapshot.saved_at) || new Date().toISOString()
+    };
+    const applied = applySchoolDataStoragePayload(payload, { allowEmpty: true });
+    if (!applied) {
+      SchoolData.students = [];
+    }
+    if (typeof window.clearLocalSchoolDataAuthorityStores === 'function') {
+      window.clearLocalSchoolDataAuthorityStores();
+    }
+    // Do not keep a stale display cache of deleted students
+    if (typeof window.saveCloudDisplayCache === 'function') {
+      try { window.saveCloudDisplayCache({ ...payload, students: [] }); } catch (e) {}
+    }
+    window._erpCloudBootReady = true;
+    window._erpCloudPushDisabled = false;
+    window._erpCloudMemoryDirty = false;
+    window._erpCloudLastPullError = '';
+    if (typeof window.setCloudLoadingOverlay === 'function') window.setCloudLoadingOverlay(false);
+    refreshUiAfterCloudApply(options);
+    return {
+      ok: true,
+      configured: true,
+      applied: true,
+      empty: true,
+      studentCount: 0,
+      message: 'Cloud roster is empty — ready for a fresh student upload.'
+    };
   }
 
   async function pullSchoolDataFromCloud(options) {
@@ -507,60 +540,26 @@
 
     cloudSyncInFlight = true;
     try {
-      let data = await fetchCloudSnapshot();
+      const data = await fetchCloudSnapshot();
       if (!data.configured) return data;
 
-      let snapshot = data.snapshot;
-      let cloudPayload = snapshot && snapshot.payload;
+      const snapshot = data.snapshot;
+      const cloudPayload = snapshot && snapshot.payload;
       const snapshotCount = Array.isArray(cloudPayload?.students) ? cloudPayload.students.length : 0;
 
-      // Empty snapshot while native tables still have students → rebuild once
-      if (!snapshot || !cloudPayload || snapshotCount === 0) {
-        try {
-          const rebuilt = await rebuildCloudSnapshotFromNative();
-          if (rebuilt.snapshot && Array.isArray(rebuilt.snapshot.payload?.students) && rebuilt.snapshot.payload.students.length) {
-            snapshot = rebuilt.snapshot;
-            cloudPayload = snapshot.payload;
-            data = { ...data, ...rebuilt, rebuiltFromNative: true };
-          }
-        } catch (err) {
-          console.warn('Native rebuild attempt failed:', err);
-        }
+      // Empty roster is valid (user deleted students / fresh start). Never error, never auto-restore.
+      if (snapshot && cloudPayload && snapshotCount === 0) {
+        return await applyEmptyCloudRoster(cloudPayload, snapshot, options);
       }
 
       if (!snapshot || !cloudPayload) {
+        // No snapshot row yet — also a valid empty start for cloud-only
         if (isCloudOnly()) {
-          try {
-            const migrated = await migrateLocalRosterToCloudOnce();
-            if (migrated.migrated) {
-              window._erpCloudBootReady = true;
-              window._erpCloudPushDisabled = false;
-              window._erpCloudMemoryDirty = false;
-              if (typeof window.saveCloudDisplayCache === 'function' && typeof buildSchoolDataStoragePayload === 'function') {
-                try { window.saveCloudDisplayCache(buildSchoolDataStoragePayload()); } catch (e) {}
-              }
-              if (typeof window.setCloudLoadingOverlay === 'function') window.setCloudLoadingOverlay(false);
-              refreshUiAfterCloudApply(options);
-              return {
-                ok: true,
-                configured: true,
-                applied: true,
-                migrated: true,
-                studentCount: migrated.studentCount,
-                message: 'Uploaded previous browser data to cloud (one-time). Cloud is now the source of truth.'
-              };
-            }
-          } catch (err) {
-            console.warn('Cloud-only local migrate failed:', err);
-          }
+          return await applyEmptyCloudRoster({ students: [], version: '2.1' }, null, options);
         }
         window._erpCloudBootReady = true;
         window._erpCloudPushDisabled = false;
-        return { ok: true, configured: true, empty: true, message: 'No cloud snapshot yet. Upload from phone/PC that has correct fees.' };
-      }
-
-      if (!Array.isArray(cloudPayload.students) || cloudPayload.students.length === 0) {
-        throw new Error('Cloud snapshot has 0 students while native tables may still hold the roster. Deploy updated api/erp-cloud.js to Render and open Backup → Download from Cloud, or call rebuildSnapshot.');
+        return { ok: true, configured: true, empty: true, message: 'No cloud snapshot yet. Upload students when ready.' };
       }
 
       const localPayload = buildSchoolDataStoragePayload();
@@ -618,7 +617,9 @@
         };
       }
 
-      const applied = applySchoolDataStoragePayload(merged);
+      const applied = applySchoolDataStoragePayload(merged, {
+        allowEmpty: !!(merged.students && merged.students.length === 0)
+      });
       if (!applied) throw new Error('Cloud snapshot could not be applied.');
       if (typeof repairCrossDeviceStudentIdentityDrift === 'function') {
         repairCrossDeviceStudentIdentityDrift();
@@ -636,6 +637,7 @@
       window._erpCloudBootReady = true;
       window._erpCloudPushDisabled = false;
       window._erpCloudMemoryDirty = false;
+      window._erpCloudLastPullError = '';
       if (typeof saveSchoolDataToStorage === 'function') saveSchoolDataToStorage({ skipCloudPush: true });
 
       // Hybrid only: push merged fees back. Cloud-only never re-uploads local-only ghosts.
@@ -668,7 +670,6 @@
         configured: true,
         applied: true,
         cloudOnly,
-        rebuiltFromNative: !!data.rebuiltFromNative,
         studentCount: (merged.students || []).length,
         savedAt: cloudStamp,
         localFees,
@@ -686,25 +687,21 @@
     let payload = (options && options.payload) || buildSchoolDataStoragePayload();
     const cloudOnly = isCloudOnly();
 
-    if (!Array.isArray(payload.students) || payload.students.length === 0) {
-      throw new Error('Refusing to upload an empty student roster to cloud.');
-    }
+    // Empty upload is allowed (fresh start). Server clears native leftovers.
+    if (!Array.isArray(payload.students)) payload.students = [];
 
     // Hybrid: merge with current cloud so ₹0 PC cannot wipe ₹1900 phone.
     // Cloud-only: still soft-merge fees for admissions this device already has, so two
     // open PCs do not clobber each other — but never resurrect students from cloud
     // that this device deleted (localStudentsAuthoritative).
-    if (!(options && options.skipMergePull)) {
+    if (!(options && options.skipMergePull) && payload.students.length > 0) {
       try {
         const remote = await fetchCloudSnapshot();
         if (remote.configured && remote.snapshot && remote.snapshot.payload) {
           const remoteCount = Array.isArray(remote.snapshot.payload.students)
             ? remote.snapshot.payload.students.length
             : 0;
-          // Never merge/push when cloud already looks empty — rebuild first
-          if (remoteCount === 0 && payload.students.length > 0) {
-            // keep local payload as-is
-          } else {
+          if (remoteCount > 0) {
             payload = mergeSchoolPayloads(payload, remote.snapshot.payload, { localStudentsAuthoritative: true });
             if (typeof applySchoolDataStoragePayload === 'function') {
               applySchoolDataStoragePayload(payload);
@@ -843,23 +840,23 @@
     try {
       // Cloud-only: replace from Supabase. Hybrid: force-merge so stale PC picks up fees.
       const pull = await pullSchoolDataFromCloud({ silent: true, force: true });
+      window._erpCloudLastPullError = '';
       if (pull.applied && typeof showNotification === 'function') {
         if (pull.migrated) {
           showNotification(`Moved ${pull.studentCount} students from this browser into cloud. Cloud is now the only copy.`, 'success');
+        } else if (pull.empty || pull.studentCount === 0) {
+          showNotification('Cloud ready — student list is empty. Upload your fresh roster when ready.', 'info');
         } else if (!pull.silentToast) {
           const feeNote = pull.mergedFees && pull.mergedFees.total
             ? ` · fees ₹${Number(pull.mergedFees.total).toLocaleString('en-IN')}`
             : '';
           const mode = isCloudOnly() ? 'Cloud ERP' : 'School data synced';
-          // Quiet toast when display-cache already showed the same roster
           const alreadyShown = Array.isArray(window.SchoolData?.students)
             && window.SchoolData.students.length === pull.studentCount;
           if (!(isCloudOnly() && alreadyShown)) {
             showNotification(`${mode} (${pull.studentCount} students${feeNote}).`, 'success');
           }
         }
-      } else if (pull.empty && isCloudOnly() && typeof showNotification === 'function') {
-        showNotification(pull.message || 'Cloud is empty. Add students — they will save to cloud only.', 'warning');
       }
     } catch (err) {
       console.warn('Initial cloud pull failed:', err);
@@ -867,16 +864,20 @@
       if (isCloudOnly()) {
         const hasCache = Array.isArray(window.SchoolData?.students) && window.SchoolData.students.length > 0;
         if (!hasCache) {
-          const recovered = typeof window.loadEmergencyLocalSchoolCache === 'function'
-            && window.loadEmergencyLocalSchoolCache();
-          if (recovered && typeof showNotification === 'function') {
-            showNotification('Cloud unreachable — emergency local cache loaded. Reconnect soon; do not trust this copy long-term.', 'warning');
+          const msg = String(err.message || '');
+          if (/could not be applied|0 students|snapshot/i.test(msg)) {
+            SchoolData.students = [];
+            window._erpCloudBootReady = true;
+            window._erpCloudPushDisabled = false;
+            window._erpCloudLastPullError = '';
+            if (typeof showNotification === 'function') {
+              showNotification('Cloud ready — student list is empty. Upload your fresh roster when ready.', 'info');
+            }
           } else if (typeof showNotification === 'function') {
             showNotification(`Cloud ERP failed to load: ${err.message}`, 'error');
           }
         } else if (typeof showNotification === 'function') {
           showNotification('Cloud refresh failed — showing last cloud copy from this device.', 'warning');
-          // Allow working from display-cache until reconnect
           window._erpCloudBootReady = true;
           window._erpCloudPushDisabled = false;
         }
@@ -926,7 +927,7 @@
   window.mergeSchoolPayloadsForCloud = mergeSchoolPayloads;
   window.migrateLocalRosterToCloudOnce = migrateLocalRosterToCloudOnce;
   window.startCloudPrefetch = startCloudPrefetch;
-  window.rebuildCloudSnapshotFromNative = rebuildCloudSnapshotFromNative;
+  window.wipeCloudRoster = wipeCloudRoster;
 
   // Start download immediately — do not wait for DOMContentLoaded
   try { startCloudPrefetch(); } catch (e) {}
