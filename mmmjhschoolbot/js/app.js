@@ -4324,9 +4324,19 @@ function saveNewStaffUser() {
 
   document.getElementById('addUserModal')?.remove();
   saveSchoolDataToStorage();
-
-  showNotification(`Created staff account for ${name} [${username}] (${role}). Login is saved.`, 'success');
   renderUsersPage(document.getElementById('contentBody'));
+
+  if (typeof pushSchoolDataToCloud === 'function') {
+    pushSchoolDataToCloud({ skipMergePull: true })
+      .then(() => {
+        showNotification(`Created ${name} [${username}] and saved to cloud.`, 'success');
+      })
+      .catch((err) => {
+        showNotification(`User created on screen, but cloud save failed: ${err.message}. They may disappear after refresh.`, 'error');
+      });
+  } else {
+    showNotification(`Created staff account for ${name} [${username}] (${role}). Cloud sync missing — may not persist.`, 'warning');
+  }
 }
 
 function deleteStaffUser(uid) {
