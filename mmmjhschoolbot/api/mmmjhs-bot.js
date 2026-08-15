@@ -464,6 +464,34 @@ function findStudentMatches(students, admissionNo) {
   return students.filter(item => normalizeAdmission(item.data.AdmissionNo) === clean);
 }
 
+/** Write/update Registrations so office can verify Chat ID links (Students remains source of truth for /whoami). */
+async function upsertRegistrationLink(student, chatId, username, linkSource) {
+  const now = new Date().toLocaleString('en-IN');
+  const reg = {
+    DateTime: now,
+    Timestamp: now,
+    AdmissionNo: student.AdmissionNo,
+    StudentName: student.StudentName,
+    Class: student.Class,
+    Section: student.Section,
+    ParentName: student.ParentName,
+    ParentPhone: student.ParentPhone,
+    SchoolBotChatId: String(chatId),
+    TelegramUserName: username || '',
+    LinkSource: linkSource || 'Telegram',
+    Status: 'Linked'
+  };
+  const registrations = await getRows('Registrations');
+  const regHeaders = registrations.headers && registrations.headers.length
+    ? registrations.headers
+    : SHEET_HEADERS.Registrations;
+  const existing = registrations.rows.find(
+    (row) => normalizeAdmission(row.data.AdmissionNo) === normalizeAdmission(student.AdmissionNo)
+  );
+  if (existing) await updateRow('Registrations', existing.index, regHeaders, reg);
+  else await appendRow('Registrations', rowFromMap(regHeaders, reg), regHeaders);
+}
+
 async function handleRegister(chatId, from, admissionNo, command) {
   if (!admissionNo) {
     await sendTelegram(chatId, `Usage Error\n\nPlease send:\n/register <Admission No>\nExample: /register 2507`);
@@ -520,30 +548,8 @@ async function handleRegister(chatId, from, admissionNo, command) {
     }
   }
 
-  const now = new Date().toLocaleString('en-IN');
-  const reg = {
-    DateTime: now,
-    Timestamp: now,
-    AdmissionNo: student.AdmissionNo,
-    StudentName: student.StudentName,
-    Class: student.Class,
-    Section: student.Section,
-    ParentName: student.ParentName,
-    ParentPhone: student.ParentPhone,
-    SchoolBotChatId: String(chatId),
-    TelegramUserName: username,
-    LinkSource: `Telegram /${command}`,
-    Status: 'Linked'
-  };
-
   try {
-    const registrations = await getRows('Registrations');
-    const regHeaders = registrations.headers && registrations.headers.length
-      ? registrations.headers
-      : SHEET_HEADERS.Registrations;
-    const existing = registrations.rows.find(row => normalizeAdmission(row.data.AdmissionNo) === normalizeAdmission(admissionNo));
-    if (existing) await updateRow('Registrations', existing.index, regHeaders, reg);
-    else await appendRow('Registrations', rowFromMap(regHeaders, reg), regHeaders);
+    await upsertRegistrationLink(student, chatId, username, `Telegram /${command}`);
   } catch (error) {
     console.error('Registration sheet update failed:', error.message);
   }
@@ -632,6 +638,7 @@ ${lines.length ? lines.join('\n') : 'Fee due fields are not filled in the Google
 
 async function handleWhoAmI(chatId, from) {
   const wanted = String(chatId || '').trim();
+  const username = getTelegramName(from);
   const byAdmission = new Map();
 
   // Students tab is the source of truth for office Chat ID paste + /link.
@@ -647,7 +654,10 @@ async function handleWhoAmI(chatId, from) {
         StudentName: data.StudentName,
         Class: data.Class,
         Section: data.Section,
+        ParentName: data.ParentName,
+        ParentPhone: data.ParentPhone,
         SchoolBotChatId: wanted,
+        TelegramUserName: data.TelegramUserName || username,
         Status: data.Status || 'Linked'
       });
     });
@@ -657,12 +667,31 @@ async function handleWhoAmI(chatId, from) {
 
   const linked = Array.from(byAdmission.values());
   if (!linked.length) {
-    await sendTelegram(chatId, `No Student Linked\n\nDear ${getTelegramName(from)}, this chat is not linked with any ERP student yet.\n\nSend /register <Admission No> to link, or ask the school office to paste your Chat ID on the Students sheet.`);
+    await sendTelegram(chatId, `No Student Linked\n\nDear ${username}, this chat is not linked with any ERP student yet.\n\nSend /register <Admission No> to link, or ask the school office to paste your Chat ID on the Students sheet.`);
+    await logEvent(chatId, username, 'whoami', '', 'Not Linked', 'Whoami: no Students-tab Chat ID match');
     return;
   }
+
+  // Mirror Students links onto Registrations so office can verify there.
+  for (const student of linked) {
+    try {
+      await upsertRegistrationLink(student, wanted, student.TelegramUserName || username, 'Telegram /whoami (Students)');
+    } catch (error) {
+      console.error('Whoami registration verify write failed:', error.message);
+    }
+  }
+
   await sendTelegram(
     chatId,
     `Linked Student(s)\n\n${linked.map((row) => `Admission ${row.AdmissionNo}: ${row.StudentName} (${classSection(row)})`).join('\n')}`
+  );
+  await logEvent(
+    chatId,
+    username,
+    'whoami',
+    linked.map((r) => r.AdmissionNo).join(','),
+    'Verified',
+    `Whoami: ${linked.length} student(s) from Students; wrote Registrations`
   );
 }
 
