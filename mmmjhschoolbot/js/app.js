@@ -4393,6 +4393,10 @@ function saveNewStaffUser() {
     alert('Please enter both the Staff Full Name and Login Username!');
     return;
   }
+  if (password.length < 8) {
+    alert('Password must be at least 8 characters for secure ERP login.');
+    return;
+  }
 
   if (!SchoolData.staffUsers) SchoolData.staffUsers = [];
   if (!SchoolData.teachers) SchoolData.teachers = [];
