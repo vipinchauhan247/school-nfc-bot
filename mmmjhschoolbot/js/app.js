@@ -3488,7 +3488,12 @@ function renderUsersPage(container) {
                   <!-- USERNAME & PASSWORD -->
                   <td style="text-align:left; padding:12px;">
                     <span style="font-size:0.8rem; color:#94a3b8;">User:</span> <code style="color:#38bdf8; font-weight:bold;">${u.username || 'admin'}</code><br>
-                    <span style="font-size:0.8rem; color:#94a3b8;">Pass:</span> <code style="color:#64748b; font-weight:bold;">••••••••</code>
+                    <span style="font-size:0.8rem; color:#94a3b8;">Pass:</span>
+                    ${canRevealStaffPasswords() ? `
+                      <code id="staffPassText_${u.id}" style="color:#fbbf24; font-weight:bold;">••••••••</code>
+                      <button type="button" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem; margin-left:6px;" onclick="toggleStaffPasswordVisible('${u.id}')">Show</button>
+                      <button type="button" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem;" onclick="copyStaffLoginCredentials('${u.id}')">Copy</button>
+                    ` : `<code style="color:#64748b; font-weight:bold;">••••••••</code>`}
                   </td>
 
                   <!-- TEACHER SUBJECT MAPPINGS SINGLE SOURCE OF TRUTH -->
@@ -4073,11 +4078,61 @@ function sendStaffTelegramMessage() {
   showNotification(`Staff Telegram message sent to ${user.name}.`, 'success');
 }
 
+function canRevealStaffPasswords() {
+  const role = String(getCurrentActiveUser()?.role || '');
+  return role === 'Super Admin' || role === 'Principal';
+}
+
+function toggleStaffPasswordVisible(userId) {
+  if (!canRevealStaffPasswords()) {
+    showNotification('Only Super Admin / Principal can reveal staff passwords.', 'warning');
+    return;
+  }
+  const user = (SchoolData.staffUsers || []).find(u => u.id === userId);
+  const el = document.getElementById(`staffPassText_${userId}`);
+  const btn = el?.parentElement?.querySelector('button');
+  if (!user || !el) return;
+  const showing = el.getAttribute('data-showing') === '1';
+  if (showing) {
+    el.textContent = '••••••••';
+    el.setAttribute('data-showing', '0');
+    if (btn) btn.textContent = 'Show';
+  } else {
+    el.textContent = user.password || '(not set — use Reset Pass)';
+    el.setAttribute('data-showing', '1');
+    if (btn) btn.textContent = 'Hide';
+  }
+}
+
+function copyStaffLoginCredentials(userId) {
+  if (!canRevealStaffPasswords()) {
+    showNotification('Only Super Admin / Principal can copy staff passwords.', 'warning');
+    return;
+  }
+  const user = (SchoolData.staffUsers || []).find(u => u.id === userId);
+  if (!user) return;
+  if (!user.password) {
+    showNotification('No password set. Click Reset Pass first, then share the new password.', 'warning');
+    return;
+  }
+  const text = `MMM JHS ERP login\nWebsite: https://www.mmmjhschool.com\nUsername: ${user.username || ''}\nPassword: ${user.password}`;
+  const done = () => showNotification(`Copied login for ${user.name}. Share privately (WhatsApp/SMS).`, 'success');
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => {
+      window.prompt('Copy these credentials:', text);
+      done();
+    });
+  } else {
+    window.prompt('Copy these credentials:', text);
+    done();
+  }
+}
+
 function resetStaffPassword(userId) {
   const u = SchoolData.staffUsers.find(x => x.id === userId);
   if (!u) return;
 
-  const newPass = prompt(`Set a new password for ${u.name} (${u.username}). Do not reuse an old password.`);
+  const newPass = prompt(`Set a new password for ${u.name} (${u.username}). Min 6 characters.`);
   if (newPass && newPass.trim()) {
     if (newPass.trim().length < 6) {
       showNotification('Password must be at least 6 characters.', 'warning');
@@ -4085,8 +4140,18 @@ function resetStaffPassword(userId) {
     }
     u.password = newPass.trim();
     saveSchoolDataToStorage();
-    showNotification(`Password reset for ${u.name}. Share the new password privately — it is not shown on screen.`, 'success');
+    if (typeof pushSchoolDataToCloud === 'function') {
+      pushSchoolDataToCloud({ skipMergePull: true }).catch((err) => console.warn('Password cloud save:', err));
+    }
     renderUsersPage(document.getElementById('contentBody'));
+    // Show once so Super Admin can share immediately
+    window.alert(
+      `Password updated for ${u.name}\n\n` +
+      `Username: ${u.username}\n` +
+      `Password: ${u.password}\n\n` +
+      `Share this privately (WhatsApp/SMS), or use Copy / Telegram on their row.`
+    );
+    showNotification(`Password reset for ${u.name}. Use Copy or Telegram to share.`, 'success');
   }
 }
 
