@@ -631,22 +631,56 @@ ${lines.length ? lines.join('\n') : 'Fee due fields are not filled in the Google
 }
 
 async function handleWhoAmI(chatId, from) {
-  let linked = [];
+  const wanted = String(chatId || '').trim();
+  const byAdmission = new Map();
+
+  const addLinked = (rows) => {
+    (rows || []).forEach((row) => {
+      const data = normalizeRegistrationRow(row.data || row);
+      const adm = normalizeAdmission(data.AdmissionNo);
+      const rowChat = String(data.SchoolBotChatId || '').trim();
+      if (!adm || !rowChat || rowChat !== wanted) return;
+      // Prefer the first hit; Students tab can fill name/class if Registrations is thin
+      if (!byAdmission.has(adm)) {
+        byAdmission.set(adm, data);
+        return;
+      }
+      const prev = byAdmission.get(adm);
+      byAdmission.set(adm, {
+        ...prev,
+        ...data,
+        StudentName: data.StudentName || prev.StudentName,
+        Class: data.Class || prev.Class,
+        Section: data.Section || prev.Section,
+        SchoolBotChatId: wanted,
+        Status: data.Status || prev.Status || 'Linked'
+      });
+    });
+  };
+
   try {
-    const { rows } = await getRows('Registrations');
-    linked = rows.filter(row => String(row.data.SchoolBotChatId || '') === String(chatId));
+    const regs = await getRows('Registrations');
+    addLinked(regs.rows);
   } catch (error) {
     console.error('Whoami registration lookup failed:', error.message);
   }
-  if (!linked.length) {
-    const { rows } = await getRows('Students');
-    linked = rows.filter(row => String(row.data.SchoolBotChatId || '') === String(chatId));
+  try {
+    // Also include Students-tab links (/link writes Students first; Registrations can lag)
+    const students = await getRows('Students');
+    addLinked(students.rows);
+  } catch (error) {
+    console.error('Whoami students lookup failed:', error.message);
   }
+
+  const linked = Array.from(byAdmission.values());
   if (!linked.length) {
     await sendTelegram(chatId, `No Student Linked\n\nDear ${getTelegramName(from)}, this chat is not linked with any ERP student yet.\n\nSend /register <Admission No> to link.`);
     return;
   }
-  await sendTelegram(chatId, `Linked Student(s)\n\n${linked.map(row => `Admission ${row.data.AdmissionNo}: ${row.data.StudentName} (${classSection(row.data)})`).join('\n')}`);
+  await sendTelegram(
+    chatId,
+    `Linked Student(s)\n\n${linked.map((row) => `Admission ${row.AdmissionNo}: ${row.StudentName} (${classSection(row)})`).join('\n')}`
+  );
 }
 
 async function handleTelegramUpdate(update) {
