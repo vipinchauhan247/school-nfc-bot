@@ -9174,9 +9174,141 @@ function getMappingClassChecksHtml(mapping) {
   return schoolClasses.map((cls) => {
     const checked = selected.has(String(cls).trim().toLowerCase()) ? 'checked' : '';
     return `<label style="display:inline-flex; align-items:center; gap:6px; padding:5px 8px; background:#0f172a; border-radius:8px; border:1px solid #334155; font-size:0.75rem; cursor:pointer;">
-      <input type="checkbox" class="map-class-check" value="${escapeHtml(cls)}" ${checked} ${universal ? 'disabled' : ''}> ${escapeHtml(cls)}
+      <input type="checkbox" class="map-class-check" value="${escapeHtml(cls)}" ${checked} ${universal ? 'disabled' : ''} onchange="validateTeacherMappingFormLive()"> ${escapeHtml(cls)}
     </label>`;
   }).join('');
+}
+
+function sectionsOverlap(secA, secB) {
+  const a = String(secA || 'ALL').trim().toUpperCase() || 'ALL';
+  const b = String(secB || 'ALL').trim().toUpperCase() || 'ALL';
+  if (a === 'ALL' || b === 'ALL') return true;
+  return a === b;
+}
+
+function expandMappingClassesForOverlap(mapping) {
+  const classes = Array.isArray(mapping?.classes) && mapping.classes.length
+    ? mapping.classes
+    : String(mapping?.class || '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (!classes.length || classes.some((c) => isUniversalSubjectClass(c))) {
+    return getSchoolClassNames();
+  }
+  return classes;
+}
+
+/**
+ * Overlap = same subject + same class + overlapping sections.
+ * Allowed example:
+ *   Math · Class 4 + Class 6 · All Secs
+ *   Math · Class 5 · Sec B
+ * Blocked example:
+ *   Math · Class 5 · All Secs  AND  Math · Class 5 · Sec B
+ */
+function findTeacherMappingOverlaps(mappings, options = {}) {
+  const ignoreTeacherId = options.ignoreTeacherId || null;
+  const conflicts = [];
+  const slots = [];
+
+  const pushSlots = (mapping, meta) => {
+    const code = normalizeSubjectCodeBase(mapping.subjectCode || mapping.subjectName);
+    if (!code) return;
+    const section = mapping.section || 'ALL';
+    expandMappingClassesForOverlap(mapping).forEach((cls) => {
+      slots.push({
+        code,
+        className: String(cls).trim(),
+        section,
+        subjectName: mapping.subjectName || mapping.subjectCode,
+        teacherName: meta.teacherName || '',
+        teacherId: meta.teacherId || '',
+        rowIndex: meta.rowIndex
+      });
+    });
+  };
+
+  (mappings || []).forEach((m, idx) => pushSlots(m, {
+    teacherName: options.teacherName || '',
+    teacherId: options.teacherId || '',
+    rowIndex: idx + 1
+  }));
+
+  if (options.checkOtherTeachers) {
+    (SchoolData.teachers || []).forEach((t) => {
+      if (ignoreTeacherId && t.id === ignoreTeacherId) return;
+      (t.subjectMappings || []).forEach((m) => pushSlots(m, {
+        teacherName: t.name || '',
+        teacherId: t.id || '',
+        rowIndex: null
+      }));
+    });
+  }
+
+  for (let i = 0; i < slots.length; i++) {
+    for (let j = i + 1; j < slots.length; j++) {
+      const left = slots[i];
+      const right = slots[j];
+      if (left.code !== right.code) continue;
+      if (left.className.toLowerCase() !== right.className.toLowerCase()) continue;
+      if (!sectionsOverlap(left.section, right.section)) continue;
+      // Same teacher duplicate rows, or two teachers on same subject-class-section
+      if (left.teacherId && right.teacherId && left.teacherId === right.teacherId && left.rowIndex === right.rowIndex) continue;
+      conflicts.push({ left, right });
+    }
+  }
+  return conflicts;
+}
+
+function formatMappingOverlapMessage(conflicts) {
+  if (!conflicts.length) return '';
+  const first = conflicts[0];
+  const { left, right } = first;
+  const sameTeacher = left.teacherId && left.teacherId === right.teacherId;
+  if (sameTeacher) {
+    return `Overlap: ${left.subjectName} is mapped twice for ${left.className} ` +
+      `(Sec ${left.section} and Sec ${right.section}). ` +
+      `Use one row for classes that share the same section rule, and another row only when the section differs (e.g. Class 4+6 All Secs, Class 5 Sec B).`;
+  }
+  return `Overlap: ${left.subjectName} for ${left.className} Sec ${left.section} is already assigned to ${right.teacherName || 'another teacher'}. ` +
+    `Pick a free class/section, or change the other teacher's mapping first.`;
+}
+
+function readTeacherMappingDraftsFromForm(realByCode) {
+  const rows = Array.from(document.querySelectorAll('#subjectMappingsContainer .mapping-row'));
+  const drafts = [];
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const mapSubSelect = r.querySelector('.map-sub');
+    const subCode = String(mapSubSelect?.value || '').trim();
+    if (!subCode) {
+      return { error: 'Choose a real subject from Subjects Directory for each row.' };
+    }
+    const real = realByCode.get(normalizeSubjectCodeBase(subCode));
+    if (!real) {
+      return { error: `"${subCode}" is not in Subjects Directory. Remove mock/old rows and pick a real subject.` };
+    }
+    const mode = r.querySelector('.map-cls-mode:checked')?.value || 'all';
+    let classes = [];
+    let classLabel = 'ALL CLASSES';
+    if (mode === 'all') {
+      classes = ['ALL CLASSES'];
+      classLabel = 'ALL CLASSES';
+    } else {
+      classes = Array.from(r.querySelectorAll('.map-class-check:checked')).map((el) => el.value);
+      if (!classes.length) {
+        return { error: `Select at least one class for ${real.name}, or choose All Classes.` };
+      }
+      classLabel = classes.length === 1 ? classes[0] : classes.join(', ');
+    }
+    const sec = r.querySelector('.map-sec')?.value || 'ALL';
+    drafts.push({
+      subjectCode: real.code,
+      subjectName: real.name,
+      class: classLabel,
+      classes,
+      section: sec
+    });
+  }
+  return { drafts };
 }
 
 function buildTeacherMappingRowHtml(mapping) {
@@ -9188,27 +9320,27 @@ function buildTeacherMappingRowHtml(mapping) {
   return `
     <div class="mapping-row" style="display:flex; flex-direction:column; gap:10px; background:#1e293b; padding:12px 14px; border-radius:10px; border:1px solid #334155;">
       <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-        <select class="map-sub session-dropdown" style="flex:1; min-width:180px;">
+        <select class="map-sub session-dropdown" style="flex:1; min-width:180px;" onchange="validateTeacherMappingFormLive()">
           ${getSubjectSelectOptionsHtml(m.subjectCode || '')}
         </select>
-        <select class="map-sec session-dropdown" style="width:120px;">
+        <select class="map-sec session-dropdown" style="width:120px;" onchange="validateTeacherMappingFormLive()">
           <option value="ALL" ${sec === 'ALL' ? 'selected' : ''}>All Secs</option>
           <option value="A" ${sec === 'A' ? 'selected' : ''}>Sec A</option>
           <option value="B" ${sec === 'B' ? 'selected' : ''}>Sec B</option>
           <option value="C" ${sec === 'C' ? 'selected' : ''}>Sec C</option>
         </select>
-        <button type="button" class="btn btn-secondary" onclick="this.closest('.mapping-row').remove()" style="background:#dc2626; color:#ffffff; border:none; padding:6px 10px;" title="Remove Mapping">
+        <button type="button" class="btn btn-secondary" onclick="this.closest('.mapping-row').remove(); validateTeacherMappingFormLive();" style="background:#dc2626; color:#ffffff; border:none; padding:6px 10px;" title="Remove Mapping">
           <i class="fa-solid fa-trash"></i>
         </button>
       </div>
       <div style="display:flex; flex-direction:column; gap:8px;">
         <div style="display:flex; gap:14px; flex-wrap:wrap; font-size:0.82rem;">
           <label style="display:inline-flex; align-items:center; gap:6px; cursor:pointer;">
-            <input type="radio" class="map-cls-mode" name="" value="all" ${universal ? 'checked' : ''} onchange="toggleMappingRowClassMode(this)">
+            <input type="radio" class="map-cls-mode" name="" value="all" ${universal ? 'checked' : ''} onchange="toggleMappingRowClassMode(this); validateTeacherMappingFormLive();">
             <strong>All Classes</strong>
           </label>
           <label style="display:inline-flex; align-items:center; gap:6px; cursor:pointer;">
-            <input type="radio" class="map-cls-mode" name="" value="selected" ${universal ? '' : 'checked'} onchange="toggleMappingRowClassMode(this)">
+            <input type="radio" class="map-cls-mode" name="" value="selected" ${universal ? '' : 'checked'} onchange="toggleMappingRowClassMode(this); validateTeacherMappingFormLive();">
             <strong>Selected classes</strong>
           </label>
         </div>
@@ -9239,6 +9371,41 @@ function toggleMappingRowClassMode(radioEl) {
   const selected = mode === 'selected';
   box.style.display = selected ? 'flex' : 'none';
   box.querySelectorAll('.map-class-check').forEach((el) => { el.disabled = !selected; });
+}
+
+function validateTeacherMappingFormLive() {
+  const tip = document.getElementById('tchMappingOverlapTip');
+  if (!tip) return true;
+  const realByCode = new Map(
+    getDirectorySubjectsUnique().map((s) => [normalizeSubjectCodeBase(s.code), s])
+  );
+  const parsed = readTeacherMappingDraftsFromForm(realByCode);
+  if (parsed.error) {
+    tip.style.display = 'none';
+    return true;
+  }
+  const teacherId = tip.getAttribute('data-teacher-id') || '';
+  const selfConflicts = findTeacherMappingOverlaps(parsed.drafts, {
+    teacherId,
+    teacherName: tip.getAttribute('data-teacher-name') || '',
+    checkOtherTeachers: false
+  });
+  const crossConflicts = findTeacherMappingOverlaps(parsed.drafts, {
+    teacherId,
+    teacherName: tip.getAttribute('data-teacher-name') || '',
+    ignoreTeacherId: teacherId,
+    checkOtherTeachers: true
+  }).filter((c) => c.left.teacherId !== c.right.teacherId || c.left.rowIndex !== c.right.rowIndex);
+
+  const conflicts = selfConflicts.length ? selfConflicts : crossConflicts;
+  if (!conflicts.length) {
+    tip.style.display = 'none';
+    tip.textContent = '';
+    return true;
+  }
+  tip.style.display = 'block';
+  tip.textContent = formatMappingOverlapMessage(conflicts);
+  return false;
 }
 
 function openTeacherSubjectAssignmentsModal(teacherId) {
@@ -9277,11 +9444,14 @@ function openTeacherSubjectAssignmentsModal(teacherId) {
           <button onclick="document.getElementById('tchSubjectModal').remove()" style="background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer; font-size:1rem;">X</button>
         </div>
 
-        <p style="font-size:0.85rem; color:#cbd5e1; margin-bottom:16px;">
+        <p style="font-size:0.85rem; color:#cbd5e1; margin-bottom:12px;">
           Linked login: <strong>@${escapeHtml(linkedUser.username)}</strong>.
-          Only subjects from <strong>Subjects Directory</strong> appear here (no mock list).
-          Choose <strong>All Classes</strong> or tick selected classes for each subject.
+          Real Subjects Directory only.
+          <br>Example: <strong>Maths · Class 4 + Class 6 · All Secs</strong> in one row,
+          and <strong>Maths · Class 5 · Sec B</strong> in another row — allowed.
+          Same subject + same class + overlapping section (All Secs vs Sec B) is blocked.
         </p>
+        <p id="tchMappingOverlapTip" data-teacher-id="${escapeHtml(teacher.id)}" data-teacher-name="${escapeHtml(teacher.name)}" style="display:none; font-size:0.82rem; color:#fbbf24; background:#422006; border:1px solid #f59e0b; padding:10px 12px; border-radius:8px; margin:0 0 14px 0;"></p>
 
         <div id="subjectMappingsContainer" style="display:flex; flex-direction:column; gap:12px; max-height:420px; overflow-y:auto; margin-bottom:18px;">
           ${rowsHtml}
@@ -9302,6 +9472,7 @@ function openTeacherSubjectAssignmentsModal(teacherId) {
 
   document.body.insertAdjacentHTML('beforeend', modalHtml);
   normalizeMappingRowRadioNames();
+  validateTeacherMappingFormLive();
 }
 
 function addSubjectMappingRowToModal() {
@@ -9313,6 +9484,7 @@ function addSubjectMappingRowToModal() {
   }
   container.insertAdjacentHTML('beforeend', buildTeacherMappingRowHtml(null));
   normalizeMappingRowRadioNames(container);
+  validateTeacherMappingFormLive();
 }
 
 function saveTeacherSubjectAssignments(teacherId) {
@@ -9328,50 +9500,45 @@ function saveTeacherSubjectAssignments(teacherId) {
   const realByCode = new Map(
     getDirectorySubjectsUnique().map((s) => [normalizeSubjectCodeBase(s.code), s])
   );
-  const rows = document.querySelectorAll('#subjectMappingsContainer .mapping-row');
-  const newMappings = [];
+  const parsed = readTeacherMappingDraftsFromForm(realByCode);
+  if (parsed.error) {
+    showNotification(parsed.error, 'error');
+    return;
+  }
+
+  const selfConflicts = findTeacherMappingOverlaps(parsed.drafts, {
+    teacherId: teacher.id,
+    teacherName: teacher.name,
+    checkOtherTeachers: false
+  });
+  if (selfConflicts.length) {
+    showNotification(formatMappingOverlapMessage(selfConflicts), 'error');
+    validateTeacherMappingFormLive();
+    return;
+  }
+
+  const crossConflicts = findTeacherMappingOverlaps(parsed.drafts, {
+    teacherId: teacher.id,
+    teacherName: teacher.name,
+    ignoreTeacherId: teacher.id,
+    checkOtherTeachers: true
+  }).filter((c) => !(c.left.teacherId === teacher.id && c.right.teacherId === teacher.id));
+  if (crossConflicts.length) {
+    showNotification(formatMappingOverlapMessage(crossConflicts), 'error');
+    validateTeacherMappingFormLive();
+    return;
+  }
+
+  const newMappings = parsed.drafts;
   const classesTaughtSet = new Set();
-
-  for (const r of rows) {
-    const mapSubSelect = r.querySelector('.map-sub');
-    const subCode = String(mapSubSelect?.value || '').trim();
-    if (!subCode) {
-      showNotification('Choose a real subject from Subjects Directory for each row.', 'error');
-      return;
-    }
-    const real = realByCode.get(normalizeSubjectCodeBase(subCode));
-    if (!real) {
-      showNotification(`"${subCode}" is not in Subjects Directory. Remove mock/old rows and pick a real subject.`, 'error');
-      return;
-    }
-
-    const mode = r.querySelector('.map-cls-mode:checked')?.value || 'all';
-    let classes = [];
-    let classLabel = 'ALL CLASSES';
-    if (mode === 'all') {
-      classes = ['ALL CLASSES'];
-      classLabel = 'ALL CLASSES';
+  newMappings.forEach((m) => {
+    if (m.classes.some((c) => isUniversalSubjectClass(c))) {
       getSchoolClassNames().forEach((c) => classesTaughtSet.add(c));
       classesTaughtSet.add('ALL');
     } else {
-      classes = Array.from(r.querySelectorAll('.map-class-check:checked')).map((el) => el.value);
-      if (!classes.length) {
-        showNotification(`Select at least one class for ${real.name}, or choose All Classes.`, 'error');
-        return;
-      }
-      classLabel = classes.length === 1 ? classes[0] : classes.join(', ');
-      classes.forEach((c) => classesTaughtSet.add(c));
+      m.classes.forEach((c) => classesTaughtSet.add(c));
     }
-
-    const sec = r.querySelector('.map-sec')?.value || 'ALL';
-    newMappings.push({
-      subjectCode: real.code,
-      subjectName: real.name,
-      class: classLabel,
-      classes,
-      section: sec
-    });
-  }
+  });
 
   teacher.subjectMappings = newMappings;
   teacher.classesTaught = Array.from(classesTaughtSet).filter((c) => c && c !== 'ALL');
