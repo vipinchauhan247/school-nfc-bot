@@ -1599,11 +1599,23 @@ async function initApp() {
 
   // Cloud-only: wait for Supabase BEFORE first paint of users/students
   if (typeof initCloudSync === 'function') {
+    // Never leave "Updating from cloud…" stuck if pull hangs or is very slow.
+    const bootWatchdog = setTimeout(() => {
+      try {
+        window._erpCloudBootReady = true;
+        window._erpCloudPushDisabled = false;
+        setCloudLoadingOverlay(false);
+        if (typeof showNotification === 'function') {
+          showNotification('Cloud update is slow — showing cached school data. Refresh again if needed.', 'warning');
+        }
+      } catch (e) {}
+    }, 25000);
     try {
       await initCloudSync();
     } catch (err) {
       console.warn('Cloud sync init:', err);
     } finally {
+      clearTimeout(bootWatchdog);
       setCloudLoadingOverlay(false);
     }
   } else {

@@ -76,11 +76,20 @@
     const max = retries == null ? 2 : retries;
     let lastErr;
     for (let attempt = 0; attempt <= max; attempt++) {
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timeoutMs = 20000;
+      const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
       try {
-        return await fetch(url, options);
+        const opts = Object.assign({}, options || {});
+        if (controller) opts.signal = controller.signal;
+        return await fetch(url, opts);
       } catch (err) {
-        lastErr = err;
-        if (attempt < max) await new Promise((resolve) => setTimeout(resolve, 3500));
+        lastErr = err && err.name === 'AbortError'
+          ? new Error('Cloud request timed out. Check Render / internet and refresh.')
+          : err;
+        if (attempt < max) await new Promise((resolve) => setTimeout(resolve, 2500));
+      } finally {
+        if (timer) clearTimeout(timer);
       }
     }
     throw lastErr;
@@ -904,6 +913,11 @@
       // Cloud-only: replace from Supabase. Hybrid: force-merge so stale PC picks up fees.
       const pull = await pullSchoolDataFromCloud({ silent: true, force: true });
       window._erpCloudLastPullError = '';
+      // If a parallel prefetch held the lock, do not leave boot hanging forever.
+      if (pull && pull.skipped && isCloudOnly()) {
+        window._erpCloudBootReady = true;
+        window._erpCloudPushDisabled = false;
+      }
       if (pull.applied && typeof showNotification === 'function') {
         if (pull.migrated) {
           showNotification(`Moved ${pull.studentCount} students from this browser into cloud. Cloud is now the only copy.`, 'success');
