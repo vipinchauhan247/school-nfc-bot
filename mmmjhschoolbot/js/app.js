@@ -1374,6 +1374,25 @@ function getStudentsByActiveSession() {
 
     normalizeFeeRecordFromReceipts(s, currentSession);
     return s;
+  }).filter(isStudentActiveForRoster);
+}
+
+function isStudentActiveForRoster(student) {
+  if (!student) return false;
+  const currentSession = SchoolData.activeSession || '2026-27';
+  const sessionStatus = String(student.sessionDetails?.[currentSession]?.status || '').trim().toLowerCase();
+  const status = String(student.status || '').trim().toLowerCase();
+  return !['left', 'inactive', 'withdrawn', 'transferred'].includes(status) && sessionStatus !== 'inactive' && sessionStatus !== 'left';
+}
+
+function getLeftStudents() {
+  const currentSession = SchoolData.activeSession || '2026-27';
+  if (!Array.isArray(SchoolData.students)) return [];
+  return SchoolData.students.filter(student => !isStudentActiveForRoster(student)).map(student => {
+    if (!student.currentClass) student.currentClass = student.class || '';
+    if (!student.currentSection) student.currentSection = student.section || '';
+    normalizeFeeRecordFromReceipts(student, currentSession);
+    return student;
   });
 }
 
@@ -1595,6 +1614,7 @@ async function initApp() {
     }
   }
 
+  await validateStoredErpSession();
   handleRouting();
 }
 
@@ -1659,6 +1679,9 @@ function handleRouting() {
       if (page === 'settings' || page === 'print-settings') {
         isAllowed = isAdmin || isAccountant || activeUser?.canManageFees === true;
       }
+      if (page === 'login-audit') {
+        isAllowed = canManageSchoolProfile;
+      }
       if (!isAdmin) {
         if (['fees', 'receipts'].includes(page)) {
           isAllowed = isAccountant || activeUser?.canManageFees === true || activeUser?.viewTotalRevenue === true;
@@ -1688,6 +1711,13 @@ function handleRouting() {
     // Security Gatekeeper: Block unauthorized route hash access
     if (hash === 'school-profile' && !canManageSchoolProfile) {
       showNotification('Access Denied: School Profile is restricted to Admin and Super Admin only.', 'warning');
+      window.location.hash = 'dashboard';
+      renderDashboard(container);
+      return;
+    }
+
+    if (hash === 'login-audit' && !canManageSchoolProfile) {
+      showNotification('Access Denied: Login Session Audit is restricted to Super Admin.', 'warning');
       window.location.hash = 'dashboard';
       renderDashboard(container);
       return;
@@ -1733,6 +1763,7 @@ function handleRouting() {
       case 'dashboard': renderDashboard(container); break;
       case 'nfc': renderNfcPage(container); break;
       case 'students': renderStudentsPage(container); break;
+      case 'left-students': renderLeftStudentsPage(container); break;
       case 'admissions': renderAdmissionsPage(container); break;
       case 'attendance': renderAttendancePage(container); break;
       case 'fees': renderFeesPage(container); break;
@@ -1752,6 +1783,7 @@ function handleRouting() {
       case 'exams-weightage': renderExamsWeightageSubdirectoryPage(container); break;
       case 'exams-schedule': renderExamSchedulePage(container); break;
       case 'users': renderUsersPage(container); break;
+      case 'login-audit': renderLoginAuditPage(container); break;
       case 'promotion': renderPromotionPage(container); break;
       case 'certificates': renderCertificatesPage(container); break;
       case 'classes': renderClassesPage(container); break;
@@ -1843,8 +1875,68 @@ function setupSessionSwitcher() {
   }
 }
 
+const ERP_SESSION_TOKEN_KEY = 'MMM_ERP_SessionToken';
+const ERP_SESSION_USER_KEY = 'MMM_ERP_SessionUserId';
+
+function getErpSecurityApiBase() {
+  const configured = typeof window.getErpCloudApiBase === 'function'
+    ? String(window.getErpCloudApiBase() || '')
+    : 'https://mmmjhschoolbot.onrender.com/api/mmmjhs-bot';
+  return configured.replace(/\/api\/mmmjhs-bot(?:\?.*)?$/i, '/api/erp-cloud');
+}
+
+function getErpSessionToken() {
+  return String(sessionStorage.getItem(ERP_SESSION_TOKEN_KEY) || '').trim();
+}
+
+async function callErpSecurityApi(action, options = {}) {
+  const method = options.method || 'POST';
+  const schoolId = String(window.ERP_CLOUD_SCHOOL_ID || 'mmm-jhs');
+  const params = new URLSearchParams({ action, schoolId });
+  const sessionToken = String(options.sessionToken || options.query?.sessionToken || options.body?.sessionToken || '').trim();
+  if (method === 'GET' && options.query) {
+    Object.entries(options.query).forEach(([key, value]) => {
+      if (key === 'sessionToken') return;
+      if (value !== undefined && value !== null && value !== '') params.set(key, String(value));
+    });
+  }
+  const init = { method, cache: 'no-store', headers: { 'Content-Type': 'application/json' } };
+  if (sessionToken) init.headers['X-ERP-Session'] = sessionToken;
+  if (method !== 'GET') {
+    const body = { schoolId, ...(options.body || {}) };
+    delete body.sessionToken;
+    init.body = JSON.stringify(body);
+  }
+  const response = await fetch(`${getErpSecurityApiBase()}?${params.toString()}`, init);
+  let data = null;
+  try { data = await response.json(); } catch (error) { data = null; }
+  if (!response.ok || !data?.ok) throw new Error(data?.error || `Cloud security request failed (${response.status}).`);
+  return data;
+}
+
+async function validateStoredErpSession() {
+  const token = getErpSessionToken();
+  const userId = sessionStorage.getItem(ERP_SESSION_USER_KEY);
+  localStorage.removeItem('MMM_ActiveUserId');
+  if (!token || !userId) {
+    window.activeUserId = null;
+    return false;
+  }
+  try {
+    await callErpSecurityApi('authSession', { method: 'GET', query: { sessionToken: token } });
+    window.activeUserId = userId;
+    return true;
+  } catch (error) {
+    sessionStorage.removeItem(ERP_SESSION_TOKEN_KEY);
+    sessionStorage.removeItem(ERP_SESSION_USER_KEY);
+    window.activeUserId = null;
+    return false;
+  }
+}
+
 function getCurrentActiveUser() {
-  const activeId = window.activeUserId || localStorage.getItem('MMM_ActiveUserId');
+  const activeId = window.activeUserId || sessionStorage.getItem(ERP_SESSION_USER_KEY);
+  if (!activeId || !getErpSessionToken()) return null;
   if (!activeId) return null;
 
   const staff = SchoolData.staffUsers || [];
@@ -1859,17 +1951,29 @@ function getUserInitials(name) {
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
 }
 
-function logoutActiveUser() {
+async function logoutActiveUser() {
+  const token = getErpSessionToken();
+  if (token) {
+    try {
+      await callErpSecurityApi('authLogout', { body: { sessionToken: token } });
+    } catch (error) {
+      console.warn('Cloud logout audit skipped:', error.message);
+    }
+  }
   window.activeUserId = null;
+  sessionStorage.removeItem(ERP_SESSION_TOKEN_KEY);
+  sessionStorage.removeItem(ERP_SESSION_USER_KEY);
   localStorage.removeItem('MMM_ActiveUserId');
   showNotification(`Logged out of Staff Portal. Please log in with your credentials.`, 'info');
   window.location.hash = 'login';
   handleRouting();
 }
 
-function switchActiveUser(uid) {
+function switchActiveUser(uid, sessionToken) {
   window.activeUserId = uid;
-  localStorage.setItem('MMM_ActiveUserId', uid);
+  sessionStorage.setItem(ERP_SESSION_USER_KEY, uid);
+  if (sessionToken) sessionStorage.setItem(ERP_SESSION_TOKEN_KEY, sessionToken);
+  localStorage.removeItem('MMM_ActiveUserId');
   const user = getCurrentActiveUser();
 
   if (user) {
@@ -1971,26 +2075,27 @@ function openLoginModal() {
   openAccountMenu();
 }
 
-function promptChangeOwnPassword() {
+async function promptChangeOwnPassword() {
   const user = getCurrentActiveUser();
   if (!user) return;
   const current = prompt('Enter your current password:');
   if (current === null) return;
-  if (String(user.password || '') !== String(current)) {
-    showNotification('Current password is incorrect.', 'error');
-    return;
-  }
-  const next = prompt('Enter a new password (min 6 characters):');
+  const next = prompt('Enter a new password (min 8 characters):');
   if (next === null) return;
-  if (String(next).trim().length < 6) {
-    showNotification('New password must be at least 6 characters.', 'warning');
+  if (String(next).trim().length < 8) {
+    showNotification('New password must be at least 8 characters.', 'warning');
     return;
   }
-  user.password = String(next).trim();
-  saveSchoolDataToStorage();
-  const modal = document.getElementById('userLoginModal');
-  if (modal) modal.remove();
-  showNotification('Password updated. Use the new password next time you log in.', 'success');
+  try {
+    await callErpSecurityApi('authChangePassword', {
+      body: { sessionToken: getErpSessionToken(), currentPassword: current, newPassword: String(next).trim() }
+    });
+    const modal = document.getElementById('userLoginModal');
+    if (modal) modal.remove();
+    showNotification('Password updated securely in the cloud.', 'success');
+  } catch (error) {
+    showNotification(error.message, 'error');
+  }
 }
 
 function renderLoginPage(container) {
@@ -2023,7 +2128,7 @@ function renderLoginPage(container) {
               <label for="loginPasswordInput">Password</label>
               <input type="password" id="loginPasswordInput" class="login-input" placeholder="Enter password" autocomplete="current-password">
             </div>
-            <button type="submit" class="btn btn-primary login-submit" onclick="submitDirectLoginForm()">
+            <button type="submit" class="btn btn-primary login-submit">
               <i class="fa-solid fa-right-to-bracket"></i> Log In to ERP
             </button>
           </form>
@@ -2033,7 +2138,7 @@ function renderLoginPage(container) {
   `;
 }
 
-function submitDirectLoginForm() {
+async function submitDirectLoginForm() {
   const un = document.getElementById('loginUsernameInput')?.value.trim();
   const pw = document.getElementById('loginPasswordInput')?.value ?? '';
 
@@ -2042,14 +2147,31 @@ function submitDirectLoginForm() {
     return;
   }
 
-  const staff = SchoolData.staffUsers || [];
-  const found = staff.find(u => String(u.username || '').toLowerCase() === un.toLowerCase() || String(u.id || '') === un);
-
-  if (!found || String(found.password || '') !== String(pw)) {
-    alert('Incorrect username or password.');
-    return;
+  const button = document.querySelector('.login-submit');
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Verifying securely…';
   }
-  switchActiveUser(found.id);
+  try {
+    const result = await callErpSecurityApi('authLogin', { body: { username: un, password: pw } });
+    const safeUser = result.user || {};
+    const staff = SchoolData.staffUsers || (SchoolData.staffUsers = []);
+    const index = staff.findIndex(user => String(user.id || '') === String(safeUser.id || '') || normalizeUsernameForLogin(user.username) === normalizeUsernameForLogin(safeUser.username));
+    if (index >= 0) staff[index] = { ...staff[index], ...safeUser };
+    else staff.push(safeUser);
+    switchActiveUser(safeUser.id || safeUser.username, result.sessionToken);
+  } catch (error) {
+    alert(error.message || 'Incorrect username or password.');
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.innerHTML = '<i class="fa-solid fa-right-to-bracket"></i> Log In to ERP';
+    }
+  }
+}
+
+function normalizeUsernameForLogin(value) {
+  return String(value || '').trim().toLowerCase();
 }
 
 function setupRoleSwitcher() {
@@ -2106,6 +2228,9 @@ function renderDashboard(container) {
         <p class="page-subtitle">Madan Mohan Malviya Junior High School - Session ${session}</p>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="window.location.hash='left-students'" style="background:#475569; color:#ffffff; border:none; font-weight:bold;">
+          <i class="fa-solid fa-user-clock"></i> Left / Inactive (${getLeftStudents().length})
+        </button>
         ${canManageFees ? `
           <button class="btn btn-primary" style="background:linear-gradient(135deg, #10b981 0%, #059669 100%); color:#ffffff; border:none; font-weight:800; padding:10px 18px; display:flex; align-items:center; gap:8px;" onclick="openQuickFeeSelectModal()"><i class="fa-solid fa-indian-rupee-sign"></i> Collect Fee Now</button>
         ` : ''}
@@ -6606,6 +6731,128 @@ function filterStudentsDirectoryTable() {
   });
 }
 
+function renderLeftStudentsPage(container) {
+  const students = getLeftStudents();
+  const currentSession = SchoolData.activeSession || '2026-27';
+  container.innerHTML = `
+    <div class="page-header">
+      <div>
+        <h2 class="page-title"><i class="fa-solid fa-user-clock" style="color:#f59e0b"></i> Left / Inactive Students</h2>
+        <p class="page-subtitle">Historical records remain in the cloud. Fees, receipts, marks, report cards and issued TCs are preserved.</p>
+      </div>
+      <button class="btn btn-primary" onclick="window.location.hash='students'"><i class="fa-solid fa-users"></i> Active Students</button>
+    </div>
+    <div class="glass-card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; gap:12px; flex-wrap:wrap;">
+        <input type="text" id="leftStudentSearchInput" placeholder="Search name, admission or certificate no…" class="session-dropdown" style="width:340px;" onkeyup="filterLeftStudentsTable()">
+        <span class="badge badge-warning">${students.length} left / inactive record${students.length === 1 ? '' : 's'}</span>
+      </div>
+      <div class="data-table-container">
+        <table class="data-table" id="leftStudentsTable">
+          <thead><tr><th>Student</th><th>Admission</th><th>Last Class</th><th>Left / TC Details</th><th>Fee Record</th><th>Actions</th></tr></thead>
+          <tbody>
+            ${students.length ? students.map(student => {
+              const fee = student.currentFeeInfo || {};
+              const dueMonths = Array.isArray(fee.dueMonths) ? fee.dueMonths : [];
+              const dueAmount = (dueMonths.length * getStudentMonthlyTuitionRate(student)) + Number(fee.previousSessionDue || 0) + Number(student.partialDue || 0);
+              const tcNo = student.tcCertificateNo || student.tcNo || '';
+              const searchable = `${student.name || ''} ${student.admissionNo || ''} ${tcNo}`.toLowerCase();
+              return `
+                <tr class="left-student-row" data-search="${escapeHtml(searchable)}">
+                  <td><strong>${escapeHtml(student.name || '')}</strong><br><small>${escapeHtml(student.parentName || '')}</small></td>
+                  <td><code>${escapeHtml(student.admissionNo || '')}</code><br><span class="badge badge-warning">${escapeHtml(student.status || 'Left')}</span></td>
+                  <td>${escapeHtml(student.currentClass || student.class || '')} - ${escapeHtml(student.currentSection || student.section || '')}<br><small>Session ${escapeHtml(currentSession)}</small></td>
+                  <td>${tcNo ? `<strong>${escapeHtml(tcNo)}</strong><br>` : ''}<small>${student.leftAt ? formatErpDateTime(student.leftAt) : 'Historical record'}</small><br><small>${escapeHtml(student.leftReason || '')}</small></td>
+                  <td>${dueAmount > 0 ? `<span class="badge badge-danger">Due: Rs ${dueAmount.toLocaleString('en-IN')}</span>` : '<span class="badge badge-success">No recorded due</span>'}</td>
+                  <td><div style="display:flex; gap:6px; flex-wrap:wrap;">
+                    <button class="btn btn-secondary" style="padding:5px 9px;" onclick="openStudentProfile('${student.admissionNo}')"><i class="fa-solid fa-eye"></i> Profile</button>
+                    <button class="btn btn-secondary" style="padding:5px 9px; color:#34d399;" onclick="openCollectFeeModal('${student.admissionNo}')"><i class="fa-solid fa-receipt"></i> Fees</button>
+                    <button class="btn btn-primary" style="padding:5px 9px;" onclick="reprintIssuedTransferCertificate('${student.admissionNo}')"><i class="fa-solid fa-qrcode"></i> Issued TC</button>
+                  </div></td>
+                </tr>`;
+            }).join('') : '<tr><td colspan="6" style="text-align:center; padding:30px; color:var(--text-muted);">No students have been marked Left or Inactive.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+function filterLeftStudentsTable() {
+  const query = String(document.getElementById('leftStudentSearchInput')?.value || '').trim().toLowerCase();
+  document.querySelectorAll('#leftStudentsTable .left-student-row').forEach(row => {
+    row.style.display = !query || String(row.getAttribute('data-search') || '').includes(query) ? '' : 'none';
+  });
+}
+
+function formatErpDateTime(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata', day: '2-digit', month: '2-digit', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
+  }) + ' IST';
+}
+
+function renderLoginAuditPage(container) {
+  container.innerHTML = `
+    <div class="page-header">
+      <div>
+        <h2 class="page-title"><i class="fa-solid fa-clock-rotate-left" style="color:#38bdf8"></i> Login Session Audit</h2>
+        <p class="page-subtitle">Server-recorded ERP sign-ins, activity and logout time. Available only to Super Admin.</p>
+      </div>
+      <button class="btn btn-primary" onclick="loadLoginAuditSessions()"><i class="fa-solid fa-rotate"></i> Refresh</button>
+    </div>
+    <div class="glass-card">
+      <div id="loginAuditSummary" style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px;"></div>
+      <div class="data-table-container">
+        <table class="data-table" id="loginAuditTable">
+          <thead><tr><th>User</th><th>Role</th><th>Logged In</th><th>Last Activity</th><th>Logged Out</th><th>Status</th><th>Device / Browser</th></tr></thead>
+          <tbody><tr><td colspan="7" style="text-align:center; padding:32px;"><i class="fa-solid fa-spinner fa-spin"></i> Loading secure audit log…</td></tr></tbody>
+        </table>
+      </div>
+    </div>`;
+  loadLoginAuditSessions();
+}
+
+async function loadLoginAuditSessions() {
+  const tableBody = document.querySelector('#loginAuditTable tbody');
+  if (!tableBody) return;
+  tableBody.innerHTML = '<tr><td colspan="7" style="text-align:center; padding:32px;"><i class="fa-solid fa-spinner fa-spin"></i> Loading secure audit log…</td></tr>';
+  try {
+    const result = await callErpSecurityApi('authAudit', {
+      method: 'GET',
+      query: { sessionToken: getErpSessionToken() }
+    });
+    const sessions = Array.isArray(result.sessions) ? result.sessions : [];
+    const activeCount = sessions.filter(item => String(item.status || '').toLowerCase() === 'active').length;
+    const summary = document.getElementById('loginAuditSummary');
+    if (summary) {
+      summary.innerHTML = `
+        <span class="badge badge-info">${sessions.length} recorded session${sessions.length === 1 ? '' : 's'}</span>
+        <span class="badge badge-success">${activeCount} active</span>
+        <span class="badge badge-warning">Times shown in IST</span>`;
+    }
+    tableBody.innerHTML = sessions.length ? sessions.map(item => {
+      const status = String(item.status || 'unknown').toLowerCase();
+      const badgeClass = status === 'active' ? 'badge-success' : (status === 'expired' ? 'badge-warning' : 'badge-info');
+      const browser = String(item.user_agent || '').replace(/\s+/g, ' ').trim();
+      return `<tr>
+        <td><strong>${escapeHtml(item.user_name || item.username || '')}</strong><br><small>@${escapeHtml(item.username || '')}</small></td>
+        <td>${escapeHtml(item.role || '')}</td>
+        <td>${escapeHtml(formatErpDateTime(item.logged_in_at) || '—')}</td>
+        <td>${escapeHtml(formatErpDateTime(item.last_seen_at) || '—')}</td>
+        <td>${escapeHtml(formatErpDateTime(item.logged_out_at) || '—')}</td>
+        <td><span class="badge ${badgeClass}">${escapeHtml(status.toUpperCase())}</span></td>
+        <td style="max-width:330px; white-space:normal;"><small>${escapeHtml(browser || 'Not supplied')}</small></td>
+      </tr>`;
+    }).join('') : '<tr><td colspan="7" style="text-align:center; padding:32px;">No login sessions have been recorded yet.</td></tr>';
+  } catch (error) {
+    tableBody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:32px; color:#f87171;">${escapeHtml(error.message || 'Could not load login audit.')}</td></tr>`;
+    showNotification(error.message || 'Could not load login audit.', 'error');
+  }
+}
+
 /* ============================================================================
    RECEPTIONIST STUDENT EDIT MODAL & FRESH DATABASE RESET ENGINE
    ============================================================================ */
@@ -7937,8 +8184,8 @@ function openClassStudentsModal(className, targetSection = null) {
   const currentSectionFilter = window.activeClassModalSection || 'ALL';
 
   const currentSession = SchoolData.activeSession;
-  const allClassStudents = SchoolData.students.filter(s => {
-    const detail = s.sessionDetails[currentSession];
+  const allClassStudents = getStudentsByActiveSession().filter(s => {
+    const detail = s.sessionDetails?.[currentSession];
     return (detail && detail.class === className) || (s.currentClass === className || s.class === className);
   });
 
@@ -8068,9 +8315,9 @@ function renderClassesPage(container) {
 
     <div class="grid-3">
       ${SchoolData.classes.map(c => {
-        const studentCount = SchoolData.students.filter(s => {
-          const detail = s.sessionDetails[SchoolData.activeSession];
-          return detail && detail.class === c.name;
+        const studentCount = getStudentsByActiveSession().filter(s => {
+          const detail = s.sessionDetails?.[SchoolData.activeSession];
+          return (detail && detail.class === c.name) || (!detail && (s.currentClass || s.class) === c.name);
         }).length;
 
         return `
@@ -15188,13 +15435,20 @@ function executeBatchPromotion() {
 
 function renderCertificatesPage(container) {
   const students = getStudentsByActiveSession();
+  const leftCount = getLeftStudents().length;
 
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-certificate" style="color:var(--accent-warning)"></i> Official Certificate Generator</h2>
-        <p class="page-subtitle">Create editable Transfer, Bonafide and Character Certificates with school logo, student photo and signature area</p>
+        <p class="page-subtitle">Preview certificates safely, or officially issue a TC with administrator re-authentication and a permanent verification QR.</p>
       </div>
+      <button class="btn btn-secondary" onclick="window.location.hash='left-students'"><i class="fa-solid fa-user-clock"></i> Left / Inactive (${leftCount})</button>
+    </div>
+
+    <div style="margin-bottom:16px; padding:14px 16px; border:1px solid rgba(245,158,11,.55); border-radius:12px; background:rgba(245,158,11,.1); color:var(--text-main);">
+      <strong><i class="fa-solid fa-shield-halved" style="color:#f59e0b"></i> Draft vs official issue:</strong>
+      Preview / Print TC does not change the student. Issue TC requires the logged-in Super Admin password, fixes the server issue time, creates the verification QR and moves the student to Left / Inactive.
     </div>
 
     <div class="glass-card">
@@ -15215,9 +15469,12 @@ function renderCertificatesPage(container) {
                 <td><code>${s.admissionNo}</code></td>
                 <td><span class="badge badge-purple">${s.currentClass} - ${s.currentSection}</span></td>
                 <td>
-                  <div style="display:flex; gap:8px;">
-                    <button class="btn btn-secondary" style="padding:6px 10px; font-size:0.75rem; font-weight:800;" onclick="generateCertificate('${s.admissionNo}', 'Transfer Certificate')">
-                      <i class="fa-solid fa-file-contract"></i> Edit TC
+                   <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                     <button class="btn btn-secondary" style="padding:6px 10px; font-size:0.75rem; font-weight:800;" onclick="generateCertificate('${s.admissionNo}', 'Transfer Certificate')">
+                       <i class="fa-solid fa-print"></i> Preview / Print TC
+                     </button>
+                     <button class="btn btn-primary" style="padding:6px 10px; font-size:0.75rem; font-weight:900; background:#dc2626; border-color:#ef4444;" onclick="openIssueTcModal('${s.admissionNo}')">
+                       <i class="fa-solid fa-file-circle-check"></i> Issue TC & Mark Left
                     </button>
                     <button class="btn btn-secondary" style="padding:6px 10px; font-size:0.75rem; font-weight:800;" onclick="generateCertificate('${s.admissionNo}', 'Bonafide Certificate')">
                       <i class="fa-solid fa-certificate"></i> Edit Bonafide
@@ -15234,6 +15491,102 @@ function renderCertificatesPage(container) {
       </div>
     </div>
   `;
+}
+
+function openIssueTcModal(admissionNo) {
+  const student = findStudentByAdmissionNo(admissionNo);
+  if (!student || !isStudentActiveForRoster(student)) {
+    showNotification('This student is already Left/Inactive or cannot be found.', 'warning');
+    return;
+  }
+  const existing = document.getElementById('issueTcModal');
+  if (existing) existing.remove();
+  const dueAmount = typeof getStudentSessionOutstandingForPromotion === 'function'
+    ? getStudentSessionOutstandingForPromotion(student, SchoolData.activeSession)
+    : 0;
+  document.body.insertAdjacentHTML('beforeend', `
+    <div class="modal-overlay active" id="issueTcModal" style="z-index:1000000; backdrop-filter:blur(8px);">
+      <div class="modal-box" style="max-width:620px; width:95%; background:#0f172a; color:#fff; border:2px solid #ef4444; border-radius:18px; padding:24px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; padding-bottom:12px;">
+          <h3 style="margin:0; color:#fca5a5;"><i class="fa-solid fa-triangle-exclamation"></i> Issue Official Transfer Certificate</h3>
+          <button onclick="document.getElementById('issueTcModal').remove()" style="border:0; background:#334155; color:#fff; width:32px; height:32px; border-radius:50%;">X</button>
+        </div>
+        <div style="margin:18px 0; padding:14px; background:#111827; border-radius:12px; line-height:1.6;">
+          <strong>${escapeHtml(student.name || '')}</strong> · Admission <code>${escapeHtml(student.admissionNo || '')}</code><br>
+          ${escapeHtml(student.currentClass || '')} - ${escapeHtml(student.currentSection || '')}<br>
+          ${dueAmount > 0 ? `<span style="color:#fca5a5; font-weight:800;">Recorded outstanding fees: Rs ${Number(dueAmount).toLocaleString('en-IN')}</span>` : '<span style="color:#6ee7b7; font-weight:800;">No recorded outstanding fee</span>'}
+        </div>
+        <label style="font-weight:800; display:block; margin-bottom:6px;">Reason for leaving</label>
+        <input id="issueTcReason" class="session-dropdown" style="width:100%; margin-bottom:14px;" value="Parent's desire / Transfer to another school">
+        <label style="font-weight:800; display:block; margin-bottom:6px;">Super Admin password</label>
+        <input id="issueTcAdminPassword" type="password" autocomplete="current-password" class="session-dropdown" style="width:100%; margin-bottom:14px;" placeholder="Re-enter your password to authorize issuance">
+        <label style="display:flex; gap:10px; align-items:flex-start; color:#e2e8f0; font-size:.9rem; margin-bottom:18px;">
+          <input id="issueTcConfirmCheck" type="checkbox" style="margin-top:3px;">
+          <span>I understand that the server issue date/time will become permanent and the student will be removed from active class, attendance and promotion lists while historical fees and marks remain.</span>
+        </label>
+        <div style="display:flex; justify-content:flex-end; gap:10px;">
+          <button class="btn btn-secondary" onclick="document.getElementById('issueTcModal').remove()">Cancel</button>
+          <button class="btn btn-primary" id="issueTcConfirmBtn" style="background:#dc2626;" onclick="confirmIssueTransferCertificate('${student.admissionNo}')"><i class="fa-solid fa-lock"></i> Issue TC & Mark Left</button>
+        </div>
+      </div>
+    </div>`);
+}
+
+async function confirmIssueTransferCertificate(admissionNo) {
+  const password = String(document.getElementById('issueTcAdminPassword')?.value || '');
+  const reason = String(document.getElementById('issueTcReason')?.value || '').trim();
+  const confirmed = !!document.getElementById('issueTcConfirmCheck')?.checked;
+  if (!password) return showNotification('Enter the Super Admin password.', 'warning');
+  if (!reason) return showNotification('Enter the reason for leaving.', 'warning');
+  if (!confirmed) return showNotification('Tick the confirmation box before issuing the TC.', 'warning');
+  const button = document.getElementById('issueTcConfirmBtn');
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Issuing securely…';
+  }
+  try {
+    const certificateNo = `TC-${SchoolData.activeSession}-${admissionNo}`;
+    const result = await callErpSecurityApi('tcIssue', {
+      body: {
+        sessionToken: getErpSessionToken(),
+        adminPassword: password,
+        admissionNo,
+        academicSession: SchoolData.activeSession,
+        certificateNo,
+        leftReason: reason
+      }
+    });
+    const modal = document.getElementById('issueTcModal');
+    if (modal) modal.remove();
+    if (typeof pullSchoolDataFromCloud === 'function') {
+      await pullSchoolDataFromCloud({ force: true });
+    }
+    const certificate = { ...(result.certificate || {}), verificationUrl: result.verificationUrl || '' };
+    showNotification(result.certificate?.already_issued ? 'TC was already issued. Opening the permanent issued copy.' : 'TC issued successfully. Student moved to Left / Inactive.', 'success');
+    generateCertificate(admissionNo, 'Transfer Certificate', certificate);
+  } catch (error) {
+    showNotification(error.message || 'TC could not be issued.', 'error');
+    if (button) {
+      button.disabled = false;
+      button.innerHTML = '<i class="fa-solid fa-lock"></i> Issue TC & Mark Left';
+    }
+  }
+}
+
+async function reprintIssuedTransferCertificate(admissionNo) {
+  try {
+    const result = await callErpSecurityApi('tcGet', {
+      method: 'GET',
+      query: { sessionToken: getErpSessionToken(), admissionNo }
+    });
+    if (!result.certificate) return showNotification('No officially issued TC was found for this student.', 'warning');
+    generateCertificate(admissionNo, 'Transfer Certificate', {
+      ...result.certificate,
+      verificationUrl: result.verificationUrl || ''
+    });
+  } catch (error) {
+    showNotification(error.message || 'Issued TC could not be loaded.', 'error');
+  }
 }
 
 function getCertificateDefaultText(student, certType) {
@@ -15253,7 +15606,7 @@ function formatCertificateClassLabel(student) {
   return `Class ${cls}`;
 }
 
-function getTransferCertificateDetailsHtml(student) {
+function getTransferCertificateDetailsHtml(student, issuedCertificate = null) {
   const profile = getSchoolProfile();
   const classLabel = formatCertificateClassLabel(student);
   const sec = student.currentSection || student.section || 'A';
@@ -15262,7 +15615,10 @@ function getTransferCertificateDetailsHtml(student) {
   const caste = student.caste || '________________';
   const father = student.parentName || '________________';
   const address = student.address || '________________';
-  const today = new Date().toLocaleDateString('en-GB');
+  const issuedAt = issuedCertificate?.issued_at || issuedCertificate?.issuedAt || '';
+  const leavingDate = issuedAt ? new Date(issuedAt).toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' }) : new Date().toLocaleDateString('en-GB');
+  const certificateSession = issuedCertificate?.academic_session || issuedCertificate?.academicSession || SchoolData.activeSession;
+  const leavingReason = issuedCertificate?.left_reason || issuedCertificate?.leftReason || "Parent's desire / Transfer to another school";
   const rows = [
     ['Date of Admission', doa],
     ['PEN', pen],
@@ -15275,8 +15631,8 @@ function getTransferCertificateDetailsHtml(student) {
     ['Address', address],
     ['Date of Birth', formatDobToDDMMYYYY(student.dob) || 'As per record'],
     ['Date of Birth in Words', dateOfBirthInWords(student.dob)],
-    ['Date of Leaving', today],
-    ['Reason for Leaving', "Parent's desire / Transfer to another school"],
+    ['Date of Leaving', leavingDate],
+    ['Reason for Leaving', leavingReason],
     ['Conduct & Character', 'Good'],
     ['Qualified for Promotion', 'Yes']
   ];
@@ -15291,7 +15647,7 @@ function getTransferCertificateDetailsHtml(student) {
       `).join('')}
     </div>
     <div contenteditable="true" class="tc-certify" style="position:relative; z-index:1; font-family:Georgia, 'Times New Roman', serif; font-size:14.5px; line-height:1.55; text-align:justify; margin:16px 8px 0; color:#10213f;">
-      Certified that the above particulars are correct as per the Admission Register of ${profile.name}. The student studied in ${classLabel}, Section ${sec}, during Academic Session ${SchoolData.activeSession}.
+      Certified that the above particulars are correct as per the Admission Register of ${profile.name}. The student studied in ${classLabel}, Section ${sec}, during Academic Session ${certificateSession}.
     </div>
   `;
 }
@@ -15323,27 +15679,37 @@ function getCertificateSignatureHtml(student) {
   `;
 }
 
-/** TC footer: Checked By (left) + Principal / school seal (right). Used by colour and letterhead templates. */
-function getTransferCertificateSignatureHtml() {
+/** Official TC: verification QR + Checked By + Principal. Draft TC has no verification QR. */
+function getTransferCertificateSignatureHtml(issuedCertificate = null) {
   const profile = getSchoolProfile();
   const principalSignature = profile.principalSignatureDataUrl || '';
+  const verificationUrl = issuedCertificate?.verificationUrl || '';
+  const qrHtml = verificationUrl ? `
+      <div class="tc-qr" style="width:150px; text-align:center; align-self:flex-end;">
+        <img src="https://api.qrserver.com/v1/create-qr-code/?size=180x180&margin=0&data=${encodeURIComponent(verificationUrl)}" alt="TC verification QR" style="width:82px; height:82px; display:block; margin:0 auto 4px;">
+        <div style="font-family:'Outfit',sans-serif; font-size:9px; color:#0f766e; font-weight:900; letter-spacing:.5px; line-height:1.35; padding-bottom:2px;">SCAN TO VERIFY</div>
+      </div>` : `
+      <div class="tc-qr tc-draft-status" style="width:150px; text-align:center; align-self:flex-end; padding-bottom:18px; color:#b91c1c; font:900 11px/1.35 'Outfit',sans-serif;">
+        DRAFT<br><span style="font-size:9px;">NOT OFFICIALLY ISSUED</span>
+      </div>`;
   return `
-    <div class="tc-sign-row" style="display:flex; justify-content:space-between; align-items:flex-end; gap:28px; width:100%;">
-      <div class="tc-checked-by" style="width:250px; text-align:center;">
-        <div style="height:78px; display:flex; align-items:flex-end; justify-content:center; margin-bottom:2px;">
-          <div style="height:54px;"></div>
+    <div class="tc-sign-row" style="display:flex; justify-content:space-between; align-items:flex-end; gap:20px; width:100%;">
+      ${qrHtml}
+      <div class="tc-checked-by" style="width:205px; text-align:center;">
+        <div style="height:64px; display:flex; align-items:flex-end; justify-content:center; margin-bottom:2px;">
+          <div style="height:48px;"></div>
         </div>
-        <div style="border-top:1.7px solid #10213f; padding-top:6px; font-family:'Playfair Display', Georgia, serif; color:#10213f; font-size:18px; font-weight:900; line-height:1.1;">Checked By</div>
-        <div style="font-family:'Outfit', sans-serif; font-size:12px; color:#64748b; font-weight:600; margin-top:3px;">Full Name & Signature</div>
+        <div style="border-top:1.7px solid #10213f; padding-top:6px; font-family:'Playfair Display', Georgia, serif; color:#10213f; font-size:18px; font-weight:900; line-height:1.2;">Checked By</div>
+        <div style="font-family:'Outfit', sans-serif; font-size:12px; color:#64748b; font-weight:600; margin-top:3px; line-height:1.35; padding-bottom:2px;">Full Name & Signature</div>
       </div>
-      <div class="tc-signature" style="width:250px; text-align:center;">
-        <div style="height:78px; display:flex; align-items:flex-end; justify-content:center; margin-bottom:2px;">
+      <div class="tc-signature" style="width:205px; text-align:center;">
+        <div style="height:64px; display:flex; align-items:flex-end; justify-content:center; margin-bottom:2px;">
           ${principalSignature
-            ? `<img src="${principalSignature}" alt="Principal signature" style="max-width:190px; max-height:74px; object-fit:contain;">`
-            : '<div style="height:54px;"></div>'}
+            ? `<img src="${principalSignature}" alt="Principal signature" style="max-width:190px; max-height:60px; object-fit:contain;">`
+            : '<div style="height:48px;"></div>'}
         </div>
-        <div style="border-top:1.7px solid #10213f; padding-top:6px; font-family:'Playfair Display', Georgia, serif; color:#10213f; font-size:18px; font-weight:900; line-height:1.1;">Principal</div>
-        <div style="font-family:'Outfit', sans-serif; font-size:12px; color:#64748b; font-weight:600; margin-top:3px;">Signature & School Seal</div>
+        <div style="border-top:1.7px solid #10213f; padding-top:6px; font-family:'Playfair Display', Georgia, serif; color:#10213f; font-size:18px; font-weight:900; line-height:1.2;">Principal</div>
+        <div style="font-family:'Outfit', sans-serif; font-size:12px; color:#64748b; font-weight:600; margin-top:3px; line-height:1.35; padding-bottom:2px;">Signature & School Seal</div>
       </div>
     </div>
   `;
@@ -15353,21 +15719,33 @@ function getPrincipalOnlyCertificateSignatureHtml() {
   return getTransferCertificateSignatureHtml();
 }
 
-function generateCertificate(admissionNo, certType) {
-  const student = findStudentByAdmissionNo(admissionNo);
-  if (!student) return;
+function generateCertificate(admissionNo, certType, issuedCertificate = null) {
+  const rosterStudent = findStudentByAdmissionNo(admissionNo);
+  if (!rosterStudent) return;
+  const issuedSnapshot = issuedCertificate?.student_snapshot || issuedCertificate?.studentSnapshot || {};
+  const student = issuedCertificate ? {
+    ...rosterStudent,
+    ...issuedSnapshot,
+    currentClass: issuedSnapshot.currentClass || issuedSnapshot.class || rosterStudent.currentClass,
+    currentSection: issuedSnapshot.currentSection || issuedSnapshot.section || rosterStudent.currentSection
+  } : rosterStudent;
 
   const existing = document.getElementById('certificateEditModal');
   if (existing) existing.remove();
 
   const profile = getSchoolProfile();
-  const certNo = `${certType.split(' ').map(w => w[0]).join('')}-${SchoolData.activeSession}-${student.admissionNo}`;
+  const certNo = issuedCertificate?.certificate_no || issuedCertificate?.certificateNo || `${certType.split(' ').map(w => w[0]).join('')}-${SchoolData.activeSession}-${student.admissionNo}`;
   const certText = getCertificateDefaultText(student, certType);
   const isTransferCertificate = certType === 'Transfer Certificate';
+  const isIssuedTransferCertificate = isTransferCertificate && !!(issuedCertificate?.issued_at || issuedCertificate?.issuedAt);
+  const issuedAt = issuedCertificate?.issued_at || issuedCertificate?.issuedAt || '';
+  const issueMeta = isIssuedTransferCertificate
+    ? `Certificate No: ${certNo} • Issued: ${formatErpDateTime(issuedAt)}`
+    : `Certificate No: ${certNo} • DRAFT PREVIEW — NOT ISSUED`;
   const watermarkLogoSrc = isTransferCertificate ? 'assets/school_logo_tc.png' : (profile.logoDataUrl || 'assets/school_logo.png');
   const watermarkHtml = `<img src="${watermarkLogoSrc}" style="width:${isTransferCertificate ? '360px' : '290px'}; height:${isTransferCertificate ? '360px' : '290px'}; border-radius:50%; object-fit:cover;">`;
   const certificateBodyHtml = isTransferCertificate
-    ? getTransferCertificateDetailsHtml(student)
+    ? getTransferCertificateDetailsHtml(student, issuedCertificate)
     : `
             <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:10px; margin:18px 0; position:relative; z-index:1;">
               <div style="border:1px solid #cbd5e1; padding:8px; border-radius:8px;"><small style="color:#64748b;">Student</small><div contenteditable="true" style="font-weight:900;">${student.name}</div></div>
@@ -15394,7 +15772,7 @@ function generateCertificate(admissionNo, certType) {
       </div>
       <div class="modal-box" style="max-width:1120px; width:calc(100vw - 48px); max-height:calc(100vh - 36px); overflow:auto; padding:0; background:#f8fafc; color:#0f172a; border-radius:12px;">
         <div style="position:sticky; top:0; z-index:10; display:flex; justify-content:space-between; align-items:center; gap:12px; padding:14px 18px; background:#0f172a; color:#ffffff;">
-          <div style="font-weight:900;"><i class="fa-solid fa-pen-to-square" style="color:#f59e0b;"></i> Edit ${certType} for ${student.name}</div>
+          <div style="font-weight:900;"><i class="fa-solid ${isIssuedTransferCertificate ? 'fa-shield-circle-check' : 'fa-pen-to-square'}" style="color:${isIssuedTransferCertificate ? '#34d399' : '#f59e0b'};"></i> ${isIssuedTransferCertificate ? 'Official Issued' : 'Edit Draft'} ${certType} for ${student.name}</div>
           <div style="display:flex; gap:8px;">
             <button class="btn btn-primary" onclick="printCertificatePreview()" style="padding:8px 14px;"><i class="fa-solid fa-print"></i> Colour Template</button>
             ${isTransferCertificate ? `<button class="btn btn-secondary" onclick="printCertificatePreview('letterhead')" style="padding:8px 14px; background:#475569; color:#fff;"><i class="fa-solid fa-print"></i> Letterhead Template</button>` : ''}
@@ -15404,7 +15782,7 @@ function generateCertificate(admissionNo, certType) {
 
         <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@500;600;700;800&family=Outfit:wght@400;600;700;800&family=Playfair+Display:wght@700;800&display=swap" rel="stylesheet">
         <div id="certificatePrintArea" data-orientation="${isTransferCertificate ? 'portrait' : 'landscape'}" style="padding:${isTransferCertificate ? '18px' : '30px'}; background:#fff;">
-          <div class="${isTransferCertificate ? 'tc-print-sheet' : ''}" style="${isTransferCertificate ? 'width:794px; max-width:100%; min-height:1123px; height:1123px; margin:0 auto; border:2.5px solid #d4af37; padding:18px 22px 20px; background:#ffffff; box-sizing:border-box; display:flex; flex-direction:column;' : 'min-height:760px; border:8px double #1e3a8a; padding:22px; background:linear-gradient(135deg, rgba(255,255,255,0.96), rgba(239,246,255,0.92)), radial-gradient(circle at top left, rgba(212,175,55,0.25), transparent 32%), radial-gradient(circle at bottom right, rgba(30,58,138,0.14), transparent 30%);'} position:relative;">
+          <div class="${isTransferCertificate ? 'tc-print-sheet' : ''}" style="${isTransferCertificate ? 'width:794px; max-width:100%; min-height:1123px; height:1123px; margin:0 auto; border:2.5px solid #d4af37; padding:18px 22px 34px; background:#ffffff; box-sizing:border-box; display:flex; flex-direction:column;' : 'min-height:760px; border:8px double #1e3a8a; padding:22px; background:linear-gradient(135deg, rgba(255,255,255,0.96), rgba(239,246,255,0.92)), radial-gradient(circle at top left, rgba(212,175,55,0.25), transparent 32%), radial-gradient(circle at bottom right, rgba(30,58,138,0.14), transparent 30%);'} position:relative;">
             <div class="${isTransferCertificate ? 'tc-decoration' : ''}" style="position:absolute; inset:${isTransferCertificate ? '9px' : '16px'}; border:${isTransferCertificate ? '1px solid #10213f' : '2px solid #d4af37'}; opacity:${isTransferCertificate ? '0.28' : '1'}; pointer-events:none;"></div>
             <div class="${isTransferCertificate ? 'tc-watermark' : ''}" style="position:absolute; top:${isTransferCertificate ? '52%' : '42%'}; left:50%; transform:translate(-50%,-50%); opacity:${isTransferCertificate ? '0.055' : '0.05'}; pointer-events:none;">${watermarkHtml}</div>
 
@@ -15426,17 +15804,17 @@ function generateCertificate(admissionNo, certType) {
             </div>
 
             <div class="tc-title-block" style="text-align:center; margin:${isTransferCertificate ? '12px 0 4px' : '26px 0 18px'}; position:relative; z-index:1;">
-              <div contenteditable="true" style="display:inline-block; padding:${isTransferCertificate ? '0 0 5px' : '10px 28px'}; border:${isTransferCertificate ? '0' : '2px solid #d4af37'}; border-bottom:${isTransferCertificate ? '3px solid #d4af37' : '2px solid #d4af37'}; border-radius:${isTransferCertificate ? '0' : '999px'}; background:${isTransferCertificate ? 'transparent' : '#fff7ed'}; font-family:'Playfair Display', Georgia, serif; font-size:${isTransferCertificate ? '24px' : '25px'}; font-weight:800; color:${isTransferCertificate ? '#10213f' : '#92400e'}; text-transform:uppercase; letter-spacing:${isTransferCertificate ? '2.2px' : '0'};">${isTransferCertificate ? 'Transfer Certificate' : certType}</div>
-              <div contenteditable="true" style="font-family:'Outfit', sans-serif; font-size:12.5px; color:#64748b; margin-top:8px; font-weight:700;">Certificate No: ${certNo} • Issue Date: ${new Date().toLocaleDateString('en-GB')}</div>
+              <div class="${isTransferCertificate ? 'tc-title' : ''}" contenteditable="true" style="display:inline-block; padding:${isTransferCertificate ? '0 0 5px' : '10px 28px'}; border:${isTransferCertificate ? '0' : '2px solid #d4af37'}; border-bottom:${isTransferCertificate ? '3px solid #d4af37' : '2px solid #d4af37'}; border-radius:${isTransferCertificate ? '0' : '999px'}; background:${isTransferCertificate ? 'transparent' : '#fff7ed'}; font-family:'Playfair Display', Georgia, serif; font-size:${isTransferCertificate ? '24px' : '25px'}; font-weight:800; color:${isTransferCertificate ? '#10213f' : '#92400e'}; text-transform:uppercase; letter-spacing:${isTransferCertificate ? '2.2px' : '0'};">${isTransferCertificate ? 'Transfer Certificate' : certType}</div>
+              <div class="${isTransferCertificate ? 'tc-certificate-meta' : ''}" contenteditable="${isIssuedTransferCertificate ? 'false' : 'true'}" style="font-family:'Outfit', sans-serif; font-size:12.5px; color:${isIssuedTransferCertificate ? '#0f766e' : '#b91c1c'}; margin-top:8px; font-weight:800;">${issueMeta}</div>
             </div>
 
             <div class="${isTransferCertificate ? 'tc-body' : ''}" style="${isTransferCertificate ? 'flex:1; display:flex; flex-direction:column;' : ''}">
               ${certificateBodyHtml}
             </div>
 
-            <div class="tc-footer" style="display:flex; justify-content:space-between; align-items:flex-end; gap:24px; position:relative; z-index:1; margin:${isTransferCertificate ? 'auto 10px 2px' : '20px 22px 0'}; padding:${isTransferCertificate ? '18px 6px 4px' : '0'};">
+            <div class="tc-footer" style="display:flex; justify-content:space-between; align-items:flex-end; gap:24px; position:relative; z-index:1; margin:${isTransferCertificate ? 'auto 10px 0' : '20px 22px 0'}; padding:${isTransferCertificate ? '12px 6px 10px' : '0'};">
               ${isTransferCertificate
-                ? getTransferCertificateSignatureHtml()
+                ? getTransferCertificateSignatureHtml(isIssuedTransferCertificate ? issuedCertificate : null)
                 : `<div class="tc-qr" style="text-align:center;">
                 <img src="https://api.qrserver.com/v1/create-qr-code/?size=110x110&data=VERIFIED-CERTIFICATE-${student.admissionNo}-${encodeURIComponent(certType)}" style="width:96px; height:96px;">
                 <div style="font-family:'Outfit', sans-serif; font-size:10px; color:#64748b; margin-top:5px; letter-spacing:0.6px; font-weight:700; text-transform:uppercase;">Verification QR</div>
@@ -15449,7 +15827,12 @@ function generateCertificate(admissionNo, certType) {
     </div>
   `;
   document.body.insertAdjacentHTML('beforeend', modalHtml);
-  showNotification('Certificate opened in edit mode. Click any text on the certificate to change it before printing.', 'info');
+  if (isIssuedTransferCertificate) {
+    document.querySelectorAll('#certificatePrintArea [contenteditable]').forEach(element => element.setAttribute('contenteditable', 'false'));
+    showNotification('Official issued TC opened with its permanent server date/time and verification QR.', 'success');
+  } else {
+    showNotification('Draft certificate opened. Printing this preview does not issue a TC or mark the student Left.', 'info');
+  }
 }
 
 function closeCertificatePreview() {
@@ -15494,7 +15877,8 @@ function printCertificatePreview(mode = 'full') {
             height:283mm !important;
             min-height:283mm !important;
             max-height:283mm !important;
-            padding:8mm 10mm 9mm !important;
+            /* Extra bottom pad so SCAN TO VERIFY / signature lines are not clipped */
+            padding:7mm 10mm 14mm !important;
             margin:0 auto !important;
             display:flex !important;
             flex-direction:column !important;
@@ -15507,8 +15891,8 @@ function printCertificatePreview(mode = 'full') {
           #certificatePrintArea[data-orientation="portrait"] .tc-body { flex:1 1 auto; }
           #certificatePrintArea[data-orientation="portrait"] .tc-footer {
             margin-top:auto !important;
-            margin-bottom:0 !important;
-            padding-bottom:0 !important;
+            margin-bottom:2mm !important;
+            padding-bottom:3mm !important;
             page-break-inside:avoid;
           }
           #certificatePrintArea .tc-label {
@@ -15533,14 +15917,50 @@ function printCertificatePreview(mode = 'full') {
           #certificatePrintArea.letterhead-print > .tc-print-sheet {
             border-color:transparent !important;
             background:#ffffff !important;
-            /* Keep Checked By / Principal / seal ≥1.5cm above bottom edge */
-            padding-bottom:15mm !important;
+            /* Keep Checked By / Principal / seal / QR text fully above bottom edge */
+            padding-bottom:18mm !important;
           }
-          /* Only the address/session line moves 2cm up; stays below physical letterhead. */
+          /* Fine-tune the visible TC content 5mm upward for the preprinted letterhead. */
           #certificatePrintArea.letterhead-print .tc-address-line {
             position:relative;
-            top:-20mm;
-            margin-bottom:-20mm;
+            top:-5mm;
+            margin-bottom:-5mm;
+            color:#334155 !important;
+          }
+          /* Print-safe contrast for the preprinted letterhead template only. */
+          #certificatePrintArea.letterhead-print .tc-header-rule {
+            background:linear-gradient(90deg, transparent, #b7791f, #17375e, #b7791f, transparent) !important;
+          }
+          #certificatePrintArea.letterhead-print .tc-title {
+            color:#0b2d4d !important;
+            border-bottom-color:#b7791f !important;
+          }
+          #certificatePrintArea.letterhead-print .tc-certificate-meta {
+            color:#334155 !important;
+            font-size:10.375pt !important;
+          }
+          #certificatePrintArea.letterhead-print .tc-detail-row {
+            border-bottom-color:#aebdca !important;
+          }
+          #certificatePrintArea.letterhead-print .tc-label {
+            color:#14213d !important;
+            font-size:12.125pt !important;
+          }
+          #certificatePrintArea.letterhead-print .tc-value {
+            color:#111827 !important;
+          }
+          #certificatePrintArea.letterhead-print .tc-certify {
+            color:#172033 !important;
+            font-size:11.875pt !important;
+          }
+          #certificatePrintArea.letterhead-print .tc-checked-by > div:nth-child(2),
+          #certificatePrintArea.letterhead-print .tc-signature > div:nth-child(2) {
+            color:#0b2d4d !important;
+            border-top-color:#0b2d4d !important;
+          }
+          #certificatePrintArea.letterhead-print .tc-checked-by > div:nth-child(3),
+          #certificatePrintArea.letterhead-print .tc-signature > div:nth-child(3) {
+            color:#475569 !important;
           }
           #certificatePrintArea.letterhead-print .tc-footer,
           #certificatePrintArea.letterhead-print .tc-sign-row,
