@@ -14968,8 +14968,8 @@ function getTransferCertificateDetailsHtml(student) {
     <div class="tc-details" style="position:relative; z-index:1; margin:10px 8px 0; font-family:Georgia, 'Times New Roman', serif;">
       ${rows.map(([label, value]) => `
         <div class="tc-detail-row" style="display:grid; grid-template-columns:210px 1fr; align-items:end; gap:14px; padding:7px 0 6px; border-bottom:1px dotted #c5d0dc;">
-          <div style="font-family:'Outfit', sans-serif; color:#7a8aa0; font-size:11.5px; letter-spacing:0.7px; text-transform:uppercase; font-weight:800; padding-bottom:2px;">${label}</div>
-          <div contenteditable="true" style="color:#10213f; font-family:'Playfair Display', Georgia, serif; font-size:16px; line-height:1.3; font-weight:800; padding-bottom:1px;">${value}</div>
+          <div class="tc-label" style="font-family:'Outfit', sans-serif; color:#1e293b; font-size:13.5px; letter-spacing:0.7px; text-transform:uppercase; font-weight:800; padding-bottom:2px;">${label}</div>
+          <div class="tc-value" contenteditable="true" style="color:#10213f; font-family:'Montserrat', 'Outfit', sans-serif; font-size:16px; line-height:1.3; font-weight:700; padding-bottom:1px;">${value}</div>
         </div>
       `).join('')}
     </div>
@@ -15006,20 +15006,34 @@ function getCertificateSignatureHtml(student) {
   `;
 }
 
-function getPrincipalOnlyCertificateSignatureHtml() {
+/** TC footer: Checked By (left) + Principal / school seal (right). Used by colour and letterhead templates. */
+function getTransferCertificateSignatureHtml() {
   const profile = getSchoolProfile();
   const principalSignature = profile.principalSignatureDataUrl || '';
   return `
-    <div class="tc-signature" style="width:250px; text-align:center; margin-left:auto;">
-      <div style="height:78px; display:flex; align-items:flex-end; justify-content:center; margin-bottom:2px;">
-        ${principalSignature
-          ? `<img src="${principalSignature}" alt="Principal signature" style="max-width:190px; max-height:74px; object-fit:contain;">`
-          : '<div style="height:54px;"></div>'}
+    <div class="tc-sign-row" style="display:flex; justify-content:space-between; align-items:flex-end; gap:28px; width:100%;">
+      <div class="tc-checked-by" style="width:250px; text-align:center;">
+        <div style="height:78px; display:flex; align-items:flex-end; justify-content:center; margin-bottom:2px;">
+          <div style="height:54px;"></div>
+        </div>
+        <div style="border-top:1.7px solid #10213f; padding-top:6px; font-family:'Playfair Display', Georgia, serif; color:#10213f; font-size:18px; font-weight:900; line-height:1.1;">Checked By</div>
+        <div style="font-family:'Outfit', sans-serif; font-size:12px; color:#64748b; font-weight:600; margin-top:3px;">Full Name & Signature</div>
       </div>
-      <div style="border-top:1.7px solid #10213f; padding-top:6px; font-family:'Playfair Display', Georgia, serif; color:#10213f; font-size:18px; font-weight:900; line-height:1.1;">Principal</div>
-      <div style="font-family:'Outfit', sans-serif; font-size:12px; color:#64748b; font-weight:600; margin-top:3px;">Signature & School Seal</div>
+      <div class="tc-signature" style="width:250px; text-align:center;">
+        <div style="height:78px; display:flex; align-items:flex-end; justify-content:center; margin-bottom:2px;">
+          ${principalSignature
+            ? `<img src="${principalSignature}" alt="Principal signature" style="max-width:190px; max-height:74px; object-fit:contain;">`
+            : '<div style="height:54px;"></div>'}
+        </div>
+        <div style="border-top:1.7px solid #10213f; padding-top:6px; font-family:'Playfair Display', Georgia, serif; color:#10213f; font-size:18px; font-weight:900; line-height:1.1;">Principal</div>
+        <div style="font-family:'Outfit', sans-serif; font-size:12px; color:#64748b; font-weight:600; margin-top:3px;">Signature & School Seal</div>
+      </div>
     </div>
   `;
+}
+
+function getPrincipalOnlyCertificateSignatureHtml() {
+  return getTransferCertificateSignatureHtml();
 }
 
 function generateCertificate(admissionNo, certType) {
@@ -15052,10 +15066,10 @@ function generateCertificate(admissionNo, certType) {
     <div class="modal-overlay active" id="certificateEditModal" style="z-index:999999;">
       <div style="position:fixed; right:24px; bottom:24px; z-index:1000002; display:flex; gap:10px; flex-wrap:wrap; justify-content:flex-end;">
         <button onclick="printCertificatePreview()" style="background:#0284c7; color:#ffffff; border:none; border-radius:999px; padding:13px 22px; font-weight:900; font-size:0.95rem; box-shadow:0 12px 30px rgba(2,132,199,0.35); cursor:pointer;">
-          <i class="fa-solid fa-print"></i> Print Certificate
+          <i class="fa-solid fa-print"></i> Print Colour Template
         </button>
         ${isTransferCertificate ? `<button onclick="printCertificatePreview('letterhead')" style="background:#334155; color:#ffffff; border:none; border-radius:999px; padding:13px 22px; font-weight:900; font-size:0.95rem; box-shadow:0 12px 30px rgba(15,23,42,0.28); cursor:pointer;">
-          <i class="fa-solid fa-print"></i> Laser Letterhead Print
+          <i class="fa-solid fa-print"></i> Letterhead Template
         </button>` : ''}
         <button onclick="closeCertificatePreview()" style="background:#ef4444; color:#ffffff; border:none; border-radius:999px; padding:13px 22px; font-weight:900; font-size:0.95rem; box-shadow:0 12px 30px rgba(239,68,68,0.35); cursor:pointer;">
           <i class="fa-solid fa-xmark"></i> Close
@@ -15065,12 +15079,13 @@ function generateCertificate(admissionNo, certType) {
         <div style="position:sticky; top:0; z-index:10; display:flex; justify-content:space-between; align-items:center; gap:12px; padding:14px 18px; background:#0f172a; color:#ffffff;">
           <div style="font-weight:900;"><i class="fa-solid fa-pen-to-square" style="color:#f59e0b;"></i> Edit ${certType} for ${student.name}</div>
           <div style="display:flex; gap:8px;">
-            <button class="btn btn-primary" onclick="printCertificatePreview()" style="padding:8px 14px;"><i class="fa-solid fa-print"></i> Print Certificate</button>
-            ${isTransferCertificate ? `<button class="btn btn-secondary" onclick="printCertificatePreview('letterhead')" style="padding:8px 14px; background:#475569; color:#fff;"><i class="fa-solid fa-print"></i> Laser Letterhead</button>` : ''}
+            <button class="btn btn-primary" onclick="printCertificatePreview()" style="padding:8px 14px;"><i class="fa-solid fa-print"></i> Colour Template</button>
+            ${isTransferCertificate ? `<button class="btn btn-secondary" onclick="printCertificatePreview('letterhead')" style="padding:8px 14px; background:#475569; color:#fff;"><i class="fa-solid fa-print"></i> Letterhead Template</button>` : ''}
             <button onclick="closeCertificatePreview()" style="background:#334155; color:#fff; border:none; width:34px; height:34px; border-radius:50%; font-weight:900;">X</button>
           </div>
         </div>
 
+        <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@500;600;700;800&family=Outfit:wght@400;600;700;800&family=Playfair+Display:wght@700;800&display=swap" rel="stylesheet">
         <div id="certificatePrintArea" data-orientation="${isTransferCertificate ? 'portrait' : 'landscape'}" style="padding:${isTransferCertificate ? '18px' : '30px'}; background:#fff;">
           <div class="${isTransferCertificate ? 'tc-print-sheet' : ''}" style="${isTransferCertificate ? 'width:794px; max-width:100%; min-height:1123px; height:1123px; margin:0 auto; border:2.5px solid #d4af37; padding:18px 22px 20px; background:#ffffff; box-sizing:border-box; display:flex; flex-direction:column;' : 'min-height:760px; border:8px double #1e3a8a; padding:22px; background:linear-gradient(135deg, rgba(255,255,255,0.96), rgba(239,246,255,0.92)), radial-gradient(circle at top left, rgba(212,175,55,0.25), transparent 32%), radial-gradient(circle at bottom right, rgba(30,58,138,0.14), transparent 30%);'} position:relative;">
             <div class="${isTransferCertificate ? 'tc-decoration' : ''}" style="position:absolute; inset:${isTransferCertificate ? '9px' : '16px'}; border:${isTransferCertificate ? '1px solid #10213f' : '2px solid #d4af37'}; opacity:${isTransferCertificate ? '0.28' : '1'}; pointer-events:none;"></div>
@@ -15079,9 +15094,9 @@ function generateCertificate(admissionNo, certType) {
             <div style="${isTransferCertificate ? 'display:block; text-align:center; padding:6px 18px 0;' : 'display:flex; justify-content:space-between; gap:18px; align-items:center;'} position:relative; z-index:1;">
               ${isTransferCertificate ? `
                 <div class="tc-logo" style="display:flex; justify-content:center; margin-bottom:6px;">${getTransferCertificateLogoHtml(78)}</div>
-                <div class="tc-school-name-spacer" aria-hidden="true" style="height:32px; line-height:1.15; margin:0;"></div>
-                <div contenteditable="true" style="font-family:'Outfit', sans-serif; font-size:13px; color:#64748b; margin-top:5px; font-weight:700;">${profile.address} • Academic Session ${SchoolData.activeSession}</div>
-                <div style="height:1px; background:linear-gradient(90deg, transparent, #d4af37, #10213f, #d4af37, transparent); margin:10px auto 0; width:72%;"></div>
+                <div class="tc-school-name" contenteditable="true" style="font-family:'Playfair Display', Georgia, serif; font-size:28px; font-weight:800; color:#10213f; letter-spacing:0; line-height:1.15;">${profile.name}</div>
+                <div class="tc-address-line" contenteditable="true" style="font-family:'Outfit', sans-serif; font-size:13px; color:#64748b; margin-top:5px; font-weight:700;">${profile.address} • Academic Session ${SchoolData.activeSession}</div>
+                <div class="tc-header-rule" style="height:1px; background:linear-gradient(90deg, transparent, #d4af37, #10213f, #d4af37, transparent); margin:10px auto 0; width:72%;"></div>
               ` : `
                 <div>${getSchoolLogoHtml(84)}</div>
                 <div style="text-align:center; flex:1;">
@@ -15093,7 +15108,7 @@ function generateCertificate(admissionNo, certType) {
               `}
             </div>
 
-            <div style="text-align:center; margin:${isTransferCertificate ? '12px 0 4px' : '26px 0 18px'}; position:relative; z-index:1;">
+            <div class="tc-title-block" style="text-align:center; margin:${isTransferCertificate ? '12px 0 4px' : '26px 0 18px'}; position:relative; z-index:1;">
               <div contenteditable="true" style="display:inline-block; padding:${isTransferCertificate ? '0 0 5px' : '10px 28px'}; border:${isTransferCertificate ? '0' : '2px solid #d4af37'}; border-bottom:${isTransferCertificate ? '3px solid #d4af37' : '2px solid #d4af37'}; border-radius:${isTransferCertificate ? '0' : '999px'}; background:${isTransferCertificate ? 'transparent' : '#fff7ed'}; font-family:'Playfair Display', Georgia, serif; font-size:${isTransferCertificate ? '24px' : '25px'}; font-weight:800; color:${isTransferCertificate ? '#10213f' : '#92400e'}; text-transform:uppercase; letter-spacing:${isTransferCertificate ? '2.2px' : '0'};">${isTransferCertificate ? 'Transfer Certificate' : certType}</div>
               <div contenteditable="true" style="font-family:'Outfit', sans-serif; font-size:12.5px; color:#64748b; margin-top:8px; font-weight:700;">Certificate No: ${certNo} • Issue Date: ${new Date().toLocaleDateString('en-GB')}</div>
             </div>
@@ -15103,11 +15118,13 @@ function generateCertificate(admissionNo, certType) {
             </div>
 
             <div class="tc-footer" style="display:flex; justify-content:space-between; align-items:flex-end; gap:24px; position:relative; z-index:1; margin:${isTransferCertificate ? 'auto 10px 2px' : '20px 22px 0'}; padding:${isTransferCertificate ? '18px 6px 4px' : '0'};">
-              <div class="tc-qr" style="text-align:center;">
-                <img src="https://api.qrserver.com/v1/create-qr-code/?size=110x110&data=VERIFIED-CERTIFICATE-${student.admissionNo}-${encodeURIComponent(certType)}" style="width:${isTransferCertificate ? '92px' : '96px'}; height:${isTransferCertificate ? '92px' : '96px'};">
+              ${isTransferCertificate
+                ? getTransferCertificateSignatureHtml()
+                : `<div class="tc-qr" style="text-align:center;">
+                <img src="https://api.qrserver.com/v1/create-qr-code/?size=110x110&data=VERIFIED-CERTIFICATE-${student.admissionNo}-${encodeURIComponent(certType)}" style="width:96px; height:96px;">
                 <div style="font-family:'Outfit', sans-serif; font-size:10px; color:#64748b; margin-top:5px; letter-spacing:0.6px; font-weight:700; text-transform:uppercase;">Verification QR</div>
               </div>
-              ${isTransferCertificate ? getPrincipalOnlyCertificateSignatureHtml() : `<div style="flex:1;">${getCertificateSignatureHtml(student)}</div>`}
+              <div style="flex:1;">${getCertificateSignatureHtml(student)}</div>`}
             </div>
           </div>
         </div>
@@ -15132,7 +15149,9 @@ function printCertificatePreview(mode = 'full') {
   const printWindow = window.open('', '_blank');
   const printHtml = `
     <div class="print-toolbar">
-      <div class="print-hint">Destination lists every printer on this PC — USB, WiFi, Bluetooth or network. Pick your A4 / laser for certificates.</div>
+      <div class="print-hint">${isLetterhead
+        ? 'Letterhead Template — use school preprinted A4 letterhead. Logo/name/watermark are not printed. Colour or B&W laser both work.'
+        : 'Colour Template — prints logo, school name, watermark and colours. Pick your A4 colour printer.'}</div>
       <button onclick="window.print()" style="background:#0284c7;">Print — Choose Printer</button>
       <button onclick="window.close()" style="background:#ef4444;">Close</button>
     </div>
@@ -15144,9 +15163,9 @@ function printCertificatePreview(mode = 'full') {
     <html>
       <head>
         <title>Print Certificate</title>
-        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700;800&family=Playfair+Display:wght@700;800&display=swap" rel="stylesheet">
+        <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@500;600;700;800&family=Outfit:wght@400;600;700;800&family=Playfair+Display:wght@700;800&display=swap" rel="stylesheet">
         <style>
-          @page { size: A4 ${orientation}; margin: ${isPortrait ? '7mm' : '8mm'}; }
+          @page { size: A4 ${orientation}; margin: ${isPortrait ? (isLetterhead ? '5mm' : '7mm') : '8mm'}; }
           body { margin:0; background:#fff; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
           * { box-sizing:border-box; }
           .print-toolbar { position:fixed; top:14px; right:14px; display:flex; flex-direction:column; align-items:flex-end; gap:8px; z-index:99999; }
@@ -15171,17 +15190,46 @@ function printCertificatePreview(mode = 'full') {
           #certificatePrintArea[data-orientation="portrait"] .tc-body { flex:1 1 auto; }
           #certificatePrintArea[data-orientation="portrait"] .tc-footer {
             margin-top:auto !important;
+            margin-bottom:0 !important;
+            padding-bottom:0 !important;
             page-break-inside:avoid;
           }
+          #certificatePrintArea .tc-label {
+            color:#1e293b !important;
+            font-size:13.5px !important;
+            font-weight:800 !important;
+          }
+          #certificatePrintArea .tc-value {
+            font-family:'Montserrat', 'Outfit', sans-serif !important;
+          }
+          /* Letterhead Template: for preprinted A4 letterhead (~5cm top header). */
           #certificatePrintArea.letterhead-print .tc-logo,
-          #certificatePrintArea.letterhead-print .tc-school-name-spacer,
+          #certificatePrintArea.letterhead-print .tc-school-name,
+          #certificatePrintArea.letterhead-print .tc-school-name-spacer {
+            /* Remove digital print but keep reserved height so the TC table does not jump. */
+            visibility:hidden !important;
+          }
           #certificatePrintArea.letterhead-print .tc-watermark,
           #certificatePrintArea.letterhead-print .tc-decoration {
-            visibility:hidden !important;
+            display:none !important;
           }
           #certificatePrintArea.letterhead-print > .tc-print-sheet {
             border-color:transparent !important;
             background:#ffffff !important;
+            /* Keep Checked By / Principal / seal ≥1.5cm above bottom edge */
+            padding-bottom:15mm !important;
+          }
+          /* Only the address/session line moves 2cm up; stays below physical letterhead. */
+          #certificatePrintArea.letterhead-print .tc-address-line {
+            position:relative;
+            top:-20mm;
+            margin-bottom:-20mm;
+          }
+          #certificatePrintArea.letterhead-print .tc-footer,
+          #certificatePrintArea.letterhead-print .tc-sign-row,
+          #certificatePrintArea.letterhead-print .tc-checked-by,
+          #certificatePrintArea.letterhead-print .tc-signature {
+            page-break-inside:avoid !important;
           }
           @media print {
             .print-toolbar { display:none !important; }
