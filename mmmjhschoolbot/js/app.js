@@ -1627,6 +1627,10 @@ async function initApp() {
   }
 
   await validateStoredErpSession();
+  // Subject Directory must never keep demo / non-login teacher names from cloud.
+  if (typeof sanitizeSubjectsTeachersMustBeUsers === 'function' && sanitizeSubjectsTeachersMustBeUsers()) {
+    saveSchoolDataToStorage();
+  }
   handleRouting();
 }
 
@@ -2435,7 +2439,7 @@ function getSubjectsForClass(className) {
             code: code,
             name: s.name.toUpperCase(),
             maxMarks: s.maxMarks || 100,
-            teacher: s.teacher || 'Unassigned'
+            teacher: getSubjectTeacherDisplayName(s)
           });
         }
       }
@@ -3131,13 +3135,13 @@ function renderExamsWeightageSubdirectoryPage(container) {
               const code = sub.code || sub.name;
               const checked = isSubjectIncluded(code);
               return `
-                <tr class="subject-weightage-row" data-code="${code}" data-name="${sub.name}" data-teacher="${sub.teacher || 'Unassigned'}" style="border-bottom:1px solid #1e293b;">
+                <tr class="subject-weightage-row" data-code="${code}" data-name="${sub.name}" data-teacher="${getSubjectTeacherDisplayName(sub)}" style="border-bottom:1px solid #1e293b;">
                   <td style="padding:12px; text-align:center;">
                     <input type="checkbox" class="subject-weightage-include" data-code="${code}" ${checked ? 'checked' : ''} style="width:18px; height:18px; cursor:pointer;">
                   </td>
                   <td style="padding:12px;"><code>${sub.code}</code></td>
                   <td style="padding:12px;"><strong style="color:#ffffff;">${sub.name}</strong></td>
-                  <td style="padding:12px; color:#cbd5e1;">${sub.teacher || 'Unassigned'}</td>
+                  <td style="padding:12px; color:#cbd5e1;">${getSubjectTeacherDisplayName(sub)}</td>
                   ${components.map(c => `
                     <td style="padding:10px; text-align:center;">
                       <input type="number" class="subject-weightage-max session-dropdown" data-code="${code}" data-name="${sub.name}" data-component="${c.key}" value="${getSubjectExamComponentMax(selectedClass, code, c.key)}" style="width:84px; text-align:center; font-weight:800; color:#34d399; border:1px solid #34d399;">
@@ -4135,6 +4139,125 @@ function staffUsernameFromName(name) {
 function isTeacherRoleUser(user) {
   const role = String(user?.role || '');
   return role.includes('Teacher');
+}
+
+function findStaffUserByName(name) {
+  const key = String(name || '').trim().toLowerCase();
+  if (!key || key === 'unassigned' || key.includes('managed in teachers')) return null;
+  return (SchoolData.staffUsers || []).find(user =>
+    String(user.name || '').trim().toLowerCase() === key ||
+    String(user.username || '').trim().toLowerCase() === key
+  ) || null;
+}
+
+/** Subject teacher label is valid only when it matches an ERP staff login. */
+function isSubjectTeacherAUser(teacherName) {
+  const user = findStaffUserByName(teacherName);
+  return !!(user && isTeacherRoleUser(user));
+}
+
+function getSubjectTeacherDisplayName(sub) {
+  const raw = String(sub?.teacher || '').trim();
+  if (!raw || raw.toLowerCase() === 'unassigned' || raw.toLowerCase().includes('managed in teachers')) {
+    return 'Unassigned';
+  }
+  if (isSubjectTeacherAUser(raw)) return raw;
+  return 'Unassigned';
+}
+
+function getTeacherRoleUsersForSubjectAssign() {
+  return (SchoolData.staffUsers || []).filter(isTeacherRoleUser);
+}
+
+/** Dropdown: only Teacher-role ERP users (no free-text / demo names). */
+function getSubjectTeacherAssignOptionsHtml(selectedName = '') {
+  const users = getTeacherRoleUsersForSubjectAssign();
+  const sel = String(selectedName || '').trim();
+  const selOk = isSubjectTeacherAUser(sel) ? sel : '';
+  let html = '<option value="">Unassigned</option>';
+  users.forEach((u) => {
+    const name = String(u.name || '').trim();
+    if (!name) return;
+    const selected = name.toLowerCase() === selOk.toLowerCase() ? 'selected' : '';
+    html += `<option value="${escapeHtml(name)}" ${selected}>${escapeHtml(name)} (@${escapeHtml(u.username || '')})</option>`;
+  });
+  return html;
+}
+
+/**
+ * Keep Subject Directory teacher column in sync with Teachers Directory mappings
+ * (only when the faculty row is linked to a real staff login).
+ */
+function applyTeacherMappingsToSubjectsDirectory(teacher, mappings) {
+  if (!teacher || !Array.isArray(SchoolData.subjects)) return false;
+  const linked = findStaffUserForTeacher(teacher);
+  if (!linked || !isTeacherRoleUser(linked)) return false;
+  const teacherName = String(teacher.name || linked.name || '').trim();
+  if (!teacherName) return false;
+
+  const mapKeys = new Set(
+    (mappings || []).map((m) =>
+      `${normalizeSubjectCodeKey(m.subjectCode)}|${String(m.class || '').trim().toLowerCase()}`
+    )
+  );
+  let changed = false;
+  SchoolData.subjects.forEach((sub) => {
+    const key = `${normalizeSubjectCodeKey(sub.code)}|${String(sub.class || '').trim().toLowerCase()}`;
+    const wasThisTeacher =
+      String(sub.teacher || '').trim().toLowerCase() === teacherName.toLowerCase();
+    if (mapKeys.has(key)) {
+      if (String(sub.teacher || '').trim() !== teacherName) {
+        sub.teacher = teacherName;
+        changed = true;
+      }
+    } else if (wasThisTeacher) {
+      sub.teacher = 'Unassigned';
+      changed = true;
+    }
+  });
+  return changed;
+}
+
+function syncSubjectTeachersFromLinkedMappings() {
+  let changed = false;
+  (SchoolData.teachers || []).forEach((teacher) => {
+    if (applyTeacherMappingsToSubjectsDirectory(teacher, teacher.subjectMappings || [])) {
+      changed = true;
+    }
+  });
+  return changed;
+}
+
+/**
+ * Enforce: only ERP users (Teacher role) may appear as subject teachers.
+ * Clears leftover demo names (Varsha, Lakshya, …) that are not logins.
+ */
+function sanitizeSubjectsTeachersMustBeUsers() {
+  if (!Array.isArray(SchoolData.subjects)) return false;
+  let changed = false;
+  SchoolData.subjects.forEach((sub) => {
+    const raw = String(sub.teacher || '').trim();
+    if (!raw) {
+      if (sub.teacher !== 'Unassigned') {
+        sub.teacher = 'Unassigned';
+        changed = true;
+      }
+      return;
+    }
+    if (raw.toLowerCase() === 'unassigned') return;
+    if (raw.toLowerCase().includes('managed in teachers') || !isSubjectTeacherAUser(raw)) {
+      sub.teacher = 'Unassigned';
+      changed = true;
+    }
+  });
+  if (syncSubjectTeachersFromLinkedMappings()) changed = true;
+  // Teachers Directory: drop faculty rows with no linked staff login
+  if (Array.isArray(SchoolData.teachers)) {
+    const before = SchoolData.teachers.length;
+    SchoolData.teachers = SchoolData.teachers.filter((t) => !!findStaffUserForTeacher(t));
+    if (SchoolData.teachers.length !== before) changed = true;
+  }
+  return changed;
 }
 
 function findStaffUserForTeacher(teacher) {
@@ -8865,6 +8988,9 @@ function saveTeacherSubjectAssignments(teacherId) {
     linkedUser.assignedSubject = newMappings.map(m => m.subjectCode).join('/');
   }
 
+  // Subject Directory teacher column must show this user (not leftover demo names).
+  applyTeacherMappingsToSubjectsDirectory(teacher, newMappings);
+
   saveSchoolDataToStorage();
   document.getElementById('tchSubjectModal')?.remove();
 
@@ -9373,19 +9499,32 @@ function switchTimetableMode(mode) {
 }
 
 function renderSubjectsPage(container) {
-  const subjects = SchoolData.subjects;
+  if (typeof sanitizeSubjectsTeachersMustBeUsers === 'function' && sanitizeSubjectsTeachersMustBeUsers()) {
+    saveSchoolDataToStorage();
+  }
+  const subjects = SchoolData.subjects || [];
+  const teacherUsers = getTeacherRoleUsersForSubjectAssign();
 
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-book-open" style="color:var(--accent-primary)"></i> Subjects Directory</h2>
-        <p class="page-subtitle">Manage Class Subjects, Subject Teachers & Weekly Periods for Automated Timetables</p>
+        <p class="page-subtitle">Subject teachers must be ERP users (Teacher role). Create the login in User Management first, then assign here or via Teachers Directory.</p>
       </div>
       <div style="display:flex; gap:10px;">
         <button class="btn btn-secondary" onclick="window.location.hash='timetable-class'"><i class="fa-solid fa-calendar-week"></i> Open Timetable Generator</button>
         <button class="btn btn-primary" onclick="openCreateSubjectModal()"><i class="fa-solid fa-plus"></i> Add New Subject</button>
       </div>
     </div>
+
+    ${teacherUsers.length === 0 ? `
+      <div class="glass-card" style="margin-bottom:16px; border:1px solid #f59e0b;">
+        <p style="margin:0; color:#fbbf24; font-size:0.9rem;">
+          <i class="fa-solid fa-triangle-exclamation"></i>
+          No Teacher-role users yet. Open <strong>User Management</strong>, create logins with a Teacher role, then assign subjects.
+        </p>
+      </div>
+    ` : ''}
 
     <div class="glass-card">
       <div class="data-table-container">
@@ -9407,7 +9546,7 @@ function renderSubjectsPage(container) {
                 <td><code>${sub.code}</code></td>
                 <td><strong style="color:var(--text-main);">${sub.name}</strong></td>
                 <td><span class="badge badge-purple">${sub.class}</span></td>
-                <td><i class="fa-solid fa-user-tie" style="color:var(--accent-primary);"></i> ${sub.teacher}</td>
+                <td><i class="fa-solid fa-user-tie" style="color:var(--accent-primary);"></i> ${escapeHtml(getSubjectTeacherDisplayName(sub))}</td>
                 <td><span class="badge badge-info"><i class="fa-solid fa-clock"></i> ${sub.periodsPerWeek} Periods / Wk</span></td>
                 <td><span class="badge badge-success">${sub.category}</span></td>
                 <td>
@@ -9469,8 +9608,14 @@ function openCreateSubjectModal() {
                 <option value="Co-Curricular">Co-Curricular</option>
               </select>
             </div>
+            <div>
+              <label style="font-size:0.8rem; font-weight:600;">Assigned Subject Teacher (ERP user only)</label>
+              <select id="subTeacher" class="session-dropdown">
+                ${getSubjectTeacherAssignOptionsHtml('')}
+              </select>
+            </div>
             <p style="font-size:0.78rem; color:#94a3b8; margin:0; background:#1e293b; padding:8px 12px; border-radius:6px;">
-              <strong>Faculty Mapping:</strong> Teachers are assigned to subjects & classes directly in the <strong>Teachers Directory</strong> (#teachers) to avoid duplicate data entry.
+              Only staff logins with a <strong>Teacher</strong> role appear here. Create the user in User Management first if the list is empty.
             </p>
           </div>
 
@@ -9492,9 +9637,14 @@ function saveNewSubject() {
   const cls = document.getElementById('subClass').value;
   const periods = parseInt(document.getElementById('subPeriods').value) || 5;
   const cat = document.getElementById('subCategory').value;
+  const teacherRaw = document.getElementById('subTeacher')?.value?.trim() || '';
 
   if (!name || !code) {
     showNotification('Warning: Subject Name and Code are required!', 'error');
+    return;
+  }
+  if (teacherRaw && !isSubjectTeacherAUser(teacherRaw)) {
+    showNotification('Subject teacher must be an ERP user with a Teacher role.', 'error');
     return;
   }
 
@@ -9503,7 +9653,7 @@ function saveNewSubject() {
     code: code,
     name: name,
     class: cls,
-    teacher: "Managed in Teachers Directory",
+    teacher: teacherRaw || 'Unassigned',
     periodsPerWeek: periods,
     category: cat
   };
@@ -9549,6 +9699,15 @@ function openEditSubjectModal(subId) {
               <label style="font-size:0.8rem; font-weight:600;">Weekly Periods Count *</label>
               <input type="number" id="subPeriods" class="session-dropdown" value="${sub.periodsPerWeek}">
             </div>
+            <div>
+              <label style="font-size:0.8rem; font-weight:600;">Assigned Subject Teacher (ERP user only)</label>
+              <select id="subTeacher" class="session-dropdown">
+                ${getSubjectTeacherAssignOptionsHtml(sub.teacher || '')}
+              </select>
+            </div>
+            <p style="font-size:0.78rem; color:#94a3b8; margin:0; background:#1e293b; padding:8px 12px; border-radius:6px;">
+              Demo / non-login names are rejected. Assign only from Teacher-role users.
+            </p>
           </div>
 
           <div style="display:flex; justify-content:space-between;">
@@ -9570,9 +9729,16 @@ function saveSubjectEdit(subId) {
   const sub = SchoolData.subjects.find(s => s.id === subId);
   if (!sub) return;
 
+  const teacherRaw = document.getElementById('subTeacher')?.value?.trim() || '';
+  if (teacherRaw && !isSubjectTeacherAUser(teacherRaw)) {
+    showNotification('Subject teacher must be an ERP user with a Teacher role.', 'error');
+    return;
+  }
+
   sub.name = document.getElementById('subName').value.trim();
   sub.class = document.getElementById('subClass')?.value || sub.class;
   sub.periodsPerWeek = parseInt(document.getElementById('subPeriods').value) || 5;
+  sub.teacher = teacherRaw || 'Unassigned';
 
   const modal = document.getElementById('subjectModal');
   if (modal) modal.remove();
