@@ -1587,6 +1587,10 @@ async function initApp() {
     }
   } else {
     setCloudLoadingOverlay(false);
+    console.error('initCloudSync missing — js/cloudSync.js was not loaded (wrong file on Vercel?)');
+    if (typeof showNotification === 'function') {
+      showNotification('Cloud sync file missing. Re-upload js/cloudSync.js (not a copy of app.js) or staff/student edits will not save.', 'error');
+    }
   }
 }
 
@@ -4256,8 +4260,20 @@ function deleteStaffUser(uid) {
     );
   }
   saveSchoolDataToStorage();
-  showNotification('Staff login and linked teacher profile removed.', 'info');
   renderUsersPage(document.getElementById('contentBody'));
+
+  // Cloud-only: memory delete is not enough — must upload staffUsers to Supabase
+  if (typeof pushSchoolDataToCloud === 'function') {
+    pushSchoolDataToCloud({ skipMergePull: true })
+      .then((data) => {
+        showNotification(`Staff removed and saved to cloud (${data.studentCount || 0} students in snapshot).`, 'success');
+      })
+      .catch((err) => {
+        showNotification(`Staff removed on screen, but cloud save failed: ${err.message}. They will come back on refresh until cloud sync works.`, 'error');
+      });
+  } else {
+    showNotification('Staff removed on screen only. js/cloudSync.js is missing or wrong — upload the real cloudSync file or they will return after refresh.', 'error');
+  }
 }
 
 function recalcStudentMatrixRow(inputElem) {
@@ -5706,8 +5722,8 @@ function applySchoolDataStoragePayload(parsed, options) {
   if (parsed.sessions) SchoolData.sessions = parsed.sessions;
   if (parsed.teachers) SchoolData.teachers = parsed.teachers;
   if (parsed.subjects) SchoolData.subjects = parsed.subjects;
-  if (Array.isArray(parsed.staffUsers) && parsed.staffUsers.length > 0) SchoolData.staffUsers = parsed.staffUsers;
-  if (parsed.examSubjectConfigs) SchoolData.examSubjectConfigs = parsed.examSubjectConfigs;
+  if (Array.isArray(parsed.staffUsers)) SchoolData.staffUsers = parsed.staffUsers;
+  if (Array.isArray(parsed.teachers)) SchoolData.teachers = parsed.teachers;
   if (parsed.schoolProfile) {
     const prev = SchoolData.schoolProfile || {};
     const next = parsed.schoolProfile;
