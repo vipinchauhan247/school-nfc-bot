@@ -1346,12 +1346,13 @@ function getClassSelectOptionsHtml(selectedClass = '', options = {}) {
   if (options.includeAll) {
     optionRows.push(`<option value="ALL" ${selected === 'ALL' ? 'selected' : ''}>All Classes</option>`);
   }
-  classes.forEach(cls => {
-    optionRows.push(`<option value="${cls}" ${selected === cls ? 'selected' : ''}>${cls}</option>`);
-  });
+  // Universal subject first — one English / Maths row covers every class.
   if (options.includeUniversal) {
-    optionRows.push(`<option value="ALL CLASSES" ${selected === 'ALL CLASSES' ? 'selected' : ''}>ALL CLASSES (Universal Subject)</option>`);
+    optionRows.push(`<option value="ALL CLASSES" ${selected === 'ALL CLASSES' || selected === 'ALL' ? 'selected' : ''}>ALL CLASSES (one subject for every class)</option>`);
   }
+  classes.forEach(cls => {
+    optionRows.push(`<option value="${cls}" ${selected === cls ? 'selected' : ''}>${cls} only</option>`);
+  });
   if (selected && selected !== 'ALL' && selected !== 'ALL CLASSES' && !classes.includes(selected)) {
     optionRows.push(`<option value="${selected}" selected>${selected}</option>`);
   }
@@ -4169,6 +4170,41 @@ function getTeacherRoleUsersForSubjectAssign() {
   return (SchoolData.staffUsers || []).filter(isTeacherRoleUser);
 }
 
+function isUniversalSubjectClass(cls) {
+  const c = String(cls || '').trim().toUpperCase();
+  return !c || c === 'ALL' || c === 'ALL CLASSES';
+}
+
+function getSubjectClassLabel(sub) {
+  return isUniversalSubjectClass(sub?.class) ? 'All Classes' : String(sub?.class || '').trim();
+}
+
+function getSubjectClassBadgeHtml(sub) {
+  if (isUniversalSubjectClass(sub?.class)) {
+    return '<span class="badge badge-success" title="Appears in every class exams &amp; timetable">All Classes</span>';
+  }
+  return `<span class="badge badge-purple">${escapeHtml(String(sub?.class || ''))}</span>`;
+}
+
+/** One-click: Class 5-only English/Maths/etc. → All Classes (no re-add per class). */
+function promoteAllSubjectsToAllClasses() {
+  const locked = (SchoolData.subjects || []).filter((s) => !isUniversalSubjectClass(s.class));
+  if (!locked.length) {
+    showNotification('All subjects already apply to All Classes.', 'info');
+    return;
+  }
+  const ok = window.confirm(
+    `Convert ${locked.length} subject(s) to ALL CLASSES?\n\n` +
+    'Example: English once covers Class 1–8. You do not need to add English again for each class.\n\n' +
+    'Marks are still entered only in Exams & Report Cards — not here.'
+  );
+  if (!ok) return;
+  locked.forEach((s) => { s.class = 'ALL CLASSES'; });
+  saveSchoolDataToStorage();
+  showNotification(`Updated ${locked.length} subject(s) to All Classes.`, 'success');
+  renderSubjectsPage(document.getElementById('contentBody'));
+}
+
 /** Dropdown: only Teacher-role ERP users (no free-text / demo names). */
 function getSubjectTeacherAssignOptionsHtml(selectedName = '') {
   const users = getTeacherRoleUsersForSubjectAssign();
@@ -4195,6 +4231,9 @@ function applyTeacherMappingsToSubjectsDirectory(teacher, mappings) {
   const teacherName = String(teacher.name || linked.name || '').trim();
   if (!teacherName) return false;
 
+  const mappedCodes = new Set(
+    (mappings || []).map((m) => normalizeSubjectCodeKey(m.subjectCode)).filter(Boolean)
+  );
   const mapKeys = new Set(
     (mappings || []).map((m) =>
       `${normalizeSubjectCodeKey(m.subjectCode)}|${String(m.class || '').trim().toLowerCase()}`
@@ -4202,10 +4241,14 @@ function applyTeacherMappingsToSubjectsDirectory(teacher, mappings) {
   );
   let changed = false;
   SchoolData.subjects.forEach((sub) => {
-    const key = `${normalizeSubjectCodeKey(sub.code)}|${String(sub.class || '').trim().toLowerCase()}`;
+    const codeKey = normalizeSubjectCodeKey(sub.code);
+    const key = `${codeKey}|${String(sub.class || '').trim().toLowerCase()}`;
     const wasThisTeacher =
       String(sub.teacher || '').trim().toLowerCase() === teacherName.toLowerCase();
-    if (mapKeys.has(key)) {
+    const matched = isUniversalSubjectClass(sub.class)
+      ? mappedCodes.has(codeKey)
+      : mapKeys.has(key);
+    if (matched) {
       if (String(sub.teacher || '').trim() !== teacherName) {
         sub.teacher = teacherName;
         changed = true;
@@ -9504,15 +9547,21 @@ function renderSubjectsPage(container) {
   }
   const subjects = SchoolData.subjects || [];
   const teacherUsers = getTeacherRoleUsersForSubjectAssign();
+  const classLockedCount = subjects.filter((s) => !isUniversalSubjectClass(s.class)).length;
 
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-book-open" style="color:var(--accent-primary)"></i> Subjects Directory</h2>
-        <p class="page-subtitle">Subject teachers must be ERP users (Teacher role). Create the login in User Management first, then assign here or via Teachers Directory.</p>
+        <p class="page-subtitle">Add English / Maths once with <strong>All Classes</strong> — no need to repeat for each class. Marks are entered in <strong>Exams &amp; Report Cards</strong>, not here.</p>
       </div>
-      <div style="display:flex; gap:10px;">
-        <button class="btn btn-secondary" onclick="window.location.hash='timetable-class'"><i class="fa-solid fa-calendar-week"></i> Open Timetable Generator</button>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        ${classLockedCount > 0 ? `
+          <button class="btn btn-secondary" onclick="promoteAllSubjectsToAllClasses()" title="Convert Class-only rows to All Classes">
+            <i class="fa-solid fa-layer-group"></i> Convert ${classLockedCount} to All Classes
+          </button>
+        ` : ''}
+        <button class="btn btn-secondary" onclick="window.location.hash='exams-entry'"><i class="fa-solid fa-table-cells"></i> Open Exams &amp; Marks</button>
         <button class="btn btn-primary" onclick="openCreateSubjectModal()"><i class="fa-solid fa-plus"></i> Add New Subject</button>
       </div>
     </div>
@@ -9533,7 +9582,7 @@ function renderSubjectsPage(container) {
             <tr>
               <th>Subject Code</th>
               <th>Subject Name</th>
-              <th>Class</th>
+              <th>Applies To</th>
               <th>Assigned Subject Teacher</th>
               <th>Weekly Periods</th>
               <th>Category</th>
@@ -9541,26 +9590,23 @@ function renderSubjectsPage(container) {
             </tr>
           </thead>
           <tbody>
-            ${subjects.map(sub => `
+            ${subjects.length ? subjects.map(sub => `
               <tr>
-                <td><code>${sub.code}</code></td>
-                <td><strong style="color:var(--text-main);">${sub.name}</strong></td>
-                <td><span class="badge badge-purple">${sub.class}</span></td>
+                <td><code>${escapeHtml(sub.code)}</code></td>
+                <td><strong style="color:var(--text-main);">${escapeHtml(sub.name)}</strong></td>
+                <td>${getSubjectClassBadgeHtml(sub)}</td>
                 <td><i class="fa-solid fa-user-tie" style="color:var(--accent-primary);"></i> ${escapeHtml(getSubjectTeacherDisplayName(sub))}</td>
                 <td><span class="badge badge-info"><i class="fa-solid fa-clock"></i> ${sub.periodsPerWeek} Periods / Wk</span></td>
-                <td><span class="badge badge-success">${sub.category}</span></td>
+                <td><span class="badge badge-success">${escapeHtml(sub.category || '')}</span></td>
                 <td>
-                  <div style="display:flex; gap:6px;">
-                    <button class="btn btn-secondary" style="padding:4px 8px; font-size:0.75rem;" onclick="openEditSubjectModal('${sub.id}')">
-                      <i class="fa-solid fa-pen-to-square"></i> Edit
-                    </button>
-                    <button class="btn btn-primary" style="padding:4px 8px; font-size:0.75rem;" onclick="goToSubjectMarksEntry('${sub.name}', '${sub.class}')">
-                      <i class="fa-solid fa-pen"></i> Enter Marks
-                    </button>
-                  </div>
+                  <button class="btn btn-secondary" style="padding:4px 8px; font-size:0.75rem;" onclick="openEditSubjectModal('${sub.id}')">
+                    <i class="fa-solid fa-pen-to-square"></i> Edit
+                  </button>
                 </td>
               </tr>
-            `).join('')}
+            `).join('') : `
+              <tr><td colspan="7" style="text-align:center; color:var(--text-muted); padding:24px;">No subjects yet. Add English once with All Classes.</td></tr>
+            `}
           </tbody>
         </table>
       </div>
@@ -9583,17 +9629,20 @@ function openCreateSubjectModal() {
           <div style="display:flex; flex-direction:column; gap:12px; margin-bottom:20px;">
             <div>
               <label style="font-size:0.8rem; font-weight:600;">Subject Name *</label>
-              <input type="text" id="subName" class="session-dropdown" placeholder="e.g. Computer Science">
+              <input type="text" id="subName" class="session-dropdown" placeholder="e.g. English">
             </div>
             <div>
               <label style="font-size:0.8rem; font-weight:600;">Subject Code *</label>
-              <input type="text" id="subCode" class="session-dropdown" placeholder="e.g. CMP-5">
+              <input type="text" id="subCode" class="session-dropdown" placeholder="e.g. ENG (same code for all classes)">
             </div>
             <div>
-              <label style="font-size:0.8rem; font-weight:600;">Target Class *</label>
+              <label style="font-size:0.8rem; font-weight:600;">Applies To *</label>
               <select id="subClass" class="session-dropdown" style="font-weight:700;">
-                ${getClassSelectOptionsHtml('Class 5', { includeUniversal: true })}
+                ${getClassSelectOptionsHtml('ALL CLASSES', { includeUniversal: true })}
               </select>
+              <p style="font-size:0.75rem; color:#94a3b8; margin:6px 0 0 0;">
+                Choose <strong>ALL CLASSES</strong> for English/Maths/etc. so you add the subject once. Use a single class only for rare class-specific subjects.
+              </p>
             </div>
             <div>
               <label style="font-size:0.8rem; font-weight:600;">Weekly Periods Count (For Timetable) *</label>
@@ -9615,7 +9664,7 @@ function openCreateSubjectModal() {
               </select>
             </div>
             <p style="font-size:0.78rem; color:#94a3b8; margin:0; background:#1e293b; padding:8px 12px; border-radius:6px;">
-              Only staff logins with a <strong>Teacher</strong> role appear here. Create the user in User Management first if the list is empty.
+              Marks entry is in <strong>Exams &amp; Report Cards</strong>. This page only defines subjects / teachers / periods.
             </p>
           </div>
 
@@ -9663,7 +9712,12 @@ function saveNewSubject() {
   const modal = document.getElementById('subjectModal');
   if (modal) modal.remove();
 
-  showNotification(`Done: Subject '${name}' added for ${cls}!`, 'success');
+  showNotification(
+    isUniversalSubjectClass(cls)
+      ? `Done: Subject '${name}' added for All Classes.`
+      : `Done: Subject '${name}' added for ${cls} only.`,
+    'success'
+  );
   renderSubjectsPage(document.getElementById('contentBody'));
 
   saveSchoolDataToStorage();
@@ -9690,10 +9744,16 @@ function openEditSubjectModal(subId) {
               <input type="text" id="subName" class="session-dropdown" value="${sub.name}">
             </div>
             <div>
-              <label style="font-size:0.8rem; font-weight:600;">Target Class *</label>
+              <label style="font-size:0.8rem; font-weight:600;">Applies To *</label>
               <select id="subClass" class="session-dropdown" style="font-weight:700;">
-                ${getClassSelectOptionsHtml(sub.class || 'Class 5', { includeUniversal: true })}
+                ${getClassSelectOptionsHtml(
+                  isUniversalSubjectClass(sub.class) ? 'ALL CLASSES' : (sub.class || 'ALL CLASSES'),
+                  { includeUniversal: true }
+                )}
               </select>
+              <p style="font-size:0.75rem; color:#94a3b8; margin:6px 0 0 0;">
+                Switch to <strong>ALL CLASSES</strong> if this subject is taught in every class (no need to duplicate rows).
+              </p>
             </div>
             <div>
               <label style="font-size:0.8rem; font-weight:600;">Weekly Periods Count *</label>
@@ -9706,7 +9766,7 @@ function openEditSubjectModal(subId) {
               </select>
             </div>
             <p style="font-size:0.78rem; color:#94a3b8; margin:0; background:#1e293b; padding:8px 12px; border-radius:6px;">
-              Demo / non-login names are rejected. Assign only from Teacher-role users.
+              Marks are entered in <strong>Exams &amp; Report Cards</strong> only.
             </p>
           </div>
 
