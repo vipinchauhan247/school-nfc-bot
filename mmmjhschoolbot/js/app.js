@@ -176,6 +176,15 @@ function absoluteAssetUrl(relativePath) {
   }
 }
 
+/**
+ * Logo for printed documents. school_logo.png carries a solid dark background,
+ * so the transparent _tc variant is used when no custom logo is uploaded.
+ */
+function getPrintLogoSource() {
+  const uploaded = String(getSchoolProfile().logoDataUrl || '').trim();
+  return uploaded || absoluteAssetUrl('assets/school_logo_tc.png');
+}
+
 function getSchoolLogoHtml(size = 62) {
   const profile = getSchoolProfile();
   const logoSrc = profile.logoDataUrl || 'assets/school_logo.png';
@@ -4275,12 +4284,28 @@ function renderAdmitCardPage(container) {
       </div>
 
       ${students.length ? `
-        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; background:#0f172a; border:1px solid #334155; border-radius:8px; padding:10px 14px;">
+        <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap; margin-bottom:12px; background:#0f172a; border:1px solid #334155; border-radius:8px; padding:10px 14px;">
           <label style="display:flex; align-items:center; gap:8px; font-size:0.84rem; font-weight:700; color:#cbd5e1; cursor:pointer;">
             <input type="checkbox" id="admitCardPhotoToggle" ${window.admitCardShowPhoto !== false ? 'checked' : ''} onchange="window.admitCardShowPhoto=this.checked" style="width:18px; height:18px; cursor:pointer;">
             Print student photo box
           </label>
-          <span style="font-size:0.74rem; color:#94a3b8;">Uses the student's uploaded photo. If none, an empty box prints for pasting a passport photo.</span>
+
+          <label style="display:flex; align-items:center; gap:8px; font-size:0.84rem; font-weight:700; color:#cbd5e1;">
+            Page layout:
+            <select id="admitCardPerPage" class="session-dropdown" style="width:210px; font-weight:700;" onchange="window.admitCardPerPage=this.value; renderAdmitCardPage(document.getElementById('contentBody'))">
+              ${Object.entries(ADMIT_CARD_LAYOUTS).map(([key, L]) => `
+                <option value="${key}" ${String(window.admitCardPerPage || '2') === key ? 'selected' : ''}>${escapeHtml(L.label)}</option>
+              `).join('')}
+            </select>
+          </label>
+
+          <span style="font-size:0.74rem; color:#94a3b8;">
+            ${students.length} student(s) &rarr; <strong style="color:#34d399;">${
+              String(window.admitCardPerPage || '2') === 'a5'
+                ? `${students.length} A5 sheet(s)`
+                : `${Math.ceil(students.length / Number(window.admitCardPerPage || 2))} A4 sheet(s)`
+            }</strong> if all are printed.
+          </span>
         </div>
 
         <div class="data-table-container" style="max-height:420px; overflow-y:auto;">
@@ -4371,7 +4396,7 @@ function buildAdmitCardHtml(student, term, schedule, options = {}) {
   const sigs = SchoolData.signatures || {};
   const principalSig = school.principalSignatureDataUrl || sigs.principalSig || '';
   // Print window is about:blank — relative asset paths would not resolve there.
-  const logo = school.logoDataUrl || absoluteAssetUrl('assets/school_logo.png');
+  const logo = getPrintLogoSource();
   const showPhoto = options.showPhoto !== false;
   const photo = showPhoto ? getStudentPhotoForAdmitCard(student) : '';
 
@@ -4432,64 +4457,105 @@ function buildAdmitCardHtml(student, term, schedule, options = {}) {
         <tbody>${rowsHtml}</tbody>
       </table>
 
-      <div class="ac-rules">
-        <strong>Instructions:</strong> Reach the exam hall 15 minutes early. Bring this admit card daily. Mobile phones and unfair means are strictly prohibited. Clear all pending dues before the exam.
-      </div>
-
-      <div class="ac-sign">
-        <div class="ac-sign-box">
-          <div class="ac-sign-line"></div>
-          <span>Class Teacher</span>
+      <div class="ac-foot">
+        <div class="ac-rules">
+          <strong>Instructions:</strong> Reach the exam hall 15 minutes early. Bring this admit card daily. Mobile phones and unfair means are strictly prohibited. Clear all pending dues before the exam.
         </div>
-        <div class="ac-sign-box">
-          ${principalSig ? `<img src="${principalSig}" class="ac-sign-img" alt="">` : `<div class="ac-sign-line"></div>`}
-          <span>Principal</span>
+        <div class="ac-sign">
+          <div class="ac-sign-box">
+            <div class="ac-sign-line"></div>
+            <span>Class Teacher</span>
+          </div>
+          <div class="ac-sign-box">
+            ${principalSig ? `<img src="${principalSig}" class="ac-sign-img" alt="">` : `<div class="ac-sign-line"></div>`}
+            <span>Principal</span>
+          </div>
         </div>
       </div>
     </div>
   `;
 }
 
-function getAdmitCardPrintStyles() {
+/**
+ * Card sizes per sheet. Heights fit A4 portrait (297mm) less 8mm margins,
+ * minus the gap between cards. "a5" prints one card per physical A5 sheet.
+ */
+/**
+ * maxRows is how many date-sheet rows fit before the card would clip.
+ * 4-per-A4 was tried and dropped: a 6-subject date sheet does not fit in 67mm.
+ */
+const ADMIT_CARD_LAYOUTS = {
+  2: { page: 'A4 portrait', margin: '8mm', height: '136mm', gap: '6mm', scale: 1, maxRows: 12, label: '2 per A4 (A5 size each)' },
+  3: { page: 'A4 portrait', margin: '8mm', height: '89mm', gap: '5mm', scale: 0.84, maxRows: 7, label: '3 per A4 (saves paper)' },
+  a5: { page: 'A5 portrait', margin: '6mm', height: '196mm', gap: '0mm', scale: 1.05, maxRows: 16, label: '1 per A5 sheet' }
+};
+
+function getAdmitCardLayout(perPage) {
+  return ADMIT_CARD_LAYOUTS[perPage] || ADMIT_CARD_LAYOUTS[2];
+}
+
+function getAdmitCardPrintStyles(perPage = 2) {
+  const L = getAdmitCardLayout(perPage);
+  const s = L.scale;
+  const px = (n) => `${(n * s).toFixed(2)}px`;
+  const perSheet = perPage === 'a5' ? 1 : Number(perPage);
+
   return `
-    @page { size: A4 portrait; margin: 8mm; }
+    @page { size: ${L.page}; margin: ${L.margin}; }
     * { box-sizing: border-box; }
     body { font-family: 'Inter', Arial, sans-serif; margin:0; background:#fff; color:#0f172a;
       -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
-    .admit-card { border:2px solid #0f172a; border-radius:6px; padding:10px 12px; margin-bottom:8mm;
-      height:138mm; display:flex; flex-direction:column; page-break-inside:avoid; }
-    .admit-card:nth-child(2n) { margin-bottom:0; page-break-after:always; }
-    .ac-head { display:flex; align-items:center; gap:10px; border-bottom:2px solid #0f172a; padding-bottom:6px; }
-    .ac-logo { width:54px; height:54px; object-fit:contain; }
+    .admit-card { border:1.5px solid #0f172a; border-radius:5px; padding:${px(9)} ${px(11)};
+      margin-bottom:${L.gap}; height:${L.height}; display:flex; flex-direction:column;
+      page-break-inside:avoid; break-inside:avoid; overflow:hidden; }
+    .admit-card:nth-child(${perSheet}n) { margin-bottom:0; page-break-after:always; break-after:page; }
+    .admit-card:last-child { page-break-after:auto; break-after:auto; }
+
+    .ac-head { display:flex; align-items:center; gap:${px(10)}; border-bottom:1.5px solid #0f172a; padding-bottom:${px(5)}; }
+    /* Logo prints clean: no plate, no border, no rounding */
+    .ac-logo { width:${px(52)}; height:${px(52)}; object-fit:contain; background:none !important;
+      border:0 !important; border-radius:0 !important; padding:0 !important; box-shadow:none !important; }
     .ac-school { text-align:center; flex:1; }
-    .ac-school h1 { margin:0; font-size:15px; letter-spacing:.3px; text-transform:uppercase; }
-    .ac-school p { margin:1px 0 3px; font-size:10px; color:#475569; }
-    .ac-school h2 { margin:0; font-size:12px; background:#0f172a; color:#fff; display:inline-block;
-      padding:2px 12px; border-radius:3px; letter-spacing:.5px; }
-    .ac-body { display:flex; gap:8px; align-items:stretch; margin-top:8px; }
+    .ac-school h1 { margin:0; font-size:${px(15)}; letter-spacing:.3px; text-transform:uppercase; line-height:1.15; }
+    .ac-school p { margin:1px 0 ${px(3)}; font-size:${px(9.5)}; color:#475569; }
+    .ac-school h2 { margin:0; font-size:${px(11.5)}; background:#0f172a; color:#fff; display:inline-block;
+      padding:${px(2)} ${px(11)}; border-radius:3px; letter-spacing:.5px; }
+
+    .ac-body { display:flex; gap:${px(8)}; align-items:stretch; margin-top:${px(7)}; }
     .ac-info { flex:1; border-collapse:collapse; }
-    .ac-photo { width:28mm; border:1px solid #94a3b8; border-radius:3px; display:flex;
+    .ac-info td { border:1px solid #cbd5e1; padding:${px(3.5)} ${px(7)}; width:50%; }
+    .ac-info span { display:block; font-size:${px(8)}; text-transform:uppercase; color:#64748b; letter-spacing:.4px; }
+    .ac-info strong { font-size:${px(11)}; }
+    .ac-photo { width:${(26 * s).toFixed(1)}mm; border:1px solid #94a3b8; border-radius:3px; display:flex;
       align-items:center; justify-content:center; overflow:hidden; background:#f8fafc; }
     .ac-photo img { width:100%; height:100%; object-fit:cover; }
-    .ac-photo span { font-size:8px; color:#64748b; text-align:center; line-height:1.4; letter-spacing:.3px; }
-    .ac-info td { border:1px solid #cbd5e1; padding:4px 8px; width:50%; font-size:11px; }
-    .ac-info span { display:block; font-size:8.5px; text-transform:uppercase; color:#64748b; letter-spacing:.4px; }
-    .ac-info strong { font-size:11.5px; }
-    .ac-section-title { margin:8px 0 4px; font-size:10.5px; font-weight:800; text-transform:uppercase;
-      letter-spacing:.6px; border-left:4px solid #0f172a; padding-left:6px; }
+    .ac-photo span { font-size:${px(7.5)}; color:#64748b; text-align:center; line-height:1.4; letter-spacing:.3px; }
+
+    .ac-section-title { margin:${px(7)} 0 ${px(3)}; font-size:${px(10)}; font-weight:800; text-transform:uppercase;
+      letter-spacing:.6px; border-left:3px solid #0f172a; padding-left:${px(6)}; }
     .ac-sched { width:100%; border-collapse:collapse; }
-    .ac-sched th { background:#e2e8f0; border:1px solid #94a3b8; padding:3px 5px; font-size:9.5px; text-transform:uppercase; }
-    .ac-sched td { border:1px solid #cbd5e1; padding:3px 5px; font-size:10.5px; }
-    .ac-rules { margin-top:auto; padding-top:6px; font-size:8.6px; color:#334155; line-height:1.45; }
-    .ac-sign { display:flex; justify-content:space-between; margin-top:8px; }
-    .ac-sign-box { width:42%; text-align:center; }
-    .ac-sign-line { height:22px; border-bottom:1px solid #0f172a; }
-    .ac-sign-img { height:26px; object-fit:contain; display:block; margin:0 auto; }
-    .ac-sign-box span { font-size:9px; font-weight:700; display:block; margin-top:2px; }
+    .ac-sched th { background:#e2e8f0; border:1px solid #94a3b8; padding:${px(2.5)} ${px(4)}; font-size:${px(9)}; text-transform:uppercase; }
+    .ac-sched td { border:1px solid #cbd5e1; padding:${px(2.5)} ${px(4)}; font-size:${px(10)}; }
+
+    /* Instructions and signatures share one row so signatures never clip on dense layouts */
+    .ac-foot { margin-top:auto; padding-top:${px(5)}; display:flex; gap:${px(10)}; align-items:flex-end; }
+    .ac-rules { flex:1; font-size:${px(8)}; color:#334155; line-height:1.35; }
+    .ac-sign { display:flex; gap:${px(10)}; flex:0 0 auto; }
+    .ac-sign-box { width:${px(86)}; text-align:center; }
+    .ac-sign-line { height:${px(17)}; border-bottom:1px solid #0f172a; }
+    .ac-sign-img { height:${px(19)}; object-fit:contain; display:block; margin:0 auto; }
+    .ac-sign-box span { font-size:${px(8)}; font-weight:700; display:block; margin-top:1px; }
   `;
 }
 
-function openAdmitCardPrintWindow(cardsHtml, title) {
+function getAdmitCardsPerPage() {
+  const sel = document.getElementById('admitCardPerPage');
+  const value = sel ? sel.value : (window.admitCardPerPage || '2');
+  window.admitCardPerPage = value;
+  return value === 'a5' ? 'a5' : Number(value);
+}
+
+function openAdmitCardPrintWindow(cardsHtml, title, perPage = 2) {
   const printWindow = window.open('', '_blank', 'width=900,height=1200');
   if (!printWindow) {
     showNotification('Popup blocked. Allow popups for this site to print admit cards.', 'warning');
@@ -4501,7 +4567,7 @@ function openAdmitCardPrintWindow(cardsHtml, title) {
       <head>
         <title>${title}</title>
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
-        <style>${getAdmitCardPrintStyles()}</style>
+        <style>${getAdmitCardPrintStyles(perPage)}</style>
       </head>
       <body>
         ${cardsHtml}
@@ -4531,12 +4597,13 @@ function printSingleAdmitCard(admissionNo) {
   }
   const schedule = getExamScheduleForClass(term, student.currentClass || student.class, student.currentSection || 'ALL');
   const html = buildAdmitCardHtml(student, term, schedule, { showPhoto: admitCardPhotoEnabled() });
-  openAdmitCardPrintWindow(html, `Admit Card - ${student.name}`);
+  openAdmitCardPrintWindow(html, `Admit Card - ${student.name}`, getAdmitCardsPerPage());
 }
 
 function printSelectedAdmitCards() {
   const term = window.admitCardTerm || 'UT1';
   const showPhoto = admitCardPhotoEnabled();
+  const perPage = getAdmitCardsPerPage();
   const picked = Array.from(document.querySelectorAll('.admit-card-chk'))
     .filter(box => box.checked)
     .map(box => box.getAttribute('data-adm'));
@@ -4554,8 +4621,15 @@ function printSelectedAdmitCards() {
     return buildAdmitCardHtml(student, term, schedule, { showPhoto });
   }).filter(Boolean).join('');
 
-  openAdmitCardPrintWindow(cards, `Admit Cards - ${term} - ${window.admitCardClass || ''}`);
-  showNotification(`Prepared ${picked.length} admit card(s) for printing.`, 'success');
+  openAdmitCardPrintWindow(cards, `Admit Cards - ${term} - ${window.admitCardClass || ''}`, perPage);
+  const sheets = perPage === 'a5' ? picked.length : Math.ceil(picked.length / Number(perPage));
+  showNotification(`Prepared ${picked.length} admit card(s) on ${sheets} sheet(s).`, 'success');
+
+  const papers = getExamScheduleForClass(term, window.admitCardClass, window.admitCardSection || 'ALL').length;
+  const maxRows = getAdmitCardLayout(perPage).maxRows;
+  if (papers > maxRows) {
+    showNotification(`${papers} papers may not fit at this size — switch to "2 per A4" or "1 per A5" if the table looks cut.`, 'warning');
+  }
 }
 
 function currentSessionSafe() {

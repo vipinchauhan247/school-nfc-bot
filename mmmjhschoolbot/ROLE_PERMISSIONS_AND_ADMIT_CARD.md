@@ -63,6 +63,22 @@ Each card prints: school name/logo/address, ADMIT CARD + term + session, student
 
 **Roll No** — editable directly in the student list on the Admit Card page. Changes save against the active session immediately. **Auto-number Roll (A–Z)** fills 1…n in the displayed alphabetical order.
 
+### Page layout (paper saving)
+
+| Option | Paper | Fits up to |
+|---|---|---|
+| 2 per A4 (A5 size each) — default | A4 | 12 papers |
+| 3 per A4 (saves paper) | A4 | 7 papers |
+| 1 per A5 sheet | A5 | 16 papers |
+
+The header line shows how many sheets the current class will use. If the date sheet has more papers than the layout fits, a warning appears after printing suggesting a roomier layout.
+
+4-per-A4 was tried and removed — a normal 6-subject date sheet gets cut off at that size.
+
+### Logo
+
+Printed documents use `assets/school_logo_tc.png`, which has a transparent background, instead of `assets/school_logo.png`, which has a solid dark square baked into the image. The logo prints with no plate, border or rounding. Uploading a logo under **School Profile** overrides it.
+
 A class with no rows for that term prints "Date sheet not published yet" and the page links back to Exam Schedule.
 
 Permissions: `exam_schedule_manage` and `admit_card_print` (Exams tab). Teachers get view/print by default; only admins can edit the date sheet.
