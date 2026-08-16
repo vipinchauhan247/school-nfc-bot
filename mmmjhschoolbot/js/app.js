@@ -3733,16 +3733,16 @@ function renderUsersPage(container) {
                   </td>
 
                   <!-- TELEGRAM CHAT ID (staff self-link via bot, or admin paste) -->
-                  <td style="text-align:left; padding:12px; min-width:160px;">
-                    ${u.telegramChatId
-                      ? `<code style="color:#34d399; font-weight:700;">${escapeHtml(String(u.telegramChatId))}</code>
-                         <div style="font-size:0.72rem; color:#94a3b8; margin-top:4px;">${escapeHtml(u.telegramUserName || 'Linked')}</div>`
-                      : `<span style="color:#fbbf24; font-size:0.8rem;">Not linked</span>`}
-                    <div style="margin-top:6px; display:flex; gap:4px; flex-wrap:wrap;">
-                      <button type="button" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem;" onclick="editStaffTelegramChatId('${u.id}')">Set Chat ID</button>
-                      ${u.telegramChatId ? `<button type="button" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem; color:#f87171;" onclick="clearStaffTelegramChatId('${u.id}')">Clear</button>` : ''}
+                  <td style="text-align:left; padding:12px; min-width:200px;">
+                    <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+                      <input type="text" id="staffTgChat_${u.id}" class="session-dropdown" value="${escapeHtml(String(u.telegramChatId || ''))}" placeholder="Paste Chat ID" style="width:130px; padding:4px 8px; font-size:0.78rem; font-weight:700;">
+                      <button type="button" class="btn btn-primary" style="padding:3px 8px; font-size:0.7rem;" onclick="saveStaffTelegramChatIdFromInput('${u.id}')">Save</button>
+                      ${u.telegramChatId ? `<button type="button" class="btn btn-secondary" style="padding:3px 8px; font-size:0.7rem; color:#f87171;" onclick="clearStaffTelegramChatId('${u.id}')">Clear</button>` : ''}
                     </div>
-                    <div style="font-size:0.68rem; color:#64748b; margin-top:4px;">Self-link: /stafflink ${escapeHtml(u.username || '')} &lt;password&gt;</div>
+                    <div style="font-size:0.72rem; margin-top:4px; color:${u.telegramChatId ? '#34d399' : '#fbbf24'};">
+                      ${u.telegramChatId ? `Linked${u.telegramUserName ? ' · ' + escapeHtml(u.telegramUserName) : ''}` : 'Not linked — admin can paste here'}
+                    </div>
+                    <div style="font-size:0.68rem; color:#64748b; margin-top:2px;">Or teacher: /stafflink ${escapeHtml(u.username || '')} &lt;password&gt;</div>
                   </td>
 
                   <!-- TEACHER SUBJECT MAPPINGS SINGLE SOURCE OF TRUTH -->
@@ -4645,21 +4645,15 @@ function repairMissingTeacherStaffAccounts() {
   return false;
 }
 
-function editStaffTelegramChatId(userId) {
+function saveStaffTelegramChatIdFromInput(userId) {
   const u = (SchoolData.staffUsers || []).find((x) => x.id === userId);
   if (!u) return;
-  const current = String(u.telegramChatId || '').trim();
-  const next = window.prompt(
-    `Paste Telegram Chat ID for ${u.name} (@${u.username || ''}).\n\nPrefer self-link: teacher opens @mmmjhschoolbot and sends\n/stafflink ${u.username || 'username'} <password>`,
-    current
-  );
-  if (next === null) return;
-  const clean = String(next).trim();
+  const input = document.getElementById(`staffTgChat_${userId}`);
+  const clean = String(input?.value || '').trim();
   if (clean && !/^-?\d{7,15}$/.test(clean)) {
     showNotification('Chat ID must be a numeric Telegram ID (7–15 digits).', 'error');
     return;
   }
-  // One chat → one staff user
   if (clean) {
     (SchoolData.staffUsers || []).forEach((other) => {
       if (other.id !== u.id && String(other.telegramChatId || '').trim() === clean) {
@@ -4672,12 +4666,15 @@ function editStaffTelegramChatId(userId) {
   if (!clean) u.telegramUserName = '';
   saveSchoolDataToStorage();
   showNotification(
-    clean
-      ? `Telegram Chat ID saved for ${u.name}.`
-      : `Telegram Chat ID cleared for ${u.name}.`,
+    clean ? `Telegram Chat ID saved for ${u.name} in ERP.` : `Telegram Chat ID cleared for ${u.name}.`,
     'success'
   );
   renderUsersPage(document.getElementById('contentBody'));
+}
+
+function editStaffTelegramChatId(userId) {
+  // Kept for older buttons; prefer inline Save in User Management.
+  saveStaffTelegramChatIdFromInput(userId);
 }
 
 function clearStaffTelegramChatId(userId) {
@@ -4686,6 +4683,8 @@ function clearStaffTelegramChatId(userId) {
   if (!window.confirm(`Clear Telegram Chat ID for ${u.name}?`)) return;
   u.telegramChatId = '';
   u.telegramUserName = '';
+  const input = document.getElementById(`staffTgChat_${userId}`);
+  if (input) input.value = '';
   saveSchoolDataToStorage();
   showNotification(`Telegram unlinked for ${u.name}.`, 'info');
   renderUsersPage(document.getElementById('contentBody'));
