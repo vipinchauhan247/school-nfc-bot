@@ -4794,6 +4794,63 @@ function canRevealStaffPasswords() {
   return role === 'Super Admin' || role === 'Principal';
 }
 
+/** Office-only reveal cache (this browser). Cloud keeps hashed login only — cannot recover old passwords. */
+const ADMIN_STAFF_PASS_VAULT_KEY = 'MMM_ERP_admin_staff_pass_vault_v1';
+
+function readAdminStaffPasswordVault() {
+  try {
+    return JSON.parse(localStorage.getItem(ADMIN_STAFF_PASS_VAULT_KEY) || '{}') || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function writeAdminStaffPasswordVault(vault) {
+  try {
+    localStorage.setItem(ADMIN_STAFF_PASS_VAULT_KEY, JSON.stringify(vault || {}));
+  } catch (e) {}
+}
+
+function rememberStaffPasswordForAdmin(user, password) {
+  if (!canRevealStaffPasswords()) return;
+  const pass = String(password || '').trim();
+  if (!pass || !user) return;
+  const vault = readAdminStaffPasswordVault();
+  const entry = {
+    password: pass,
+    userId: String(user.id || ''),
+    username: String(user.username || ''),
+    name: String(user.name || ''),
+    savedAt: new Date().toISOString()
+  };
+  const userKey = String(user.username || '').trim().toLowerCase();
+  const idKey = String(user.id || '').trim().toLowerCase();
+  if (userKey) vault[userKey] = entry;
+  if (idKey) vault[idKey] = entry;
+  writeAdminStaffPasswordVault(vault);
+  // Keep in-memory too so Show works before next render/pull
+  user.password = pass;
+}
+
+function forgetStaffPasswordForAdmin(user) {
+  const vault = readAdminStaffPasswordVault();
+  const userKey = String(user?.username || '').trim().toLowerCase();
+  const idKey = String(user?.id || '').trim().toLowerCase();
+  if (userKey) delete vault[userKey];
+  if (idKey) delete vault[idKey];
+  writeAdminStaffPasswordVault(vault);
+}
+
+function getStaffPasswordForAdminReveal(user) {
+  if (!user) return '';
+  const live = String(user.password || '').trim();
+  if (live) return live;
+  const vault = readAdminStaffPasswordVault();
+  const byUser = vault[String(user.username || '').trim().toLowerCase()];
+  const byId = vault[String(user.id || '').trim().toLowerCase()];
+  return String((byUser || byId)?.password || '').trim();
+}
+
 function toggleStaffPasswordVisible(userId) {
   if (!canRevealStaffPasswords()) {
     showNotification('Only Super Admin / Principal can reveal staff passwords.', 'warning');
@@ -4801,18 +4858,30 @@ function toggleStaffPasswordVisible(userId) {
   }
   const user = (SchoolData.staffUsers || []).find(u => u.id === userId);
   const el = document.getElementById(`staffPassText_${userId}`);
-  const btn = el?.parentElement?.querySelector('button');
+  const row = el?.closest('td');
+  const btn = row?.querySelector('button[data-pass-toggle="1"]') || row?.querySelector('button');
   if (!user || !el) return;
   const showing = el.getAttribute('data-showing') === '1';
   if (showing) {
     el.textContent = '••••••••';
     el.setAttribute('data-showing', '0');
     if (btn) btn.textContent = 'Show';
-  } else {
-    el.textContent = user.password || '(hidden in cloud — login still works; Reset Pass to set/share a new one)';
-    el.setAttribute('data-showing', '1');
-    if (btn) btn.textContent = 'Hide';
+    return;
   }
+
+  const password = getStaffPasswordForAdminReveal(user);
+  if (!password) {
+    const resetNow = window.confirm(
+      `Password for ${user.name} is secure in cloud (hashed) — the old one cannot be shown.\n\n` +
+      `Click OK to Reset Pass now and show a new password you can copy/share.`
+    );
+    if (resetNow) resetStaffPassword(userId);
+    return;
+  }
+
+  el.textContent = password;
+  el.setAttribute('data-showing', '1');
+  if (btn) btn.textContent = 'Hide';
 }
 
 function copyStaffLoginCredentials(userId) {
@@ -4822,11 +4891,17 @@ function copyStaffLoginCredentials(userId) {
   }
   const user = (SchoolData.staffUsers || []).find(u => u.id === userId);
   if (!user) return;
-  if (!user.password) {
-    showNotification('No password set. Click Reset Pass first, then share the new password.', 'warning');
+  const password = getStaffPasswordForAdminReveal(user);
+  if (!password) {
+    const resetNow = window.confirm(
+      `No viewable password for ${user.name} on this PC.\n\n` +
+      `Cloud login still works, but Show/Copy need a password set on this browser.\n\n` +
+      `OK = Reset Pass and then copy.`
+    );
+    if (resetNow) resetStaffPassword(userId);
     return;
   }
-  const text = `MMM JHS ERP login\nWebsite: https://www.mmmjhschool.com\nUsername: ${user.username || ''}\nPassword: ${user.password}`;
+  const text = `MMM JHS ERP login\nWebsite: https://www.mmmjhschool.com\nUsername: ${user.username || ''}\nPassword: ${password}`;
   const done = () => showNotification(`Copied login for ${user.name}. Share privately (WhatsApp/SMS).`, 'success');
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(done).catch(() => {
@@ -4860,20 +4935,28 @@ function resetStaffPassword(userId) {
             newPassword: password
           }
         });
-        u.password = password;
+        rememberStaffPasswordForAdmin(u, password);
         saveSchoolDataToStorage({ skipCloudPush: true });
         if (typeof pushSchoolDataToCloud === 'function') {
           pushSchoolDataToCloud({ skipMergePull: true }).catch((err) => console.warn('Password snapshot mirror:', err));
         }
         renderUsersPage(document.getElementById('contentBody'));
+        // Auto-show the new password in the table
+        setTimeout(() => {
+          const el = document.getElementById(`staffPassText_${u.id}`);
+          if (el) {
+            el.textContent = password;
+            el.setAttribute('data-showing', '1');
+          }
+        }, 50);
         window.alert(
           `Password updated for ${u.name}\n\n` +
           `Username: ${u.username}\n` +
           `Password: ${password}\n\n` +
-          `This password now works for ERP login.\n` +
-          `After refresh, Show may say "not set" (passwords are hidden in cloud for security) — login still works.`
+          `This works for ERP login.\n` +
+          `Show/Copy will keep working on this office PC after refresh.`
         );
-        showNotification(`Password reset for ${u.name} and saved to secure login.`, 'success');
+        showNotification(`Password reset for ${u.name}. It is now visible via Show on this PC.`, 'success');
       } catch (error) {
         showNotification(error.message || 'Could not save password to secure login.', 'error');
       }
