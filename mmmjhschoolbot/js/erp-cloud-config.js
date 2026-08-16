@@ -12,12 +12,14 @@ window.ERP_CLOUD_NATIVE = true; // prefer native student links when API provides
 window.ERP_CLOUD_ONLY = true;
 
 /**
- * Where the ERP API lives. Change this one line to move hosts — login, cloud
- * sync, TC and the bot proxy all follow it.
- *
- *   Render (current):  'https://mmmjhschoolbot.onrender.com/api/mmmjhs-bot'
- *   Vercel same-site:  '/api/mmmjhs-bot'   ← after copying the api/ folder to Vercel
- *
- * Leave unset to keep the built-in Render URL.
+ * Cloud sync API host. On the live school website we use the Vercel serverless
+ * copy in /api/ so polling never hits Render bandwidth.
+ * Telegram webhook stays on Render; only browser ERP traffic uses this path.
  */
-// window.MMMJHS_BOT_API_URL = '/api/mmmjhs-bot';
+(function () {
+  if (window.MMMJHS_BOT_API_URL) return;
+  const host = String(window.location.hostname || '').replace(/^www\./, '').toLowerCase();
+  if (host === 'mmmjhschool.com' || host.endsWith('.vercel.app')) {
+    window.MMMJHS_BOT_API_URL = '/api/mmmjhs-bot';
+  }
+})();

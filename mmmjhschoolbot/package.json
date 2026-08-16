@@ -1,6 +1,6 @@
 {
   "name": "mmm-school-erp",
-  "version": "1.0.0",
+  "version": "1.0.1-bandwidth-fix",
   "private": true,
   "description": "MMM Junior High School ERP with 24/7 @mmmjhschoolbot backend",
   "scripts": {

@@ -1019,15 +1019,14 @@
       pullSchoolDataFromCloud({ silent: true }).catch(() => {});
     }, CLOUD_POLL_MS);
 
-    // Tab back in front: check once immediately so the office never waits.
+    // Tab back in front: quick timestamp check only (never a blind full pull).
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState !== 'visible') return;
       if (window._erpCloudMemoryDirty) return;
+      if (!versionProbeSupported) return;
       cloudSnapshotChanged()
         .then((changed) => {
-          if (changed || !versionProbeSupported) {
-            pullSchoolDataFromCloud({ silent: true }).catch(() => {});
-          }
+          if (changed) pullSchoolDataFromCloud({ silent: true }).catch(() => {});
         })
         .catch(() => {});
     });

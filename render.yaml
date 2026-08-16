@@ -1,0 +1,10 @@
+# Render reads this from the repo root. Root Directory must be mmmjhschoolbot.
+services:
+  - type: web
+    name: mmm-school-erp
+    runtime: node
+    rootDir: mmmjhschoolbot
+    buildCommand: ""
+    startCommand: npm start
+    plan: free
+    autoDeploy: true

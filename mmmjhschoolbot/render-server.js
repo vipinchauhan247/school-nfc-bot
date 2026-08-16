@@ -151,6 +151,8 @@ const server = http.createServer(async (req, res) => {
   serveStatic(req, res, parsedUrl.pathname);
 });
 
+const BUILD_VERSION = '20260816-bandwidth-fix';
+
 server.listen(PORT, () => {
-  console.log(`MMM School ERP Render server running on port ${PORT}`);
+  console.log(`MMM School ERP Render server v${BUILD_VERSION} running on port ${PORT}`);
 });

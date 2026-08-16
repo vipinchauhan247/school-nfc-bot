@@ -1,0 +1,18 @@
+{
+  "functions": {
+    "api/mmmjhs-bot.js": {
+      "maxDuration": 60
+    },
+    "api/erp-cloud.js": {
+      "maxDuration": 60
+    }
+  },
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-store" }
+      ]
+    }
+  ]
+}
