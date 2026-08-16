@@ -3967,6 +3967,9 @@ function renderExamSchedulePage(container) {
     .map((row, idx) => ({ row, idx }))
     .filter(({ row }) => filterClass === 'ALL' || String(row.className || '').trim() === filterClass)
     .filter(({ row }) => filterTerm === 'ALL' || String(row.term || '').trim() === filterTerm);
+  // A class/term picked above already applies to every row — no need to repeat it per row.
+  const lockClass = filterClass !== 'ALL';
+  const lockTerm = filterTerm !== 'ALL';
 
   container.innerHTML = `
     <div class="page-header">
@@ -4000,16 +4003,22 @@ function renderExamSchedulePage(container) {
           ${terms.map(t => `<option value="${escapeHtml(t)}" ${filterTerm === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}
         </select>
         <span class="badge badge-info">${rows.length} row(s)</span>
+        ${lockClass || lockTerm ? `
+          <span style="font-size:0.76rem; color:#94a3b8;">
+            New rows are added as <strong style="color:#38bdf8;">${escapeHtml(lockClass ? filterClass : 'selected class')}${lockTerm ? ` · ${escapeHtml(filterTerm)}` : ''}</strong>,
+            so the Class${lockTerm ? ' / Term' : ''} column is hidden. Choose “All” above to edit it per row.
+          </span>
+        ` : ''}
       </div>
 
       <div class="data-table-container" style="overflow-x:auto;">
-        <table class="data-table" style="min-width:980px;">
+        <table class="data-table" style="min-width:${lockClass && lockTerm ? '760px' : '980px'};">
           <thead>
             <tr>
-              <th>Exam Term</th>
-              <th>Class</th>
+              ${lockTerm ? '' : '<th>Exam Term</th>'}
+              ${lockClass ? '' : '<th>Class</th>'}
               <th>Section</th>
-              <th>Subject</th>
+              <th style="min-width:180px;">Subject</th>
               <th>Exam Date</th>
               <th>Start Time</th>
               <th>End Time</th>
@@ -4020,30 +4029,32 @@ function renderExamSchedulePage(container) {
           <tbody>
             ${rows.length ? rows.map(({ row, idx }) => `
               <tr>
+                ${lockTerm ? `<input type="hidden" class="exam-schedule-input" data-index="${idx}" data-field="term" value="${escapeHtml(row.term || '')}">` : `
                 <td>
                   <input list="examTermPresets" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="term" value="${escapeHtml(row.term || '')}" placeholder="UT1 / Half-Yearly">
-                </td>
+                </td>`}
+                ${lockClass ? `<input type="hidden" class="exam-schedule-input" data-index="${idx}" data-field="className" value="${escapeHtml(row.className || '')}">` : `
                 <td>
-                  <select class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="className">
+                  <select class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="className" style="min-width:130px;">
                     ${getClassSelectOptionsHtml(row.className || '')}
                   </select>
-                </td>
+                </td>`}
                 <td>
-                  <select class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="section">
+                  <select class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="section" style="min-width:120px;">
                     ${['ALL', 'A', 'B', 'C', 'D'].map(sec => `<option value="${sec}" ${String(row.section || 'ALL').toUpperCase() === sec ? 'selected' : ''}>${sec === 'ALL' ? 'All Sections' : `Section ${sec}`}</option>`).join('')}
                   </select>
                 </td>
                 <td>
-                  <input list="examSubjectPresets" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="subject" value="${escapeHtml(row.subject || '')}" placeholder="Subject">
+                  <input list="examSubjectPresets" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="subject" value="${escapeHtml(row.subject || '')}" placeholder="Subject" style="min-width:170px;">
                 </td>
                 <td><input type="date" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="date" value="${escapeHtml(row.date || '')}"></td>
                 <td><input type="time" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="startTime" value="${escapeHtml(row.startTime || '')}"></td>
                 <td><input type="time" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="endTime" value="${escapeHtml(row.endTime || '')}"></td>
-                <td><input type="number" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="maxMarks" value="${escapeHtml(row.maxMarks || '')}" placeholder="30"></td>
+                <td><input type="number" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="maxMarks" value="${escapeHtml(row.maxMarks || '')}" placeholder="30" style="min-width:80px;"></td>
                 <td><button class="btn btn-danger" style="padding:6px 10px; font-size:0.78rem;" onclick="deleteExamScheduleRow(${idx})"><i class="fa-solid fa-trash"></i> Delete</button></td>
               </tr>
             `).join('') : `
-              <tr><td colspan="9" style="text-align:center; padding:30px; color:var(--text-muted);">No exam rows for this filter. Click Add Exam Row.</td></tr>
+              <tr><td colspan="9" style="text-align:center; padding:30px; color:var(--text-muted);">No exam rows for ${lockClass ? escapeHtml(filterClass) : 'this filter'}${lockTerm ? ` (${escapeHtml(filterTerm)})` : ''}. Click <strong>Add Exam Row</strong>.</td></tr>
             `}
           </tbody>
         </table>
@@ -4264,25 +4275,52 @@ function renderAdmitCardPage(container) {
       </div>
 
       ${students.length ? `
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; background:#0f172a; border:1px solid #334155; border-radius:8px; padding:10px 14px;">
+          <label style="display:flex; align-items:center; gap:8px; font-size:0.84rem; font-weight:700; color:#cbd5e1; cursor:pointer;">
+            <input type="checkbox" id="admitCardPhotoToggle" ${window.admitCardShowPhoto !== false ? 'checked' : ''} onchange="window.admitCardShowPhoto=this.checked" style="width:18px; height:18px; cursor:pointer;">
+            Print student photo box
+          </label>
+          <span style="font-size:0.74rem; color:#94a3b8;">Uses the student's uploaded photo. If none, an empty box prints for pasting a passport photo.</span>
+        </div>
+
         <div class="data-table-container" style="max-height:420px; overflow-y:auto;">
           <table class="data-table">
             <thead>
-              <tr><th style="width:60px;">Print</th><th>Student</th><th>Father's Name</th><th>Admission No</th><th>Roll No</th><th>Class & Sec</th><th>Action</th></tr>
+              <tr><th style="width:60px;">Print</th><th style="width:64px;">Photo</th><th>Student</th><th>Father's Name</th><th>Admission No</th><th style="width:110px;">Roll No</th><th>Class & Sec</th><th>Action</th></tr>
             </thead>
             <tbody>
-              ${students.map(s => `
+              ${students.map(s => {
+                const adm = escapeHtml(String(s.admissionNo || ''));
+                const photo = getStudentPhotoForAdmitCard(s);
+                return `
                 <tr>
-                  <td><input type="checkbox" class="admit-card-chk" data-adm="${escapeHtml(String(s.admissionNo || ''))}" checked style="width:18px; height:18px; cursor:pointer;"></td>
+                  <td><input type="checkbox" class="admit-card-chk" data-adm="${adm}" checked style="width:18px; height:18px; cursor:pointer;"></td>
+                  <td>
+                    ${photo
+                      ? `<img src="${photo}" style="width:38px; height:44px; object-fit:cover; border-radius:4px; border:1px solid #334155;">`
+                      : `<span title="No photo uploaded" style="display:inline-flex; align-items:center; justify-content:center; width:38px; height:44px; border:1px dashed #f59e0b; border-radius:4px; color:#f59e0b; font-size:0.65rem;">none</span>`}
+                  </td>
                   <td><strong style="color:#38bdf8;">${escapeHtml(s.name || '')}</strong></td>
                   <td>${escapeHtml(s.parentName || '')}</td>
-                  <td><code>${escapeHtml(String(s.admissionNo || ''))}</code></td>
-                  <td>${escapeHtml(String(s.currentRollNo || s.rollNo || '—'))}</td>
+                  <td><code>${adm}</code></td>
+                  <td>
+                    <input type="text" class="session-dropdown admit-roll-input" data-adm="${adm}"
+                      value="${escapeHtml(String(s.currentRollNo || s.rollNo || ''))}" placeholder="Roll"
+                      style="width:80px; padding:4px 8px; font-weight:700; text-align:center;"
+                      onchange="saveAdmitCardRollNo('${adm}', this.value)">
+                  </td>
                   <td><span class="badge badge-purple">${escapeHtml(s.currentClass || '')} - ${escapeHtml(s.currentSection || '')}</span></td>
-                  <td><button class="btn btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="printSingleAdmitCard('${escapeHtml(String(s.admissionNo || ''))}')"><i class="fa-solid fa-print"></i> Print</button></td>
+                  <td><button class="btn btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="printSingleAdmitCard('${adm}')"><i class="fa-solid fa-print"></i> Print</button></td>
                 </tr>
-              `).join('')}
+              `;
+              }).join('')}
             </tbody>
           </table>
+        </div>
+
+        <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:14px; flex-wrap:wrap;">
+          <button class="btn btn-secondary" onclick="autoAssignAdmitCardRollNumbers()"><i class="fa-solid fa-list-ol"></i> Auto-number Roll (A–Z)</button>
+          <button class="btn btn-primary" style="background:linear-gradient(135deg, #ec4899 0%, #be185d 100%); border:none;" onclick="printSelectedAdmitCards()"><i class="fa-solid fa-print"></i> Print Selected Admit Cards</button>
         </div>
       ` : `<p style="color:var(--text-muted); margin:0;">No students found in ${escapeHtml(className)}${section === 'ALL' ? '' : ` Section ${escapeHtml(section)}`} for this session.</p>`}
     </div>
@@ -4293,13 +4331,49 @@ function toggleAllAdmitCardStudents(checked) {
   document.querySelectorAll('.admit-card-chk').forEach(box => { box.checked = !!checked; });
 }
 
-function buildAdmitCardHtml(student, term, schedule) {
+/** Only a real uploaded photo — mock/stock URLs would print a stranger's face on a card. */
+function getStudentPhotoForAdmitCard(student) {
+  const photo = String(student?.photo || student?.photoDataUrl || '').trim();
+  if (!photo) return '';
+  if (photo.startsWith('data:image')) return photo;
+  if (/unsplash|placeholder|dicebear|gravatar/i.test(photo)) return '';
+  return photo;
+}
+
+/** Roll numbers are edited on this page and stored against the active session. */
+function saveAdmitCardRollNo(admissionNo, value) {
+  const session = SchoolData.activeSession || '2026-27';
+  const student = (SchoolData.students || []).find(s => String(s.admissionNo) === String(admissionNo));
+  if (!student) return;
+  const roll = String(value || '').trim();
+  student.currentRollNo = roll;
+  student.rollNo = roll;
+  if (!student.sessionDetails) student.sessionDetails = {};
+  if (!student.sessionDetails[session]) student.sessionDetails[session] = {};
+  student.sessionDetails[session].rollNo = roll;
+  saveSchoolDataToStorage();
+}
+
+function autoAssignAdmitCardRollNumbers() {
+  const inputs = Array.from(document.querySelectorAll('.admit-roll-input'));
+  if (!inputs.length) return;
+  if (!window.confirm(`Assign roll numbers 1–${inputs.length} in the current (A–Z) order? Existing roll numbers will be replaced.`)) return;
+  inputs.forEach((input, i) => {
+    input.value = String(i + 1);
+    saveAdmitCardRollNo(input.getAttribute('data-adm'), String(i + 1));
+  });
+  showNotification(`Roll numbers 1–${inputs.length} assigned.`, 'success');
+}
+
+function buildAdmitCardHtml(student, term, schedule, options = {}) {
   const school = getSchoolProfile();
   const session = SchoolData.activeSession || '';
   const sigs = SchoolData.signatures || {};
   const principalSig = school.principalSignatureDataUrl || sigs.principalSig || '';
   // Print window is about:blank — relative asset paths would not resolve there.
   const logo = school.logoDataUrl || absoluteAssetUrl('assets/school_logo.png');
+  const showPhoto = options.showPhoto !== false;
+  const photo = showPhoto ? getStudentPhotoForAdmitCard(student) : '';
 
   const rowsHtml = schedule.length
     ? schedule.map((r, i) => {
@@ -4328,20 +4402,27 @@ function buildAdmitCardHtml(student, term, schedule) {
         </div>
       </div>
 
-      <table class="ac-info">
-        <tr>
-          <td><span>Student Name</span><strong>${escapeHtml(student.name || '')}</strong></td>
-          <td><span>Admission No</span><strong>${escapeHtml(String(student.admissionNo || ''))}</strong></td>
-        </tr>
-        <tr>
-          <td><span>Father's Name</span><strong>${escapeHtml(student.parentName || '')}</strong></td>
-          <td><span>Roll No</span><strong>${escapeHtml(String(student.currentRollNo || student.rollNo || '—'))}</strong></td>
-        </tr>
-        <tr>
-          <td><span>Class &amp; Section</span><strong>${escapeHtml(student.currentClass || '')} - ${escapeHtml(student.currentSection || '')}</strong></td>
-          <td><span>Date of Birth</span><strong>${escapeHtml(typeof formatDobToDDMMYYYY === 'function' ? formatDobToDDMMYYYY(student.dob) : (student.dob || '—'))}</strong></td>
-        </tr>
-      </table>
+      <div class="ac-body">
+        <table class="ac-info">
+          <tr>
+            <td><span>Student Name</span><strong>${escapeHtml(student.name || '')}</strong></td>
+            <td><span>Admission No</span><strong>${escapeHtml(String(student.admissionNo || ''))}</strong></td>
+          </tr>
+          <tr>
+            <td><span>Father's Name</span><strong>${escapeHtml(student.parentName || '')}</strong></td>
+            <td><span>Roll No</span><strong>${escapeHtml(String(student.currentRollNo || student.rollNo || '—'))}</strong></td>
+          </tr>
+          <tr>
+            <td><span>Class &amp; Section</span><strong>${escapeHtml(student.currentClass || '')} - ${escapeHtml(student.currentSection || '')}</strong></td>
+            <td><span>Date of Birth</span><strong>${escapeHtml(typeof formatDobToDDMMYYYY === 'function' ? formatDobToDDMMYYYY(student.dob) : (student.dob || '—'))}</strong></td>
+          </tr>
+        </table>
+        ${showPhoto ? `
+          <div class="ac-photo">
+            ${photo ? `<img src="${photo}" alt="">` : `<span>Affix<br>Photo</span>`}
+          </div>
+        ` : ''}
+      </div>
 
       <div class="ac-section-title">Examination Date Sheet</div>
       <table class="ac-sched">
@@ -4385,7 +4466,12 @@ function getAdmitCardPrintStyles() {
     .ac-school p { margin:1px 0 3px; font-size:10px; color:#475569; }
     .ac-school h2 { margin:0; font-size:12px; background:#0f172a; color:#fff; display:inline-block;
       padding:2px 12px; border-radius:3px; letter-spacing:.5px; }
-    .ac-info { width:100%; border-collapse:collapse; margin-top:8px; }
+    .ac-body { display:flex; gap:8px; align-items:stretch; margin-top:8px; }
+    .ac-info { flex:1; border-collapse:collapse; }
+    .ac-photo { width:28mm; border:1px solid #94a3b8; border-radius:3px; display:flex;
+      align-items:center; justify-content:center; overflow:hidden; background:#f8fafc; }
+    .ac-photo img { width:100%; height:100%; object-fit:cover; }
+    .ac-photo span { font-size:8px; color:#64748b; text-align:center; line-height:1.4; letter-spacing:.3px; }
     .ac-info td { border:1px solid #cbd5e1; padding:4px 8px; width:50%; font-size:11px; }
     .ac-info span { display:block; font-size:8.5px; text-transform:uppercase; color:#64748b; letter-spacing:.4px; }
     .ac-info strong { font-size:11.5px; }
@@ -4430,6 +4516,12 @@ function openAdmitCardPrintWindow(cardsHtml, title) {
   printWindow.document.close();
 }
 
+function admitCardPhotoEnabled() {
+  const toggle = document.getElementById('admitCardPhotoToggle');
+  if (toggle) return toggle.checked;
+  return window.admitCardShowPhoto !== false;
+}
+
 function printSingleAdmitCard(admissionNo) {
   const term = window.admitCardTerm || 'UT1';
   const student = getStudentsByActiveSession().find(s => String(s.admissionNo) === String(admissionNo));
@@ -4438,11 +4530,13 @@ function printSingleAdmitCard(admissionNo) {
     return;
   }
   const schedule = getExamScheduleForClass(term, student.currentClass || student.class, student.currentSection || 'ALL');
-  openAdmitCardPrintWindow(buildAdmitCardHtml(student, term, schedule), `Admit Card - ${student.name}`);
+  const html = buildAdmitCardHtml(student, term, schedule, { showPhoto: admitCardPhotoEnabled() });
+  openAdmitCardPrintWindow(html, `Admit Card - ${student.name}`);
 }
 
 function printSelectedAdmitCards() {
   const term = window.admitCardTerm || 'UT1';
+  const showPhoto = admitCardPhotoEnabled();
   const picked = Array.from(document.querySelectorAll('.admit-card-chk'))
     .filter(box => box.checked)
     .map(box => box.getAttribute('data-adm'));
@@ -4457,7 +4551,7 @@ function printSelectedAdmitCards() {
     const student = all.find(s => String(s.admissionNo) === String(adm));
     if (!student) return '';
     const schedule = getExamScheduleForClass(term, student.currentClass || student.class, student.currentSection || 'ALL');
-    return buildAdmitCardHtml(student, term, schedule);
+    return buildAdmitCardHtml(student, term, schedule, { showPhoto });
   }).filter(Boolean).join('');
 
   openAdmitCardPrintWindow(cards, `Admit Cards - ${term} - ${window.admitCardClass || ''}`);
@@ -4569,12 +4663,20 @@ function getAccessRightsTabBarHtml(activeTab, reopenCall) {
   `;
 }
 
-/** Shared permission grid. View-only modules (dashboard cards) hide Add/Modify/Delete. */
-function getAccessRightsGridHtml(modules, getRights) {
+/** Role template if one is saved, otherwise the built-in role default. */
+function getEffectiveRoleRights(role) {
+  return getRolePermissionTemplate(role) || getDefaultAccessRightsForRole(role);
+}
+
+/**
+ * Shared permission grid. View-only modules (dashboard cards) hide Add/Modify/Delete.
+ * When getRoleRights is supplied, rows that differ from the role are flagged as overrides.
+ */
+function getAccessRightsGridHtml(modules, getRights, getRoleRights = null) {
   return `
-    <div style="background:#0f172a; border-radius:10px; border:1px solid #334155; overflow:auto; max-height:52vh; margin-bottom:18px;">
+    <div style="background:#0f172a; border-radius:10px; border:1px solid #334155; overflow:auto; flex:1 1 auto; min-height:180px; margin-bottom:14px;">
       <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.88rem;">
-        <thead>
+        <thead style="position:sticky; top:0; z-index:2;">
           <tr style="background:#0284c7; color:#ffffff;">
             <th style="text-align:left; padding:10px 16px;">Module Name</th>
             <th style="padding:10px; width:96px;">View<br><button type="button" class="btn btn-secondary" style="padding:1px 6px; font-size:0.65rem; margin-top:3px;" onclick="toggleAccessRightsColumn('view')">All</button></th>
@@ -4586,12 +4688,18 @@ function getAccessRightsGridHtml(modules, getRights) {
         <tbody>
           ${modules.map(mod => {
             const rights = getRights(mod.key) || { view: false, add: false, modify: false, delete: false };
+            const roleRights = getRoleRights ? (getRoleRights(mod.key) || {}) : null;
+            const differs = roleRights && ['view', 'add', 'modify', 'delete']
+              .some(a => (!mod.viewOnly || a === 'view') && !!rights[a] !== !!roleRights[a]);
             const cell = (action) => mod.viewOnly && action !== 'view'
               ? `<td style="padding:10px; color:#475569;">—</td>`
               : `<td style="padding:10px;"><input type="checkbox" class="acc-right-chk" data-mod="${mod.key}" data-action="${action}" ${rights[action] ? 'checked' : ''} style="width:18px; height:18px; cursor:pointer;"></td>`;
             return `
-              <tr style="border-bottom:1px solid #1e293b;">
-                <td style="text-align:left; padding:10px 16px;"><strong style="color:#ffffff;">${mod.name}</strong></td>
+              <tr style="border-bottom:1px solid #1e293b; ${differs ? 'background:rgba(251,191,36,0.07);' : ''}">
+                <td style="text-align:left; padding:10px 16px;">
+                  <strong style="color:#ffffff;">${mod.name}</strong>
+                  ${differs ? `<div style="font-size:0.68rem; color:#fbbf24; font-weight:700; margin-top:2px;"><i class="fa-solid fa-user-pen"></i> differs from role</div>` : ''}
+                </td>
                 ${cell('view')}${cell('add')}${cell('modify')}${cell('delete')}
               </tr>
             `;
@@ -4600,6 +4708,20 @@ function getAccessRightsGridHtml(modules, getRights) {
       </table>
     </div>
   `;
+}
+
+/** Drop a person's personal overrides so they follow their role template again. */
+function resetUserRightsToRole(userId) {
+  const user = (SchoolData.staffUsers || []).find(u => u.id === userId);
+  if (!user) return;
+  if (!window.confirm(`Remove personal overrides for ${user.name} and follow the ${user.role} role again?`)) return;
+  user.accessRights = JSON.parse(JSON.stringify(getEffectiveRoleRights(user.role)));
+  user.viewTotalRevenue = !!user.accessRights.total_revenue_view?.view;
+  user.viewDueBalance = !!user.accessRights.total_dues_view?.view;
+  user.canManageFees = !!(user.accessRights.fee_collection?.view || user.accessRights.fee_collection?.add);
+  saveSchoolDataToStorage();
+  showNotification(`${user.name} now follows the ${user.role} role permissions.`, 'success');
+  openUserAccessRightsModal(userId);
 }
 
 function toggleAccessRightsColumn(action) {
@@ -4642,15 +4764,15 @@ function openRolePermissionsModal(roleName) {
 
   const modalHtml = `
     <div class="modal-overlay active" id="rolePermissionsModal" style="z-index:999999; backdrop-filter:blur(8px);">
-      <div class="modal-box" style="max-width:900px; width:96%; background:#0f172a; color:#ffffff; padding:24px; border-radius:18px; border:2px solid #a855f7; box-shadow:0 25px 50px -12px rgba(0,0,0,0.85);">
-        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; padding-bottom:14px; margin-bottom:16px;">
+      <div class="modal-box" style="max-width:900px; width:96%; height:94vh; max-height:94vh; display:flex; flex-direction:column; background:#0f172a; color:#ffffff; padding:20px; border-radius:18px; border:2px solid #a855f7; box-shadow:0 25px 50px -12px rgba(0,0,0,0.85);">
+        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; padding-bottom:14px; margin-bottom:16px; flex:0 0 auto;">
           <h3 style="margin:0; color:#c084fc; font-size:1.25rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
             <i class="fa-solid fa-users-gear"></i> Role Permissions
           </h3>
           <button onclick="document.getElementById('rolePermissionsModal').remove()" style="background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer; font-size:1rem;">X</button>
         </div>
 
-        <div style="display:flex; align-items:center; gap:14px; margin-bottom:8px; background:#1e293b; padding:12px 16px; border-radius:10px; border:1px solid #334155; flex-wrap:wrap;">
+        <div style="display:flex; align-items:center; gap:14px; margin-bottom:8px; background:#1e293b; padding:12px 16px; border-radius:10px; border:1px solid #334155; flex-wrap:wrap; flex:0 0 auto;">
           <label style="font-size:0.9rem; font-weight:700; color:#c084fc;">Role:</label>
           <select id="rolePermRoleSelect" class="session-dropdown" style="width:260px; font-weight:700;" onchange="openRolePermissionsModal(this.value)">
             ${roles.map(r => `<option value="${escapeHtml(r)}" ${r === role ? 'selected' : ''}>${escapeHtml(r)}</option>`).join('')}
@@ -4658,15 +4780,17 @@ function openRolePermissionsModal(roleName) {
           <span class="badge badge-purple" style="font-size:0.8rem;">${memberCount} staff on this role</span>
           <span class="badge ${template ? 'badge-success' : 'badge-warning'}" style="font-size:0.8rem;">${template ? 'Custom template saved' : 'Using role defaults'}</span>
         </div>
-        <p style="font-size:0.78rem; color:#94a3b8; margin:0 0 14px 0;">
+        <p style="font-size:0.78rem; color:#94a3b8; margin:0 0 12px 0; flex:0 0 auto;">
           Set once here instead of per teacher. Saving applies to every staff account with this role. Individual staff can still be fine-tuned from <strong>Access Rights</strong>.
         </p>
 
-        ${getAccessRightsTabBarHtml(tab, `openRolePermissionsModal('${String(role).replace(/'/g, "\\'")}')`)}
+        <div style="flex:0 0 auto;">
+          ${getAccessRightsTabBarHtml(tab, `openRolePermissionsModal('${String(role).replace(/'/g, "\\'")}')`)}
+        </div>
 
         ${getAccessRightsGridHtml(modules, (key) => (template && template[key]) || defaults[key])}
 
-        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px; flex:0 0 auto;">
           <div style="background:#1e293b; color:#fbbf24; padding:8px 16px; border-radius:8px; font-weight:700; font-size:0.82rem;">
             <i class="fa-solid fa-triangle-exclamation"></i> Saving overwrites per-user rights for all ${memberCount} ${escapeHtml(role)} account(s).
           </div>
@@ -4729,34 +4853,47 @@ function openUserAccessRightsModal(userId) {
 
   const modalHtml = `
     <div class="modal-overlay active" id="userAccessRightsModal" style="z-index:999999; backdrop-filter:blur(8px);">
-      <div class="modal-box" style="max-width:850px; width:95%; background:#0f172a; color:#ffffff; padding:24px; border-radius:18px; border:2px solid #38bdf8; box-shadow:0 25px 50px -12px rgba(0,0,0,0.85);">
-        
+      <div class="modal-box" style="max-width:880px; width:96%; height:94vh; max-height:94vh; display:flex; flex-direction:column; background:#0f172a; color:#ffffff; padding:20px; border-radius:18px; border:2px solid #38bdf8; box-shadow:0 25px 50px -12px rgba(0,0,0,0.85);">
+
         <!-- TOP TOOLBAR & USER SELECTOR -->
-        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; padding-bottom:14px; margin-bottom:16px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; padding-bottom:14px; margin-bottom:14px; flex:0 0 auto;">
           <h3 style="margin:0; color:#38bdf8; font-size:1.25rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
             <i class="fa-solid fa-user-shield"></i> User Access Rights Configurator
           </h3>
           <button onclick="document.getElementById('userAccessRightsModal').remove()" style="background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer; font-size:1rem;">X</button>
         </div>
 
-        <div style="display:flex; align-items:center; gap:14px; margin-bottom:18px; background:#1e293b; padding:12px 16px; border-radius:10px; border:1px solid #334155;">
+        <div style="display:flex; align-items:center; gap:14px; margin-bottom:8px; background:#1e293b; padding:12px 16px; border-radius:10px; border:1px solid #334155; flex-wrap:wrap; flex:0 0 auto;">
           <label style="font-size:0.9rem; font-weight:700; color:#38bdf8;">Select User:</label>
           <select id="accessRightsUserSelect" class="session-dropdown" style="width:280px; font-weight:700;" onchange="openUserAccessRightsModal(this.value)">
             ${SchoolData.staffUsers.map(u => `
-              <option value="${u.id}" ${u.id === user.id ? 'selected' : ''}>${u.name} (${u.role})</option>
+              <option value="${u.id}" ${u.id === user.id ? 'selected' : ''}>${escapeHtml(u.name)} (${escapeHtml(u.role)})</option>
             `).join('')}
           </select>
-          <span class="badge badge-purple" style="font-size:0.8rem;">Role: ${user.role}</span>
+          <span class="badge badge-purple" style="font-size:0.8rem;">Role: ${escapeHtml(user.role)}</span>
+          <button class="btn btn-secondary" style="padding:5px 12px; font-size:0.75rem;" onclick="resetUserRightsToRole('${user.id}')">
+            <i class="fa-solid fa-rotate-left"></i> Follow role again
+          </button>
+        </div>
+        <p style="font-size:0.78rem; color:#94a3b8; margin:0 0 12px 0; flex:0 0 auto;">
+          This screen is a <strong>per-person override</strong>. Anything ticked or unticked here beats the
+          <strong>${escapeHtml(user.role)}</strong> role template for ${escapeHtml(user.name)} only.
+          Rows marked <span style="color:#fbbf24; font-weight:700;">differs from role</span> are already overridden.
+        </p>
+
+        <div style="flex:0 0 auto;">
+          ${getAccessRightsTabBarHtml(tab, `openUserAccessRightsModal('${user.id}')`)}
         </div>
 
-        ${getAccessRightsTabBarHtml(tab, `openUserAccessRightsModal('${user.id}')`)}
+        ${getAccessRightsGridHtml(
+          modules,
+          (key) => (user.accessRights && user.accessRights[key]) || getEffectiveRoleRights(user.role)[key],
+          (key) => getEffectiveRoleRights(user.role)[key]
+        )}
 
-        ${getAccessRightsGridHtml(modules, (key) => (user.accessRights && user.accessRights[key]) || getDefaultAccessRightsForRole(user.role)[key])}
-
-        <!-- FOOTER ALERT & SAVE BUTTON MATCHING SCREENSHOT -->
-        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px; flex:0 0 auto;">
           <div style="background:#bbf7d0; color:#166534; padding:8px 16px; border-radius:8px; font-weight:800; font-size:0.85rem; display:flex; align-items:center; gap:8px;">
-            <i class="fa-solid fa-circle-info"></i> These rights are enforced (Dashboard totals, Fees, Receipts). Admin/Principal always override.
+            <i class="fa-solid fa-circle-info"></i> Saved here = this person only. Admin / Principal always override.
           </div>
           <div style="display:flex; gap:10px;">
             <button class="btn btn-secondary" onclick="document.getElementById('userAccessRightsModal').remove()">Cancel</button>
