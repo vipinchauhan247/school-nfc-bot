@@ -2251,6 +2251,9 @@ function setupThemeToggle() {
    MODULE 1: DASHBOARD
    ============================================================================ */
 function renderDashboard(container) {
+  if (typeof repairStaffFinancialVisibilityRights === 'function' && repairStaffFinancialVisibilityRights()) {
+    saveSchoolDataToStorage({ skipCloudPush: true });
+  }
   const students = getStudentsByActiveSession();
   const session = SchoolData.activeSession;
   
@@ -2274,8 +2277,9 @@ function renderDashboard(container) {
   const activeUser = getCurrentActiveUser();
   const isAdmin = activeUser && (activeUser.role === 'Super Admin' || activeUser.role === 'Principal');
   const isAccountant = activeUser && activeUser.role === 'Accountant';
-  const canSeeRevenue = isAdmin || isAccountant || activeUser?.viewTotalRevenue === true || (activeUser?.hideFees !== true && activeUser?.viewDueBalance === true);
-  const canManageFees = isAdmin || isAccountant || activeUser?.canManageFees === true;
+  const canSeeTotalDues = canUserViewSchoolTotalDues(activeUser);
+  const canSeeTotalRevenue = canUserViewSchoolTotalRevenue(activeUser);
+  const canManageFees = isAdmin || isAccountant || activeUser?.canManageFees === true || hasUserAccessPermission(activeUser, 'fee_collection', 'view');
   const canAdmitStudents = isAdmin || activeUser?.canAdmitStudents === true;
 
   container.innerHTML = `
@@ -2337,7 +2341,7 @@ function renderDashboard(container) {
           <span class="kpi-label">Absent Today</span>
         </div>
       </div>
-      ${canSeeRevenue ? `
+      ${canSeeTotalDues ? `
         <div class="glass-card kpi-card">
           <div class="kpi-icon-box amber"><i class="fa-solid fa-indian-rupee-sign"></i></div>
           <div class="kpi-data">
@@ -2345,12 +2349,20 @@ function renderDashboard(container) {
             <span class="kpi-label">Pending Dues (${session})</span>
           </div>
         </div>
+      ` : canSeeTotalRevenue ? `
+        <div class="glass-card kpi-card">
+          <div class="kpi-icon-box amber"><i class="fa-solid fa-sack-dollar"></i></div>
+          <div class="kpi-data">
+            <span class="kpi-value">Granted</span>
+            <span class="kpi-label">Revenue view (see Fees / Receipts)</span>
+          </div>
+        </div>
       ` : `
         <div class="glass-card kpi-card">
           <div class="kpi-icon-box cyan"><i class="fa-solid fa-award"></i></div>
           <div class="kpi-data">
             <span class="kpi-value">Active</span>
-            <span class="kpi-label">Teacher Portal Access</span>
+            <span class="kpi-label">${(activeUser?.role || 'Staff')} Portal</span>
           </div>
         </div>
       `}
@@ -3752,7 +3764,10 @@ function ensureStaffUserIds() {
    ============================================================================ */
 function renderUsersPage(container) {
   ensureStaffUserIds();
-  hydrateStaffPasswordsFromAdminVault();
+  if (typeof hydrateStaffPasswordsFromAdminVault === 'function') hydrateStaffPasswordsFromAdminVault();
+  if (typeof repairStaffFinancialVisibilityRights === 'function' && repairStaffFinancialVisibilityRights()) {
+    saveSchoolDataToStorage();
+  }
   const users = SchoolData.staffUsers;
 
   container.innerHTML = `
@@ -3774,7 +3789,7 @@ function renderUsersPage(container) {
           <h3 style="font-family:var(--font-heading); color:#38bdf8; margin:0; display:flex; align-items:center; gap:10px;">
             <i class="fa-solid fa-key"></i> Named Staff User Rights & Revenue Visibility Matrix
           </h3>
-          <small style="color:var(--text-muted);">Configure exact permission rights for Salesman, Accountant, Teachers (Hide Fees, View Dues, Total Revenue View, Weightage).</small>
+          <small style="color:var(--text-muted);">Tick boxes then <strong>Save</strong> — they really hide/show school-wide Total Dues &amp; Total Revenue (not cosmetic). Receptionist can collect fees without seeing school totals.</small>
         </div>
         <button class="btn btn-primary" style="background:linear-gradient(135deg, #0284c7 0%, #0369a1 100%); border:none; padding:10px 20px;" onclick="saveUserPermissionsMatrix()">
           <i class="fa-solid fa-floppy-disk"></i> Save All User Permissions
@@ -4054,8 +4069,9 @@ const ERP_MODULES_LIST = {
     { key: "fee_collection", name: "Fee Collection & Payment Entry" },
     { key: "fee_receipt_print", name: "Fee Receipt Generation & Printing (A4/A5)" },
     { key: "fee_receipt_deletion", name: "Fee Receipt Deletion & Cancellation" },
-    { key: "student_dues_view", name: "View Student Due Balances" },
-    { key: "total_revenue_view", name: "View Total School Fee Revenue & Analytics" },
+    { key: "student_dues_view", name: "View Per-Student Due (while collecting fees)" },
+    { key: "total_dues_view", name: "View School-Wide Total Pending Dues (Dashboard / Fee totals)" },
+    { key: "total_revenue_view", name: "View School-Wide Total Collection / Revenue" },
     { key: "telegram_fee_notice", name: "Telegram Fee Notices & Receipt Dispatch" }
   ],
   exams: [
@@ -4180,7 +4196,7 @@ function openUserAccessRightsModal(userId) {
         <!-- FOOTER ALERT & SAVE BUTTON MATCHING SCREENSHOT -->
         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px;">
           <div style="background:#bbf7d0; color:#166534; padding:8px 16px; border-radius:8px; font-weight:800; font-size:0.85rem; display:flex; align-items:center; gap:8px;">
-            <i class="fa-solid fa-circle-info"></i> Note : Admin role will override these settings
+            <i class="fa-solid fa-circle-info"></i> These rights are enforced (Dashboard totals, Fees, Receipts). Admin/Principal always override.
           </div>
           <div style="display:flex; gap:10px;">
             <button class="btn btn-secondary" onclick="document.getElementById('userAccessRightsModal').remove()">Cancel</button>
@@ -4214,18 +4230,121 @@ function saveUserAccessRightsModal(userId) {
     user.accessRights[modKey][action] = chk.checked;
   });
 
+  // Keep matrix flags in sync with Access Rights (real enforcement uses both)
+  if (user.accessRights.total_revenue_view) {
+    user.viewTotalRevenue = !!user.accessRights.total_revenue_view.view;
+  }
+  if (user.accessRights.total_dues_view) {
+    user.viewDueBalance = !!user.accessRights.total_dues_view.view;
+  }
+  if (user.accessRights.fee_collection) {
+    user.canManageFees = !!(user.accessRights.fee_collection.view || user.accessRights.fee_collection.add || user.accessRights.fee_collection.modify);
+  }
+
   saveSchoolDataToStorage();
   document.getElementById('userAccessRightsModal').remove();
 
-  showNotification(`Access Rights saved for ${user.name} (${user.role}).`, 'success');
+  showNotification(`Access Rights saved for ${user.name} (${user.role}). Totals visibility updated.`, 'success');
   if (document.getElementById('contentBody')) {
     renderUsersPage(document.getElementById('contentBody'));
   }
 }
 
+function isErpAdminUser(user) {
+  const role = String(user?.role || '').toLowerCase().trim();
+  return role.includes('super admin') || role.includes('principal');
+}
+
+function ensureStaffAccessRight(user, moduleKey, action, enabled) {
+  if (!user) return;
+  if (!user.accessRights) user.accessRights = getDefaultAccessRightsForRole(user.role);
+  if (!user.accessRights[moduleKey]) {
+    user.accessRights[moduleKey] = { view: false, add: false, modify: false, delete: false };
+  }
+  user.accessRights[moduleKey][action] = !!enabled;
+}
+
+/**
+ * School-wide total collection / revenue (dashboard KPIs, fee/receipt summary cards).
+ * Controlled by matrix "View Total Revenue" + Access Rights total_revenue_view.
+ */
+function canUserViewSchoolTotalRevenue(user = getCurrentActiveUser()) {
+  if (!user) return false;
+  if (isErpAdminUser(user)) return true;
+  if (user.accessRights && user.accessRights.total_revenue_view) {
+    return !!user.accessRights.total_revenue_view.view;
+  }
+  if (String(user.role || '') === 'Receptionist') return false;
+  if (String(user.role || '') === 'Accountant') return user.viewTotalRevenue !== false;
+  return user.viewTotalRevenue === true;
+}
+
+/**
+ * School-wide pending dues total (dashboard Pending Dues, fee page aggregate).
+ * Controlled by matrix "View Total Dues" + Access Rights total_dues_view.
+ * Collecting fees ≠ seeing school-wide total (receptionist default: off).
+ */
+function canUserViewSchoolTotalDues(user = getCurrentActiveUser()) {
+  if (!user) return false;
+  if (isErpAdminUser(user)) return true;
+  if (user.accessRights && user.accessRights.total_dues_view) {
+    return !!user.accessRights.total_dues_view.view;
+  }
+  if (String(user.role || '') === 'Receptionist') return false;
+  if (String(user.role || '') === 'Accountant') return user.viewDueBalance !== false;
+  return user.viewDueBalance === true;
+}
+
+/** Per-student due while collecting / on fee row (not school-wide total). */
+function canUserViewStudentDueDetails(user = getCurrentActiveUser()) {
+  if (!user) return false;
+  if (isErpAdminUser(user)) return true;
+  if (user.canManageFees === true) return true;
+  if (hasUserAccessPermission(user, 'fee_collection', 'view') === true) return true;
+  return hasUserAccessPermission(user, 'student_dues_view', 'view') === true;
+}
+
+/** Ensure fee total modules exist; one-shot: strip school-wide totals from Receptionist. */
+function repairStaffFinancialVisibilityRights() {
+  let changed = false;
+  (SchoolData.staffUsers || []).forEach((u) => {
+    const defaults = getDefaultAccessRightsForRole(u.role);
+    if (!u.accessRights) {
+      u.accessRights = { ...defaults };
+      changed = true;
+    }
+    ['total_dues_view', 'total_revenue_view', 'student_dues_view'].forEach((key) => {
+      if (!u.accessRights[key]) {
+        u.accessRights[key] = { ...(defaults[key] || { view: false, add: false, modify: false, delete: false }) };
+        changed = true;
+      }
+    });
+  });
+
+  if (!SchoolData._finRightsV2) {
+    (SchoolData.staffUsers || []).forEach((u) => {
+      if (String(u.role || '') !== 'Receptionist') return;
+      if (u.viewDueBalance || u.viewTotalRevenue) changed = true;
+      u.viewDueBalance = false;
+      u.viewTotalRevenue = false;
+      ensureStaffAccessRight(u, 'total_dues_view', 'view', false);
+      ensureStaffAccessRight(u, 'total_revenue_view', 'view', false);
+      // Keep per-student dues for fee collection
+      ensureStaffAccessRight(u, 'student_dues_view', 'view', true);
+      ensureStaffAccessRight(u, 'fee_collection', 'view', true);
+      ensureStaffAccessRight(u, 'fee_collection', 'add', true);
+      u.canManageFees = true;
+      changed = true;
+    });
+    SchoolData._finRightsV2 = true;
+    changed = true;
+  }
+  return changed;
+}
+
 function hasUserAccessPermission(user, moduleKey, action = 'view') {
   if (!user) return false;
-  if (user.role === 'Super Admin' || user.role === 'Principal') return true;
+  if (isErpAdminUser(user)) return true;
 
   if (user.accessRights && user.accessRights[moduleKey]) {
     const rights = user.accessRights[moduleKey];
@@ -4239,7 +4358,8 @@ function hasUserAccessPermission(user, moduleKey, action = 'view') {
     return !!roleRights[moduleKey][action];
   }
 
-  return true;
+  // Deny by default — never grant unknown modules
+  return false;
 }
 
 function canCurrentUserExportExamSheets() {
@@ -4309,17 +4429,20 @@ function getDefaultAccessRightsForRole(role) {
       if (['student_admission', 'student_directory', 'student_edit', 'attendance_register', 'nfc_scanner'].includes(mod.key)) {
         base[mod.key] = { view: true, add: true, modify: true, delete: false };
       } else if (['fee_collection', 'fee_receipt_print', 'student_dues_view', 'telegram_fee_notice'].includes(mod.key)) {
+        // Collect fees + that student's due — NOT school-wide totals
         base[mod.key] = { view: true, add: true, modify: false, delete: false };
+      } else if (['total_revenue_view', 'total_dues_view', 'reports_analytics', 'fee_receipt_deletion'].includes(mod.key)) {
+        base[mod.key] = { view: false, add: false, modify: false, delete: false };
       } else if (mod.key === 'report_cards_print' || mod.key === 'exam_marks_entry') {
-        base[mod.key] = { view: true, add: false, modify: false, delete: false }; // Receptionist can VIEW & PRINT, but CANNOT edit marks!
-      } else {
         base[mod.key] = { view: true, add: false, modify: false, delete: false };
+      } else {
+        base[mod.key] = { view: false, add: false, modify: false, delete: false };
       }
     } else if (isAccountant) {
       if (mod.key.includes('fee') || mod.key.includes('revenue') || mod.key.includes('dues') || mod.key.includes('telegram')) {
         base[mod.key] = { view: true, add: true, modify: true, delete: true };
       } else {
-        base[mod.key] = { view: true, add: false, modify: false, delete: false };
+        base[mod.key] = { view: false, add: false, modify: false, delete: false };
       }
     } else if (isTeacher) {
       if (['exam_marks_entry', 'report_cards_print', 'exam_exports', 'attendance_register', 'student_directory'].includes(mod.key)) {
@@ -4327,10 +4450,10 @@ function getDefaultAccessRightsForRole(role) {
       } else if (['teacher_subject_mappings', 'timetable_management'].includes(mod.key)) {
         base[mod.key] = { view: true, add: false, modify: false, delete: false };
       } else {
-        base[mod.key] = { view: true, add: false, modify: false, delete: false };
+        base[mod.key] = { view: false, add: false, modify: false, delete: false };
       }
     } else {
-      base[mod.key] = { view: true, add: false, modify: false, delete: false };
+      base[mod.key] = { view: false, add: false, modify: false, delete: false };
     }
   });
 
@@ -5155,12 +5278,36 @@ function saveUserPermissionsMatrix() {
     const uObj = SchoolData.staffUsers.find(x => x.id === uid);
     if (uObj) {
       uObj[field] = box.checked;
+      // Sync Access Rights modules so dashboard/fees enforcement matches the matrix
+      if (field === 'viewTotalRevenue') {
+        ensureStaffAccessRight(uObj, 'total_revenue_view', 'view', box.checked);
+      }
+      if (field === 'viewDueBalance') {
+        ensureStaffAccessRight(uObj, 'total_dues_view', 'view', box.checked);
+      }
+      if (field === 'canManageFees') {
+        ensureStaffAccessRight(uObj, 'fee_collection', 'view', box.checked);
+        ensureStaffAccessRight(uObj, 'fee_collection', 'add', box.checked);
+        ensureStaffAccessRight(uObj, 'student_dues_view', 'view', box.checked);
+      }
+      if (field === 'canAccessTelegramBot') {
+        ensureStaffAccessRight(uObj, 'telegram_bot_admin', 'view', box.checked);
+        ensureStaffAccessRight(uObj, 'telegram_fee_notice', 'view', box.checked);
+      }
+      if (field === 'canAdmitStudents') {
+        ensureStaffAccessRight(uObj, 'student_admission', 'view', box.checked);
+        ensureStaffAccessRight(uObj, 'student_admission', 'add', box.checked);
+      }
+      if (field === 'reportCards') {
+        ensureStaffAccessRight(uObj, 'report_cards_print', 'view', box.checked);
+      }
     }
   });
 
-  showNotification('Named Staff User Rights & Revenue Visibility Matrix saved successfully.', 'success');
+  showNotification('User rights saved. Total Dues / Revenue visibility now applies on Dashboard & Fees.', 'success');
 
   saveSchoolDataToStorage();
+  renderUsersPage(document.getElementById('contentBody'));
 }
 
 function openAddNewUserModal() {
@@ -5194,7 +5341,7 @@ function openAddNewUserModal() {
           <div>
             <label style="font-size:0.85rem; font-weight:700; color:#cbd5e1;">Assigned Role / Designation *</label>
             <select id="newStaffRole" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px; font-weight:700;">
-              <option value="Receptionist">Receptionist (Student Edit, Admission & Dues Only)</option>
+              <option value="Receptionist">Receptionist (Admission & collect fees — no school totals)</option>
               <option value="Subject Teacher">Subject Teacher</option>
               <option value="Class Teacher & Subject Teacher">Class Teacher & Subject Teacher</option>
               <option value="Accountant">Accountant</option>
@@ -5290,7 +5437,7 @@ function saveNewStaffUser() {
     assignedClasses: (isAdminRole || isReceptionistRole) ? ["ALL"] : (linkedTeacherClasses.length ? linkedTeacherClasses : ["Class 5"]),
     hideFees: isTeacherRole,
     viewTotalRevenue: isAdminRole || isAccountantRole,
-    viewDueBalance: isAdminRole || isAccountantRole || isReceptionistRole,
+    viewDueBalance: isAdminRole || isAccountantRole,
     canManageFees: isAdminRole || isAccountantRole || isReceptionistRole,
     canAdmitStudents: isAdminRole || isReceptionistRole,
     canEditStudents: isAdminRole || isReceptionistRole,
@@ -11515,6 +11662,22 @@ function renderFeesPage(container) {
   const currentSession = SchoolData.activeSession;
   const classOptions = getSchoolClassNames();
   const paidCount = students.filter(s => (s.feeRecords?.[currentSession]?.payments || []).length > 0).length;
+  const canSeeCollected = canUserViewSchoolTotalRevenue();
+  const canSeePendingTotal = canUserViewSchoolTotalDues();
+  const collectedTotal = students.reduce((acc, s) => {
+    const payments = s.feeRecords[currentSession]?.payments || [];
+    return acc + payments.reduce((pAcc, p) => pAcc + (p.amount || 0), 0);
+  }, 0);
+  const pendingTotal = students.reduce((acc, s) => {
+    const fee = s.currentFeeInfo || {};
+    const overdueMonths = getCurrentOverdueMonths(s);
+    return acc + (overdueMonths.length * getStudentMonthlyTuitionRate(s)) + (fee.previousSessionDue || 0);
+  }, 0);
+  const defaulterCount = students.filter(s => {
+    const fee = s.currentFeeInfo || {};
+    const overdueMonths = getCurrentOverdueMonths(s);
+    return (overdueMonths.length > 0 || (fee.previousSessionDue || 0) > 0);
+  }).length;
 
   container.innerHTML = `
     <div class="page-header">
@@ -11537,10 +11700,8 @@ function renderFeesPage(container) {
         <div class="metric-icon" style="background:rgba(16, 185, 129, 0.15); color:var(--accent-success);"><i class="fa-solid fa-wallet"></i></div>
         <div class="metric-info">
           <span class="metric-title">Collected Fee (Session ${currentSession})</span>
-          <span class="metric-value">Rs${students.reduce((acc, s) => {
-            const payments = s.feeRecords[currentSession]?.payments || [];
-            return acc + payments.reduce((pAcc, p) => pAcc + (p.amount || 0), 0);
-          }, 0).toLocaleString('en-IN')}</span>
+          <span class="metric-value">${canSeeCollected ? `Rs${collectedTotal.toLocaleString('en-IN')}` : '••••••'}</span>
+          ${!canSeeCollected ? `<div style="font-size:0.72rem; color:#94a3b8; margin-top:4px;">Hidden — need View Total Revenue right</div>` : ''}
         </div>
       </div>
 
@@ -11548,11 +11709,8 @@ function renderFeesPage(container) {
         <div class="metric-icon" style="background:rgba(239, 68, 68, 0.15); color:var(--accent-danger);"><i class="fa-solid fa-hand-holding-dollar"></i></div>
         <div class="metric-info">
           <span class="metric-title">Pending Session Dues (Up to August)</span>
-          <span class="metric-value">Rs${students.reduce((acc, s) => {
-            const fee = s.currentFeeInfo || {};
-            const overdueMonths = getCurrentOverdueMonths(s);
-            return acc + (overdueMonths.length * getStudentMonthlyTuitionRate(s)) + (fee.previousSessionDue || 0);
-          }, 0).toLocaleString('en-IN')}</span>
+          <span class="metric-value">${canSeePendingTotal ? `Rs${pendingTotal.toLocaleString('en-IN')}` : '••••••'}</span>
+          ${!canSeePendingTotal ? `<div style="font-size:0.72rem; color:#94a3b8; margin-top:4px;">Hidden — need View Total Dues right</div>` : ''}
         </div>
       </div>
 
@@ -11560,11 +11718,7 @@ function renderFeesPage(container) {
         <div class="metric-icon" style="background:rgba(245, 158, 11, 0.15); color:var(--accent-warning);"><i class="fa-solid fa-user-clock"></i></div>
         <div class="metric-info">
           <span class="metric-title">Fee Defaulters</span>
-          <span class="metric-value">${students.filter(s => {
-            const fee = s.currentFeeInfo || {};
-            const overdueMonths = getCurrentOverdueMonths(s);
-            return (overdueMonths.length > 0 || (fee.previousSessionDue || 0) > 0);
-          }).length} Students</span>
+          <span class="metric-value">${canSeePendingTotal ? `${defaulterCount} Students` : '••••'}</span>
         </div>
       </div>
     </div>
@@ -14025,6 +14179,7 @@ function renderReceiptsLedgerPage(container) {
   const currentSession = SchoolData.activeSession;
   const allReceipts = getAllFeeReceipts();
   const totalCollected = allReceipts.reduce((acc, r) => acc + (r.amount || 0), 0);
+  const canSeeRevenue = canUserViewSchoolTotalRevenue();
 
   container.innerHTML = `
     <div class="page-header">
@@ -14044,7 +14199,7 @@ function renderReceiptsLedgerPage(container) {
         <div class="metric-icon" style="background:rgba(16, 185, 129, 0.15); color:var(--accent-success);"><i class="fa-solid fa-receipt"></i></div>
         <div class="metric-info">
           <span class="metric-title">Total Receipts Issued</span>
-          <span class="metric-value">${allReceipts.length} Receipts</span>
+          <span class="metric-value">${canSeeRevenue ? `${allReceipts.length} Receipts` : '••••'}</span>
         </div>
       </div>
 
@@ -14052,7 +14207,8 @@ function renderReceiptsLedgerPage(container) {
         <div class="metric-icon" style="background:rgba(56, 189, 248, 0.15); color:var(--accent-primary);"><i class="fa-solid fa-indian-rupee-sign"></i></div>
         <div class="metric-info">
           <span class="metric-title">Total Revenue Verified</span>
-          <span class="metric-value">Rs${totalCollected.toLocaleString('en-IN')}</span>
+          <span class="metric-value">${canSeeRevenue ? `Rs${totalCollected.toLocaleString('en-IN')}` : '••••••'}</span>
+          ${!canSeeRevenue ? `<div style="font-size:0.72rem; color:#94a3b8; margin-top:4px;">Hidden — need View Total Revenue right</div>` : ''}
         </div>
       </div>
     </div>
@@ -17307,6 +17463,7 @@ function toggleSessionStatus(sessId) {
 }
 
 function renderReportsPage(container) {
+  const canDuesReport = canUserViewSchoolTotalDues();
   container.innerHTML = `
     <div class="page-header">
       <div>
@@ -17318,7 +17475,9 @@ function renderReportsPage(container) {
       <div class="glass-card">
         <h3><i class="fa-solid fa-download"></i> Export Dues Report</h3>
         <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Download Excel breakdown of all pending student fee dues for ${SchoolData.activeSession}.</p>
-        <button class="btn btn-primary" onclick="showNotification('Exporting Dues Report to Excel...', 'success')">Export Excel</button>
+        ${canDuesReport
+          ? `<button class="btn btn-primary" onclick="showNotification('Exporting Dues Report to Excel...', 'success')">Export Excel</button>`
+          : `<button class="btn btn-secondary" disabled style="opacity:0.55;">Hidden — need View Total Dues right</button>`}
       </div>
       <div class="glass-card">
         <h3><i class="fa-solid fa-file-pdf"></i> Export Attendance Summary</h3>
