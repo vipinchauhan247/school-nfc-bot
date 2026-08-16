@@ -1,0 +1,8 @@
+PHASE 2 — copy this into Supabase SQL Editor and click Run
+(Do not run this in the NFC / Vipinbellbot project.)
+
+Then copy api/erp-cloud.js to your Render GitHub repo (same folder as mmmjhs-bot.js).
+Redeploy Render. No website GitHub needed.
+
+After deploy, open this in browser (use your real secret):
+https://mmmjhschoolbot.onrender.com/api/mmmjhs-bot?action=nativeMigrate&schoolId=mmm-jhs&secret=YOUR_SECRET

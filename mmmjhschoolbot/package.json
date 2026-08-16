@@ -1,0 +1,13 @@
+{
+  "name": "mmm-school-erp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MMM Junior High School ERP with 24/7 @mmmjhschoolbot backend",
+  "scripts": {
+    "start": "node render-server.js",
+    "check": "node --check render-server.js && node --check api/mmmjhs-bot.js && node --check js/app.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
