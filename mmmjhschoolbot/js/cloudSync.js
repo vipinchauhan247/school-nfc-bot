@@ -21,6 +21,13 @@
   let cloudPollTimer = null;
   let cloudSyncInFlight = false;
 
+  // Live-sync tuning. The poll itself only fetches a timestamp, so a short
+  // interval stays cheap; the roster is downloaded only when it changed.
+  const CLOUD_POLL_MS = 15000;
+  const FALLBACK_PULL_EVERY_TICKS = 6; // ~90s, used only if the server has no probe
+  let versionProbeSupported = true;
+  let fallbackPollTicks = 0;
+
   function isCloudOnly() {
     // Default ON for MMM JHS. Set window.ERP_CLOUD_ONLY = false only to re-enable hybrid.
     return window.ERP_CLOUD_ONLY !== false;
@@ -444,6 +451,34 @@
       if (typeof saveSchoolDataToStorage === 'function') saveSchoolDataToStorage({ skipCloudPush: true });
     }
     return { ok: true, applied, count: data.students.length };
+  }
+
+  function cloudVersionUrl() {
+    const schoolId = getCloudSchoolId();
+    return withCloudSecret(`${getErpCloudApiBase()}?action=cloudVersion&schoolId=${encodeURIComponent(schoolId)}`);
+  }
+
+  /**
+   * Ask the server for just the snapshot timestamp (~80 bytes) instead of
+   * re-downloading the whole roster on every poll.
+   * Returns true when a full pull is actually needed.
+   */
+  async function cloudSnapshotChanged() {
+    try {
+      const res = await fetchWithRetry(cloudVersionUrl(), { headers: cloudHeaders(), cache: 'no-store' });
+      const data = await parseCloudResponse(res);
+      if (!data || !data.ok || !data.savedAt) {
+        // Older server without the probe — fall back to slow full polling.
+        versionProbeSupported = false;
+        return false;
+      }
+      versionProbeSupported = true;
+      const known = String(localStorage.getItem(LS_LAST_CLOUD_AT) || '');
+      return String(data.savedAt) !== known;
+    } catch (err) {
+      versionProbeSupported = false;
+      return false;
+    }
   }
 
   async function fetchCloudSnapshotRaw() {
@@ -964,18 +999,37 @@
     }
 
     clearInterval(cloudPollTimer);
-    // Live poll ~every 5s — skip while this device has unsaved edits (prevents wiping a new teacher)
-    cloudPollTimer = setInterval(() => {
+    // Poll the timestamp, not the roster. A full download happens only when the
+    // cloud copy actually changed — skipped while this device has unsaved edits.
+    cloudPollTimer = setInterval(async () => {
       if (window._erpCloudMemoryDirty) return;
-      pullSchoolDataFromCloud({ silent: true }).catch(() => {});
-    }, 5000);
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
 
-    // Also sync when tab becomes visible again
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') {
-        if (window._erpCloudMemoryDirty) return;
+      if (versionProbeSupported) {
+        const changed = await cloudSnapshotChanged();
+        if (!changed) return;
         pullSchoolDataFromCloud({ silent: true }).catch(() => {});
+        return;
       }
+
+      // No probe on the server: pull rarely instead of every tick.
+      fallbackPollTicks += 1;
+      if (fallbackPollTicks < FALLBACK_PULL_EVERY_TICKS) return;
+      fallbackPollTicks = 0;
+      pullSchoolDataFromCloud({ silent: true }).catch(() => {});
+    }, CLOUD_POLL_MS);
+
+    // Tab back in front: check once immediately so the office never waits.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') return;
+      if (window._erpCloudMemoryDirty) return;
+      cloudSnapshotChanged()
+        .then((changed) => {
+          if (changed || !versionProbeSupported) {
+            pullSchoolDataFromCloud({ silent: true }).catch(() => {});
+          }
+        })
+        .catch(() => {});
     });
 
     return { ok: true, configured: true, cloudOnly: isCloudOnly() };
@@ -988,7 +1042,10 @@
     if (!cfg.configured) return `${mode}: not configured on server.`;
     const push = window._erpCloudLastPushAt ? `Last upload: ${window._erpCloudLastPushAt}` : 'Not uploaded yet';
     const err = window._erpCloudLastPushError || window._erpCloudLastPullError;
-    return err ? `${mode} · ${push} | Error: ${err}` : `${mode} · ${push} · Auto-sync every 5s`;
+    const sync = versionProbeSupported
+      ? `Auto-sync every ${CLOUD_POLL_MS / 1000}s (downloads only on change)`
+      : `Auto-sync every ${(CLOUD_POLL_MS * FALLBACK_PULL_EVERY_TICKS) / 1000}s`;
+    return err ? `${mode} · ${push} | Error: ${err}` : `${mode} · ${push} · ${sync}`;
   }
 
   window.isErpCloudOnly = isCloudOnly;
