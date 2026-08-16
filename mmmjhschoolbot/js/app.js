@@ -2892,7 +2892,7 @@ function renderExamsPage(container, mode = 'entry') {
           <h3 style="font-family:var(--font-heading); color:#6366f1; margin:0; display:flex; align-items:center; gap:10px;">
             <i class="fa-solid fa-table-cells"></i> Master Class Spreadsheet (All Subjects)
           </h3>
-          <small style="color:var(--text-muted);"><i class="fa-solid fa-arrows-left-right" style="color:var(--accent-primary);"></i> Drag Slider Bar or click Subject Filter Buttons above to jump straight to Science, Hindi, Social, Computer!</small>
+          <small style="color:var(--text-muted);"><i class="fa-solid fa-arrows-left-right" style="color:var(--accent-primary);"></i> On phone or PC: name columns stay frozen — swipe/slide subjects (or use slider / subject buttons).</small>
         </div>
         ${canExportExamSheets ? `
           <button class="btn btn-primary" style="background:linear-gradient(135deg, #6366f1 0%, #4f46e5 100%); border:none; padding:10px 20px;" onclick="saveAndExportVisibleClassSheet()">
@@ -2990,16 +2990,18 @@ function renderExamsPage(container, mode = 'entry') {
           }
           #subjectTableContainer .sticky-col-2 {
             left: 36px !important;
-            min-width: 118px !important;
-            max-width: 132px !important;
+            width: 120px !important;
+            min-width: 120px !important;
+            max-width: 120px !important;
             font-size: 0.88rem !important;
             white-space: normal !important;
             line-height: 1.2 !important;
           }
           #subjectTableContainer .sticky-col-3 {
-            left: 154px !important;
-            min-width: 96px !important;
-            max-width: 112px !important;
+            left: 156px !important;
+            width: 100px !important;
+            min-width: 100px !important;
+            max-width: 100px !important;
             font-size: 0.8rem !important;
             white-space: normal !important;
             line-height: 1.2 !important;
@@ -4253,6 +4255,26 @@ function canCurrentUserExportStudents() {
 function canCurrentUserBulkDeleteStudents() {
   const user = getCurrentActiveUser();
   return hasUserAccessPermission(user, 'student_bulk_delete', 'delete') === true;
+}
+
+/** Only Super Admin / Principal may delete subjects from the directory (not teachers). */
+function canCurrentUserDeleteSubjects() {
+  const role = String(getCurrentActiveUser()?.role || '').toLowerCase().trim();
+  return role.includes('super admin') || role.includes('principal');
+}
+
+function canCurrentUserAddSubjects() {
+  const user = getCurrentActiveUser();
+  if (!user) return false;
+  if (canCurrentUserDeleteSubjects()) return true;
+  return hasUserAccessPermission(user, 'subject_management', 'add') === true;
+}
+
+function canCurrentUserModifySubjects() {
+  const user = getCurrentActiveUser();
+  if (!user) return false;
+  if (canCurrentUserDeleteSubjects()) return true;
+  return hasUserAccessPermission(user, 'subject_management', 'modify') === true;
 }
 
 function blockStudentExportIfDenied() {
@@ -10410,16 +10432,18 @@ function renderSubjectsPage(container) {
   }
   const subjects = SchoolData.subjects || [];
   const teacherUsers = getTeacherRoleUsersForSubjectAssign();
+  const canAdd = canCurrentUserAddSubjects();
+  const canModify = canCurrentUserModifySubjects();
 
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-book-open" style="color:var(--accent-primary)"></i> Subjects Directory</h2>
-        <p class="page-subtitle">Subject scope can be All Classes; teachers are assigned <strong>per class</strong> in Teachers Directory (English school-wide ≠ one teacher everywhere). Marks stay in Exams.</p>
+        <p class="page-subtitle">Subject scope can be All Classes; teachers are assigned <strong>per class</strong> in Teachers Directory (English school-wide ≠ one teacher everywhere). Marks stay in Exams. Only Super Admin / Principal can delete subjects.</p>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
         <button class="btn btn-secondary" onclick="window.location.hash='exams-entry'"><i class="fa-solid fa-table-cells"></i> Open Exams &amp; Marks</button>
-        <button class="btn btn-primary" onclick="openCreateSubjectModal()"><i class="fa-solid fa-plus"></i> Add New Subject</button>
+        ${canAdd ? `<button class="btn btn-primary" onclick="openCreateSubjectModal()"><i class="fa-solid fa-plus"></i> Add New Subject</button>` : ''}
       </div>
     </div>
 
@@ -10456,9 +10480,11 @@ function renderSubjectsPage(container) {
                 <td><span class="badge badge-info"><i class="fa-solid fa-clock"></i> ${sub.periodsPerWeek} Periods / Wk</span></td>
                 <td><span class="badge badge-success">${escapeHtml(sub.category || '')}</span></td>
                 <td>
+                  ${canModify ? `
                   <button class="btn btn-secondary" style="padding:4px 8px; font-size:0.75rem;" onclick="openEditSubjectModal('${sub.id}')">
                     <i class="fa-solid fa-pen-to-square"></i> Edit
                   </button>
+                  ` : `<span style="color:#64748b; font-size:0.78rem;">View only</span>`}
                 </td>
               </tr>
             `).join('') : `
@@ -10472,6 +10498,10 @@ function renderSubjectsPage(container) {
 }
 
 function openCreateSubjectModal() {
+  if (!canCurrentUserAddSubjects()) {
+    showNotification('Access denied: only office admin can add subjects.', 'warning');
+    return;
+  }
   const existing = document.getElementById('subjectModal');
   if (existing) existing.remove();
 
@@ -10535,6 +10565,10 @@ function openCreateSubjectModal() {
 }
 
 function saveNewSubject() {
+  if (!canCurrentUserAddSubjects()) {
+    showNotification('Access denied: only office admin can add subjects.', 'warning');
+    return;
+  }
   const name = document.getElementById('subName').value.trim();
   const code = document.getElementById('subCode').value.trim();
   const periods = parseInt(document.getElementById('subPeriods').value) || 5;
@@ -10587,11 +10621,16 @@ function saveNewSubject() {
 }
 
 function openEditSubjectModal(subId) {
+  if (!canCurrentUserModifySubjects()) {
+    showNotification('Access denied: teachers cannot edit the Subjects Directory.', 'warning');
+    return;
+  }
   const existing = document.getElementById('subjectModal');
   if (existing) existing.remove();
 
   const sub = SchoolData.subjects.find(s => s.id === subId);
   if (!sub) return;
+  const canDelete = canCurrentUserDeleteSubjects();
 
   const modalHtml = `
     <div class="modal-overlay active" id="subjectModal" style="z-index:99999;">
@@ -10623,12 +10662,19 @@ function openEditSubjectModal(subId) {
             <p style="font-size:0.78rem; color:#94a3b8; margin:0; background:#1e293b; padding:8px 12px; border-radius:6px;">
               Marks are entered in <strong>Exams &amp; Report Cards</strong> only.
             </p>
+            ${!canDelete ? `
+            <p style="font-size:0.78rem; color:#fbbf24; margin:0; background:#1e293b; padding:8px 12px; border-radius:6px;">
+              <i class="fa-solid fa-lock"></i> Only Super Admin / Principal can delete subjects.
+            </p>
+            ` : ''}
           </div>
 
           <div style="display:flex; justify-content:space-between;">
+            ${canDelete ? `
             <button class="btn btn-secondary" style="color:var(--accent-danger);" onclick="deleteSubject('${sub.id}')">
               <i class="fa-solid fa-trash"></i> Delete Subject
             </button>
+            ` : `<span></span>`}
             <button class="btn btn-primary" onclick="saveSubjectEdit('${sub.id}')">
               <i class="fa-solid fa-floppy-disk"></i> Save Changes
             </button>
@@ -10642,6 +10688,10 @@ function openEditSubjectModal(subId) {
 }
 
 function saveSubjectEdit(subId) {
+  if (!canCurrentUserModifySubjects()) {
+    showNotification('Access denied: teachers cannot edit the Subjects Directory.', 'warning');
+    return;
+  }
   const sub = SchoolData.subjects.find(s => s.id === subId);
   if (!sub) return;
 
@@ -10675,11 +10725,21 @@ function saveSubjectEdit(subId) {
 }
 
 function deleteSubject(subId) {
+  if (!canCurrentUserDeleteSubjects()) {
+    showNotification('Access denied: teachers cannot delete subjects. Ask Super Admin / Principal.', 'warning');
+    return;
+  }
+  const sub = (SchoolData.subjects || []).find(s => s.id === subId);
+  const label = sub?.name || 'this subject';
+  if (!window.confirm(`Delete subject "${label}" from the Subjects Directory?\n\nThis cannot be undone. Marks already entered are kept.`)) {
+    return;
+  }
+
   SchoolData.subjects = SchoolData.subjects.filter(s => s.id !== subId);
   const modal = document.getElementById('subjectModal');
   if (modal) modal.remove();
 
-  showNotification(' Subject deleted successfully!', 'info');
+  showNotification('Subject deleted successfully.', 'info');
   renderSubjectsPage(document.getElementById('contentBody'));
 
   saveSchoolDataToStorage();
