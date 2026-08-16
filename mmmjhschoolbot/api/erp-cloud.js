@@ -919,6 +919,79 @@ async function upsertStudentLink({ admissionNo, chatId, username, student }) {
   return { ok: true, admission_no, school_bot_chat_id: base.school_bot_chat_id };
 }
 
+/**
+ * Staff self-link for @mmmjhschoolbot:
+ * verify ERP username+password, then store telegramChatId on staffUsers in cloud snapshot.
+ * Teachers are NOT on the Students Google Sheet.
+ */
+async function upsertStaffTelegramLink({ username, password, chatId, telegramUserName, unlink }) {
+  if (!isConfigured()) return { ok: false, error: 'Cloud ERP is not configured on the bot server.' };
+  const schoolId = schoolIdDefault();
+  const user = await authenticateStaffPassword(schoolId, username, password);
+  if (!user) {
+    return { ok: false, error: 'Invalid staff username or password. Use your ERP login (User Management).' };
+  }
+
+  const snapshot = await readSnapshot(schoolId);
+  if (!snapshot || !snapshot.payload || typeof snapshot.payload !== 'object') {
+    return { ok: false, error: 'School cloud snapshot not found. Ask office to open ERP once so staff users sync to cloud.' };
+  }
+
+  const payload = { ...snapshot.payload };
+  const staff = Array.isArray(payload.staffUsers) ? payload.staffUsers.map((u) => ({ ...u })) : [];
+  const key = normalizeUsername(user.username || user.id);
+  const idx = staff.findIndex((u) =>
+    normalizeUsername(u?.username) === key || normalizeUsername(u?.id) === key
+  );
+  if (idx < 0) {
+    return { ok: false, error: 'Staff user not found in cloud snapshot.' };
+  }
+
+  const cleanChat = String(chatId || '').trim();
+  if (!unlink && !/^-?\d{7,15}$/.test(cleanChat)) {
+    return { ok: false, error: 'Invalid Telegram chat ID.' };
+  }
+
+  // One Telegram chat → one staff login (clear from others)
+  if (!unlink && cleanChat) {
+    staff.forEach((u, i) => {
+      if (i === idx) return;
+      if (String(u.telegramChatId || '').trim() === cleanChat) {
+        u.telegramChatId = '';
+        u.telegramUserName = '';
+      }
+    });
+  }
+
+  if (unlink) {
+    staff[idx].telegramChatId = '';
+    staff[idx].telegramUserName = '';
+  } else {
+    staff[idx].telegramChatId = cleanChat;
+    staff[idx].telegramUserName = String(telegramUserName || '').trim();
+  }
+
+  payload.staffUsers = staff;
+  payload.savedAt = new Date().toISOString();
+  await writeSnapshot(schoolId, payload, `telegram-staff-link:${staff[idx].username || staff[idx].id}`);
+
+  return {
+    ok: true,
+    unlinked: !!unlink,
+    staff: publicStaffUser(staff[idx])
+  };
+}
+
+async function findStaffByTelegramChatId(chatId) {
+  if (!isConfigured()) return null;
+  const cleanChat = String(chatId || '').trim();
+  if (!cleanChat) return null;
+  const snapshot = await readSnapshot(schoolIdDefault());
+  const staff = Array.isArray(snapshot?.payload?.staffUsers) ? snapshot.payload.staffUsers : [];
+  const hit = staff.find((u) => String(u.telegramChatId || '').trim() === cleanChat);
+  return hit ? publicStaffUser(hit) : null;
+}
+
 async function listNativeStudents(schoolId) {
   const sid = encodeURIComponent(schoolId || schoolIdDefault());
   const rows = await supabaseRequest(
@@ -1424,6 +1497,8 @@ async function erpCloudHandler(req, res) {
 }
 
 erpCloudHandler.upsertStudentLink = upsertStudentLink;
+erpCloudHandler.upsertStaffTelegramLink = upsertStaffTelegramLink;
+erpCloudHandler.findStaffByTelegramChatId = findStaffByTelegramChatId;
 erpCloudHandler.isConfigured = isConfigured;
 erpCloudHandler.listNativeStudents = listNativeStudents;
 erpCloudHandler.route = route;

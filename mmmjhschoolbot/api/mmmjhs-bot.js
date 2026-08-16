@@ -405,7 +405,7 @@ function classSection(row) {
 function helpMessage(name) {
   return `Welcome to ${SCHOOL_NAME}!
 
-Hello ${name || 'Parent'}!
+Hello ${name || 'Parent / Staff'}!
 This is the official school ERP message bot.
 
 Parents - link for school messages:
@@ -423,6 +423,11 @@ Example: /fees 2507
 
 Check which child is linked to this chat:
 /whoami
+
+Teachers / Staff - link THIS phone (not on Google Sheet):
+/stafflink <ERP username> <ERP password>
+Example: /stafflink arunima MyPass123
+/staffunlink <ERP username> <ERP password>
 
 Attendance card commands are handled by the separate attendance bot only.`;
 }
@@ -640,6 +645,15 @@ async function handleWhoAmI(chatId, from) {
   const wanted = String(chatId || '').trim();
   const username = getTelegramName(from);
   const byAdmission = new Map();
+  let staffHit = null;
+
+  if (erpCloud && typeof erpCloud.findStaffByTelegramChatId === 'function' && erpCloud.isConfigured()) {
+    try {
+      staffHit = await erpCloud.findStaffByTelegramChatId(wanted);
+    } catch (error) {
+      console.error('Whoami staff lookup failed:', error.message);
+    }
+  }
 
   // Students tab is the source of truth for office Chat ID paste + /link.
   try {
@@ -666,13 +680,15 @@ async function handleWhoAmI(chatId, from) {
   }
 
   const linked = Array.from(byAdmission.values());
-  if (!linked.length) {
-    await sendTelegram(chatId, `No Student Linked\n\nDear ${username}, this chat is not linked with any ERP student yet.\n\nSend /register <Admission No> to link, or ask the school office to paste your Chat ID on the Students sheet.`);
-    await logEvent(chatId, username, 'whoami', '', 'Not Linked', 'Whoami: no Students-tab Chat ID match');
+  if (!linked.length && !staffHit) {
+    await sendTelegram(
+      chatId,
+      `Nothing Linked\n\nDear ${username}, this chat is not linked yet.\n\nParents: /register <Admission No>\nTeachers/Staff: /stafflink <ERP username> <ERP password>`
+    );
+    await logEvent(chatId, username, 'whoami', '', 'Not Linked', 'Whoami: no student or staff Chat ID match');
     return;
   }
 
-  // Mirror Students links onto Registrations so office can verify there.
   for (const student of linked) {
     try {
       await upsertRegistrationLink(student, wanted, student.TelegramUserName || username, 'Telegram /whoami (Students)');
@@ -681,18 +697,83 @@ async function handleWhoAmI(chatId, from) {
     }
   }
 
-  await sendTelegram(
-    chatId,
-    `Linked Student(s)\n\n${linked.map((row) => `Admission ${row.AdmissionNo}: ${row.StudentName} (${classSection(row)})`).join('\n')}`
-  );
+  const parts = [];
+  if (staffHit) {
+    parts.push(
+      `Staff Link\nName: ${staffHit.name || ''}\nUsername: ${staffHit.username || ''}\nRole: ${staffHit.role || 'Staff'}`
+    );
+  }
+  if (linked.length) {
+    parts.push(
+      `Linked Student(s)\n${linked.map((row) => `Admission ${row.AdmissionNo}: ${row.StudentName} (${classSection(row)})`).join('\n')}`
+    );
+  }
+
+  await sendTelegram(chatId, parts.join('\n\n'));
   await logEvent(
     chatId,
     username,
     'whoami',
-    linked.map((r) => r.AdmissionNo).join(','),
+    [staffHit ? `staff:${staffHit.username || staffHit.id}` : '', linked.map((r) => r.AdmissionNo).join(',')].filter(Boolean).join('|'),
     'Verified',
-    `Whoami: ${linked.length} student(s) from Students; wrote Registrations`
+    `Whoami: staff=${!!staffHit}; students=${linked.length}`
   );
+}
+
+async function handleStaffLink(chatId, from, username, password, command) {
+  const displayName = getTelegramName(from);
+  if (!username || !password) {
+    await sendTelegram(
+      chatId,
+      `Staff Telegram Link\n\nUsage:\n/${command} <ERP username> <ERP password>\nExample: /${command} arunima MyPass123\n\nTeachers are linked to ERP User Management — not the Students Google Sheet.`
+    );
+    return;
+  }
+
+  if (!erpCloud || typeof erpCloud.upsertStaffTelegramLink !== 'function' || !erpCloud.isConfigured()) {
+    await sendTelegram(chatId, `Staff link is unavailable: cloud ERP is not configured on the bot server. Ask the office.`);
+    return;
+  }
+
+  const unlink = command === 'staffunlink' || command === 'unlinkstaff';
+  let result;
+  try {
+    result = await erpCloud.upsertStaffTelegramLink({
+      username,
+      password,
+      chatId,
+      telegramUserName: displayName,
+      unlink
+    });
+  } catch (error) {
+    console.error('Staff telegram link failed:', error.message);
+    await sendTelegram(chatId, `Staff link failed: ${error.message}`);
+    await logEvent(chatId, displayName, command, username, 'Error', error.message);
+    return;
+  }
+
+  if (!result || !result.ok) {
+    const msg = (result && result.error) || 'Could not link staff Telegram.';
+    await sendTelegram(chatId, `Staff Link Failed\n\n${msg}`);
+    await logEvent(chatId, displayName, command, username, 'Rejected', msg);
+    return;
+  }
+
+  const staff = result.staff || {};
+  if (unlink) {
+    await sendTelegram(
+      chatId,
+      `Staff Telegram Unlinked\n\n${staff.name || username} (@${staff.username || username}) is no longer linked to this phone.\nRole: ${staff.role || 'Staff'}`
+    );
+    await logEvent(chatId, displayName, command, username, 'Unlinked', `Staff ${staff.username || username}`);
+    return;
+  }
+
+  await sendTelegram(
+    chatId,
+    `Staff Telegram Linked\n\nDear ${staff.name || displayName}, this phone is now linked as school staff.\n\nUsername: ${staff.username || username}\nRole: ${staff.role || 'Staff'}\n\nYou can receive login credentials and staff notices on @mmmjhschoolbot.\nParents still use /link AdmissionNo — that is separate.`
+  );
+  await logEvent(chatId, displayName, command, username, 'Linked', `Staff ${staff.username || username} (${staff.role || ''})`);
 }
 
 async function handleTelegramUpdate(update) {
@@ -711,6 +792,12 @@ async function handleTelegramUpdate(update) {
     await sendTelegram(chatId, helpMessage(getTelegramName(from)));
     await logEvent(chatId, getTelegramName(from), effectiveCommand, '', 'Help Sent', 'Help menu sent');
     return;
+  }
+
+  if (['stafflink', 'linkstaff', 'teacherlink', 'staffunlink', 'unlinkstaff'].includes(effectiveCommand)) {
+    const staffUser = String(parts[1] || '').trim();
+    const staffPass = parts.slice(2).join(' ').trim();
+    return handleStaffLink(chatId, from, staffUser, staffPass, effectiveCommand);
   }
 
   if (['register', 'link', 'start'].includes(effectiveCommand)) return handleRegister(chatId, from, admissionNo, effectiveCommand);

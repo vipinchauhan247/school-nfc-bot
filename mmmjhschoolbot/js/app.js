@@ -3671,7 +3671,7 @@ function renderUsersPage(container) {
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-user-shield" style="color:#38bdf8"></i> User Management & Staff Rights Directory</h2>
-        <p class="page-subtitle">Main System Directory - Manage Staff Accounts (Salesman, Teachers, Accountant) & Configure Revenue, Dues & Fee Visibility</p>
+        <p class="page-subtitle">Staff Telegram is <strong>not</strong> on the Students Google Sheet. Teachers link with @mmmjhschoolbot: <code>/stafflink username password</code></p>
       </div>
       <button class="btn btn-primary" onclick="openAddNewUserModal()"><i class="fa-solid fa-user-plus"></i> Add New Staff User Account</button>
     </div>
@@ -3698,6 +3698,7 @@ function renderUsersPage(container) {
               <th style="text-align:left; padding:12px;">Staff ID</th>
               <th style="text-align:left; padding:12px;">Role / Designation</th>
               <th style="text-align:left; padding:12px; background:rgba(2, 132, 199, 0.2); color:#38bdf8;">Username & Password</th>
+              <th style="text-align:left; padding:12px; background:rgba(56, 189, 248, 0.15); color:#38bdf8;">Telegram Chat ID</th>
               <th style="text-align:left; padding:12px; background:rgba(99, 102, 241, 0.2); color:#818cf8;">Teacher Subject Mappings</th>
               <th style="padding:12px; background:rgba(16, 185, 129, 0.2); color:#34d399;">Collect Fees & Ledger</th>
               <th style="padding:12px; background:rgba(16, 185, 129, 0.15); color:#34d399;">View Total Revenue</th>
@@ -3729,6 +3730,19 @@ function renderUsersPage(container) {
                       <button type="button" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem; margin-left:6px;" onclick="toggleStaffPasswordVisible('${u.id}')">Show</button>
                       <button type="button" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem;" onclick="copyStaffLoginCredentials('${u.id}')">Copy</button>
                     ` : `<code style="color:#64748b; font-weight:bold;">••••••••</code>`}
+                  </td>
+
+                  <!-- TELEGRAM CHAT ID (staff self-link via bot, or admin paste) -->
+                  <td style="text-align:left; padding:12px; min-width:160px;">
+                    ${u.telegramChatId
+                      ? `<code style="color:#34d399; font-weight:700;">${escapeHtml(String(u.telegramChatId))}</code>
+                         <div style="font-size:0.72rem; color:#94a3b8; margin-top:4px;">${escapeHtml(u.telegramUserName || 'Linked')}</div>`
+                      : `<span style="color:#fbbf24; font-size:0.8rem;">Not linked</span>`}
+                    <div style="margin-top:6px; display:flex; gap:4px; flex-wrap:wrap;">
+                      <button type="button" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem;" onclick="editStaffTelegramChatId('${u.id}')">Set Chat ID</button>
+                      ${u.telegramChatId ? `<button type="button" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem; color:#f87171;" onclick="clearStaffTelegramChatId('${u.id}')">Clear</button>` : ''}
+                    </div>
+                    <div style="font-size:0.68rem; color:#64748b; margin-top:4px;">Self-link: /stafflink ${escapeHtml(u.username || '')} &lt;password&gt;</div>
                   </td>
 
                   <!-- TEACHER SUBJECT MAPPINGS SINGLE SOURCE OF TRUTH -->
@@ -4631,13 +4645,59 @@ function repairMissingTeacherStaffAccounts() {
   return false;
 }
 
+function editStaffTelegramChatId(userId) {
+  const u = (SchoolData.staffUsers || []).find((x) => x.id === userId);
+  if (!u) return;
+  const current = String(u.telegramChatId || '').trim();
+  const next = window.prompt(
+    `Paste Telegram Chat ID for ${u.name} (@${u.username || ''}).\n\nPrefer self-link: teacher opens @mmmjhschoolbot and sends\n/stafflink ${u.username || 'username'} <password>`,
+    current
+  );
+  if (next === null) return;
+  const clean = String(next).trim();
+  if (clean && !/^-?\d{7,15}$/.test(clean)) {
+    showNotification('Chat ID must be a numeric Telegram ID (7–15 digits).', 'error');
+    return;
+  }
+  // One chat → one staff user
+  if (clean) {
+    (SchoolData.staffUsers || []).forEach((other) => {
+      if (other.id !== u.id && String(other.telegramChatId || '').trim() === clean) {
+        other.telegramChatId = '';
+        other.telegramUserName = '';
+      }
+    });
+  }
+  u.telegramChatId = clean;
+  if (!clean) u.telegramUserName = '';
+  saveSchoolDataToStorage();
+  showNotification(
+    clean
+      ? `Telegram Chat ID saved for ${u.name}.`
+      : `Telegram Chat ID cleared for ${u.name}.`,
+    'success'
+  );
+  renderUsersPage(document.getElementById('contentBody'));
+}
+
+function clearStaffTelegramChatId(userId) {
+  const u = (SchoolData.staffUsers || []).find((x) => x.id === userId);
+  if (!u) return;
+  if (!window.confirm(`Clear Telegram Chat ID for ${u.name}?`)) return;
+  u.telegramChatId = '';
+  u.telegramUserName = '';
+  saveSchoolDataToStorage();
+  showNotification(`Telegram unlinked for ${u.name}.`, 'info');
+  renderUsersPage(document.getElementById('contentBody'));
+}
+
 function sendStaffCredentialsViaTelegram(userId) {
   const u = SchoolData.staffUsers.find(x => x.id === userId);
   if (!u) return;
 
   const chatId = u.telegramChatId || "";
   if (!chatId) {
-    showNotification(`No Telegram Chat ID saved for ${u.name}. Open staff profile and add the real ID first.`, 'warning');
+    showNotification(`No Telegram Chat ID for ${u.name}. Ask them to send /stafflink ${u.username || 'username'} <password> to @mmmjhschoolbot, or use Set Chat ID.`, 'warning');
     return;
   }
   const msgText = `*Staff Login Credentials Notice*\n\nDear *${u.name}*,\n\nYour ERP Staff Portal login credentials have been generated:\n\n- *Username:* \`${u.username || 'admin'}\`\n- *Password:* \`${u.password || 'teacher123'}\`\n- *Assigned Role:* ${u.role}\n- *Assigned Subject:* ${u.assignedSubject || 'ALL'}\n\nWebsite Portal: https://mmmjhschool.com`;
@@ -4673,7 +4733,7 @@ function sendStaffTelegramMessage() {
     return;
   }
   if (!user.telegramChatId) {
-    showNotification(`No Telegram Chat ID saved for ${user.name}. Import it by CSV or add it in the staff record first.`, 'warning');
+    showNotification(`No Telegram Chat ID for ${user.name}. Ask them to /stafflink on @mmmjhschoolbot, or Set Chat ID in User Management.`, 'warning');
     return;
   }
 
