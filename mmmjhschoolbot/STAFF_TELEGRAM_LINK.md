@@ -25,9 +25,10 @@ Unlink:
 Uses Students Google Sheet. Separate from staff.
 
 ## Office / ERP
-- **User Management** shows Telegram Chat ID column (Linked / Not linked).
-- Admin can **Set Chat ID** manually if needed.
-- **Telegram** button (send credentials) works only after Chat ID is linked.
+- **User Management** → **Telegram Chat ID** column
+- Admin can **paste Chat ID** and click **Save** (no Google Sheet)
+- Or teacher self-links with `/stafflink`
+- **Telegram** button (send credentials) works after Chat ID is saved
 
 ## Deploy
 1. **Render** (bot): upload/redeploy
