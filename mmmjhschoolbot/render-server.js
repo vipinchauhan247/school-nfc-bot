@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const zlib = require('zlib');
 const { URL } = require('url');
 
 const botHandler = require('./api/mmmjhs-bot');
@@ -84,13 +85,51 @@ function readBody(req) {
   });
 }
 
+/**
+ * Gzip JSON API responses. Snapshot payloads compress by roughly 85%, which is
+ * the difference between megabytes and kilobytes on every sync.
+ * Applied only to the API paths, where handlers use setHeader (not writeHead).
+ */
+function withGzip(req, res) {
+  if (!/\bgzip\b/i.test(String(req.headers['accept-encoding'] || ''))) return res;
+  const originalEnd = res.end.bind(res);
+  res.end = function gzipEnd(chunk, encoding, callback) {
+    if (!chunk || res.headersSent || req.method === 'HEAD') {
+      return originalEnd(chunk, encoding, callback);
+    }
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8');
+    if (buf.length < 1024) return originalEnd(buf);
+    zlib.gzip(buf, (err, compressed) => {
+      if (err) return originalEnd(buf);
+      try {
+        res.setHeader('Content-Encoding', 'gzip');
+        res.setHeader('Vary', 'Accept-Encoding');
+        res.removeHeader('Content-Length');
+      } catch (e) {
+        return originalEnd(buf);
+      }
+      originalEnd(compressed);
+    });
+    return res;
+  };
+  return res;
+}
+
 const server = http.createServer(async (req, res) => {
   const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
+
+  // Uptime monitors should hit this, not a data endpoint.
+  if (parsedUrl.pathname === '/api/health' || parsedUrl.pathname === '/healthz') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end('{"ok":true}');
+    return;
+  }
 
   if (parsedUrl.pathname === '/api/mmmjhs-bot' || parsedUrl.pathname === '/api/erp-cloud') {
     try {
       req.query = Object.fromEntries(parsedUrl.searchParams.entries());
       req.body = req.method === 'POST' ? await readBody(req) : {};
+      withGzip(req, res);
       if (parsedUrl.pathname === '/api/erp-cloud' && erpCloudHandler) {
         await erpCloudHandler(req, res);
       } else {
