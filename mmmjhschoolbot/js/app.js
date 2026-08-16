@@ -168,6 +168,14 @@ function canCurrentUserManageSchoolProfile() {
   return role.includes('admin');
 }
 
+function absoluteAssetUrl(relativePath) {
+  try {
+    return new URL(relativePath, window.location.href).href;
+  } catch (e) {
+    return relativePath;
+  }
+}
+
 function getSchoolLogoHtml(size = 62) {
   const profile = getSchoolProfile();
   const logoSrc = profile.logoDataUrl || 'assets/school_logo.png';
@@ -1799,6 +1807,7 @@ function handleRouting() {
       case 'exams-report-cards': renderExamsReportCardsSubdirectoryPage(container); break;
       case 'exams-weightage': renderExamsWeightageSubdirectoryPage(container); break;
       case 'exams-schedule': renderExamSchedulePage(container); break;
+      case 'exams-admit-card': renderAdmitCardPage(container); break;
       case 'users': renderUsersPage(container); break;
       case 'login-audit': renderLoginAuditPage(container); break;
       case 'promotion': renderPromotionPage(container); break;
@@ -2277,10 +2286,18 @@ function renderDashboard(container) {
   const activeUser = getCurrentActiveUser();
   const isAdmin = activeUser && (activeUser.role === 'Super Admin' || activeUser.role === 'Principal');
   const isAccountant = activeUser && activeUser.role === 'Accountant';
-  const canSeeTotalDues = canUserViewSchoolTotalDues(activeUser);
+  // Pending Dues needs BOTH the fee-total right and the dashboard-card right
+  const canSeeTotalDues = canUserViewSchoolTotalDues(activeUser) && canUserSeeDashboardWidget('dash_pending_dues', activeUser);
   const canSeeTotalRevenue = canUserViewSchoolTotalRevenue(activeUser);
-  const canManageFees = isAdmin || isAccountant || activeUser?.canManageFees === true || hasUserAccessPermission(activeUser, 'fee_collection', 'view');
-  const canAdmitStudents = isAdmin || activeUser?.canAdmitStudents === true;
+  const canManageFees = (isAdmin || isAccountant || activeUser?.canManageFees === true || hasUserAccessPermission(activeUser, 'fee_collection', 'view'))
+    && canUserSeeDashboardWidget('dash_collect_fee_button', activeUser);
+  const canAdmitStudents = (isAdmin || activeUser?.canAdmitStudents === true)
+    && canUserSeeDashboardWidget('dash_new_admission_button', activeUser);
+  const showTotalStudents = canUserSeeDashboardWidget('dash_total_students', activeUser);
+  const showPresentToday = canUserSeeDashboardWidget('dash_present_today', activeUser);
+  const showAbsentToday = canUserSeeDashboardWidget('dash_absent_today', activeUser);
+  const showAttendancePreview = canUserSeeDashboardWidget('dash_attendance_preview', activeUser);
+  const showLeftStudents = canUserSeeDashboardWidget('dash_left_students_button', activeUser);
 
   container.innerHTML = `
     <div class="page-header">
@@ -2289,9 +2306,11 @@ function renderDashboard(container) {
         <p class="page-subtitle">Madan Mohan Malviya Junior High School - Session ${session}</p>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        ${showLeftStudents ? `
         <button class="btn btn-secondary" onclick="window.location.hash='left-students'" style="background:#475569; color:#ffffff; border:none; font-weight:bold;">
           <i class="fa-solid fa-user-clock"></i> Left / Inactive (${getLeftStudents().length})
         </button>
+        ` : ''}
         ${canManageFees ? `
           <button class="btn btn-primary" style="background:linear-gradient(135deg, #10b981 0%, #059669 100%); color:#ffffff; border:none; font-weight:800; padding:10px 18px; display:flex; align-items:center; gap:8px;" onclick="openQuickFeeSelectModal()"><i class="fa-solid fa-indian-rupee-sign"></i> Collect Fee Now</button>
         ` : ''}
@@ -2320,6 +2339,7 @@ function renderDashboard(container) {
     </div>
 
     <div class="grid-4" style="margin-bottom: 24px;">
+      ${showTotalStudents ? `
       <div class="glass-card kpi-card">
         <div class="kpi-icon-box purple"><i class="fa-solid fa-users"></i></div>
         <div class="kpi-data">
@@ -2327,6 +2347,8 @@ function renderDashboard(container) {
           <span class="kpi-label">Total Enrolled (${session})</span>
         </div>
       </div>
+      ` : ''}
+      ${showPresentToday ? `
       <div class="glass-card kpi-card">
         <div class="kpi-icon-box green"><i class="fa-solid fa-user-check"></i></div>
         <div class="kpi-data">
@@ -2334,6 +2356,8 @@ function renderDashboard(container) {
           <span class="kpi-label">Present Today (${attendancePercent}%)</span>
         </div>
       </div>
+      ` : ''}
+      ${showAbsentToday ? `
       <div class="glass-card kpi-card">
         <div class="kpi-icon-box red"><i class="fa-solid fa-user-xmark"></i></div>
         <div class="kpi-data">
@@ -2341,6 +2365,7 @@ function renderDashboard(container) {
           <span class="kpi-label">Absent Today</span>
         </div>
       </div>
+      ` : ''}
       ${canSeeTotalDues ? `
         <div class="glass-card kpi-card">
           <div class="kpi-icon-box amber"><i class="fa-solid fa-indian-rupee-sign"></i></div>
@@ -2349,26 +2374,19 @@ function renderDashboard(container) {
             <span class="kpi-label">Pending Dues (${session})</span>
           </div>
         </div>
-      ` : canSeeTotalRevenue ? `
-        <div class="glass-card kpi-card">
-          <div class="kpi-icon-box amber"><i class="fa-solid fa-sack-dollar"></i></div>
-          <div class="kpi-data">
-            <span class="kpi-value">Granted</span>
-            <span class="kpi-label">Revenue view (see Fees / Receipts)</span>
-          </div>
-        </div>
-      ` : `
+      ` : ''}
+      ${!showTotalStudents && !showPresentToday && !showAbsentToday && !canSeeTotalDues ? `
         <div class="glass-card kpi-card">
           <div class="kpi-icon-box cyan"><i class="fa-solid fa-award"></i></div>
           <div class="kpi-data">
             <span class="kpi-value">Active</span>
-            <span class="kpi-label">${(activeUser?.role || 'Staff')} Portal</span>
+            <span class="kpi-label">${escapeHtml(activeUser?.role || 'Staff')} Portal</span>
           </div>
         </div>
-      `}
+      ` : ''}
     </div>
 
-    <div>
+    <div style="${showAttendancePreview ? '' : 'display:none;'}">
       <div class="glass-card" style="width:100%;">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
           <h3><i class="fa-solid fa-clipboard-user" style="color:var(--accent-cyan)"></i> Attendance Register Preview (${session})</h3>
@@ -2792,23 +2810,7 @@ function renderExamsPage(container, mode = 'entry') {
       </div>
     </div>
 
-    <!-- SUB-DIRECTORY NAVIGATION TABS -->
-    <div style="display:flex; gap:12px; margin-bottom:20px; border-bottom:2px solid var(--border-color); padding-bottom:12px; flex-wrap:wrap;">
-      <button class="btn btn-primary" style="padding:10px 20px; font-size:0.95rem; font-weight:700;" onclick="window.location.hash='exams-entry'">
-        <i class="fa-solid fa-table-cells"></i> Marks Entry Broadsheet
-      </button>
-      <button class="btn btn-secondary" style="padding:10px 20px; font-size:0.95rem; font-weight:700; background:rgba(16, 185, 129, 0.15); color:#34d399; border:1px solid #34d399;" onclick="window.location.hash='exams-report-cards'">
-        <i class="fa-solid fa-award"></i> Report Cards & Ranks
-      </button>
-      ${(getCurrentActiveUser().role === 'Super Admin' || getCurrentActiveUser().role === 'Principal') ? `
-        <button class="btn btn-secondary" style="padding:10px 20px; font-size:0.95rem; font-weight:700; background:rgba(245, 158, 11, 0.15); color:#f59e0b; border:1px solid #f59e0b;" onclick="window.location.hash='exams-weightage'">
-          <i class="fa-solid fa-sliders"></i> Subject Exam Marks & Weightage
-        </button>
-        <button class="btn btn-secondary" style="padding:10px 20px; font-size:0.95rem; font-weight:700; background:rgba(56, 189, 248, 0.15); color:#38bdf8; border:1px solid #38bdf8;" onclick="window.location.hash='users'">
-          <i class="fa-solid fa-user-shield"></i> User Rights & Permissions
-        </button>
-      ` : ''}
-    </div>
+    ${getExamsSubNavHtml('exams-entry')}
 
     <!-- ACTIVE USER PERMISSION STATUS BANNER -->
     <div style="padding:12px 18px; background:rgba(56, 189, 248, 0.12); border:1px solid #38bdf8; border-radius:12px; color:#38bdf8; font-weight:700; font-size:0.88rem; margin-bottom:16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
@@ -3252,15 +3254,7 @@ function renderExamsWeightageSubdirectoryPage(container) {
       <button class="btn btn-primary" onclick="window.location.hash='exams-entry'"><i class="fa-solid fa-table-cells"></i> Open Marks Sheet</button>
     </div>
 
-    <!-- SUB-DIRECTORY NAVIGATION TABS -->
-    <div style="display:flex; gap:12px; margin-bottom:20px; border-bottom:2px solid var(--border-color); padding-bottom:12px; flex-wrap:wrap;">
-      <button class="btn btn-secondary" style="padding:10px 20px; font-size:0.95rem; font-weight:700;" onclick="window.location.hash='exams-entry'">
-        <i class="fa-solid fa-table-cells"></i> Marks Entry Broadsheet
-      </button>
-      <button class="btn btn-primary" style="padding:10px 20px; font-size:0.95rem; font-weight:700; background:linear-gradient(135deg, #f59e0b 0%, #d97706 100%); border:none;" onclick="window.location.hash='exams-weightage'">
-        <i class="fa-solid fa-sliders"></i> Subject Exam Marks & Weightage
-      </button>
-    </div>
+    ${getExamsSubNavHtml('exams-weightage')}
 
     <div class="glass-card" style="max-width:1180px; margin:0 auto; border:2px solid #f59e0b; padding:24px;">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; flex-wrap:wrap; gap:16px;">
@@ -3428,23 +3422,7 @@ function renderExamsStructureSubdirectoryPage(container) {
       <button class="btn btn-primary" onclick="window.location.hash='exams-entry'"><i class="fa-solid fa-table-cells"></i> Open Marks Sheet</button>
     </div>
 
-    <!-- SUB-DIRECTORY NAVIGATION TABS -->
-    <div style="display:flex; gap:12px; margin-bottom:20px; border-bottom:2px solid var(--border-color); padding-bottom:12px; flex-wrap:wrap;">
-      <button class="btn btn-secondary" style="padding:10px 20px; font-size:0.95rem; font-weight:700;" onclick="window.location.hash='exams-entry'">
-        <i class="fa-solid fa-table-cells"></i> Marks Entry Broadsheet
-      </button>
-      <button class="btn btn-primary" style="padding:10px 20px; font-size:0.95rem; font-weight:700; background:linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%); border:none;" onclick="window.location.hash='exams-structure'">
-        <i class="fa-solid fa-sliders"></i> Class Subject Setup & Max Marks
-      </button>
-      <button class="btn btn-secondary" style="padding:10px 20px; font-size:0.95rem; font-weight:700; background:rgba(16, 185, 129, 0.15); color:#34d399; border:1px solid #34d399;" onclick="window.location.hash='exams-report-cards'">
-        <i class="fa-solid fa-award"></i> Report Cards & Ranks
-      </button>
-      ${(getCurrentActiveUser().role === 'Super Admin' || getCurrentActiveUser().role === 'Principal') ? `
-        <button class="btn btn-secondary" style="padding:10px 20px; font-size:0.95rem; font-weight:700; background:rgba(245, 158, 11, 0.15); color:#f59e0b; border:1px solid #f59e0b;" onclick="window.location.hash='exams-weightage'">
-          <i class="fa-solid fa-sliders"></i> Subject Exam Marks & Weightage
-        </button>
-      ` : ''}
-    </div>
+    ${getExamsSubNavHtml('exams-weightage')}
 
     <div class="glass-card" style="max-width:960px; margin:0 auto; border:2px solid #8b5cf6; padding:24px;">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; flex-wrap:wrap; gap:16px; border-bottom:1px solid #334155; padding-bottom:16px;">
@@ -3646,20 +3624,7 @@ function renderExamsReportCardsSubdirectoryPage(container) {
       </div>
     </div>
 
-    <!-- SUB-DIRECTORY NAVIGATION TABS -->
-    <div style="display:flex; gap:12px; margin-bottom:20px; border-bottom:2px solid var(--border-color); padding-bottom:12px; flex-wrap:wrap;">
-      <button class="btn btn-secondary" style="padding:10px 20px; font-size:0.95rem; font-weight:700;" onclick="window.location.hash='exams-entry'">
-        <i class="fa-solid fa-table-cells"></i> Marks Entry Broadsheet
-      </button>
-      <button class="btn btn-primary" style="padding:10px 20px; font-size:0.95rem; font-weight:700; background:linear-gradient(135deg, #10b981 0%, #059669 100%); border:none;" onclick="window.location.hash='exams-report-cards'">
-        <i class="fa-solid fa-award"></i> Class Report Cards & Ranks
-      </button>
-      ${(getCurrentActiveUser().role === 'Super Admin' || getCurrentActiveUser().role === 'Principal') ? `
-        <button class="btn btn-secondary" style="padding:10px 20px; font-size:0.95rem; font-weight:700; background:rgba(245, 158, 11, 0.15); color:#f59e0b; border:1px solid #f59e0b;" onclick="window.location.hash='exams-weightage'">
-          <i class="fa-solid fa-sliders"></i> Subject Exam Marks & Weightage
-        </button>
-      ` : ''}
-    </div>
+    ${getExamsSubNavHtml('exams-report-cards')}
 
     <div class="glass-card" style="margin-bottom:24px; padding:20px; border:2px solid #10b981;">
       <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px; margin-bottom:20px;">
@@ -3778,6 +3743,7 @@ function renderUsersPage(container) {
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
         <button class="btn btn-secondary" onclick="refreshStaffTelegramLinksFromCloud()"><i class="fa-solid fa-cloud-arrow-down"></i> Refresh Telegram Links</button>
+        <button class="btn btn-primary" style="background:linear-gradient(135deg, #a855f7 0%, #7c3aed 100%); border:none;" onclick="window.activeAccessTab='dashboard'; openRolePermissionsModal()"><i class="fa-solid fa-users-gear"></i> Role Permissions</button>
         <button class="btn btn-primary" onclick="openAddNewUserModal()"><i class="fa-solid fa-user-plus"></i> Add New Staff User Account</button>
       </div>
     </div>
@@ -3924,32 +3890,118 @@ function renderUsersPage(container) {
   `;
 }
 
+/** Shared sub-nav for every Exams directory page. */
+function getExamsSubNavHtml(active) {
+  const tabs = [
+    { hash: 'exams-entry', icon: 'fa-table-cells', label: 'Marks Entry' },
+    { hash: 'exams-weightage', icon: 'fa-sliders', label: 'Subject Marks & Weightage' },
+    { hash: 'exams-report-cards', icon: 'fa-award', label: 'Report Cards' },
+    { hash: 'exams-schedule', icon: 'fa-calendar-days', label: 'Exam Schedule' },
+    { hash: 'exams-admit-card', icon: 'fa-id-card', label: 'Admit Card' }
+  ];
+  return `
+    <div style="display:flex; gap:12px; margin-bottom:20px; border-bottom:2px solid var(--border-color); padding-bottom:12px; flex-wrap:wrap;">
+      ${tabs.map(t => `
+        <button class="btn ${t.hash === active ? 'btn-primary' : 'btn-secondary'}" onclick="window.location.hash='${t.hash}'">
+          <i class="fa-solid ${t.icon}"></i> ${t.label}
+        </button>
+      `).join('')}
+    </div>
+  `;
+}
+
+const ERP_EXAM_TERM_PRESETS = ['UT1', 'UT2', 'Half-Yearly', 'UT3', 'UT4', 'Final Annual'];
+
+function getExamScheduleTerms() {
+  const used = (SchoolData.examSchedules || []).map(r => String(r.term || '').trim()).filter(Boolean);
+  return [...new Set([...ERP_EXAM_TERM_PRESETS, ...used])];
+}
+
+function examScheduleSectionMatches(rowSection, section) {
+  const rs = String(rowSection || 'ALL').trim().toUpperCase();
+  const want = String(section || 'ALL').trim().toUpperCase();
+  if (!rs || rs === 'ALL') return true;
+  if (!want || want === 'ALL') return true;
+  return rs === want;
+}
+
+/** Date sheet rows for one class (each class has its own schedule), sorted by date+time. */
+function getExamScheduleForClass(term, className, section = 'ALL') {
+  const wantTerm = String(term || '').trim().toLowerCase();
+  const wantClass = String(className || '').trim().toLowerCase();
+  return (SchoolData.examSchedules || [])
+    .filter(r => String(r.term || '').trim().toLowerCase() === wantTerm)
+    .filter(r => String(r.className || '').trim().toLowerCase() === wantClass)
+    .filter(r => examScheduleSectionMatches(r.section, section))
+    .slice()
+    .sort((a, b) => `${a.date || ''} ${a.startTime || ''}`.localeCompare(`${b.date || ''} ${b.startTime || ''}`));
+}
+
+function formatExamDateWithDay(dateStr) {
+  const raw = String(dateStr || '').trim();
+  if (!raw) return { date: '—', day: '' };
+  const d = new Date(`${raw}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return { date: raw, day: '' };
+  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  return {
+    date: `${dd}-${mm}-${d.getFullYear()}`,
+    day: d.toLocaleDateString('en-IN', { weekday: 'short' })
+  };
+}
+
+function formatExamTimeRange(row) {
+  const s = String(row?.startTime || '').trim();
+  const e = String(row?.endTime || '').trim();
+  if (!s && !e) return '—';
+  if (s && e) return `${s} – ${e}`;
+  return s || e;
+}
+
 function renderExamSchedulePage(container) {
   if (!Array.isArray(SchoolData.examSchedules)) SchoolData.examSchedules = [];
+  const filterClass = window.examScheduleFilterClass || 'ALL';
+  const filterTerm = window.examScheduleFilterTerm || 'ALL';
+  const terms = getExamScheduleTerms();
+  const rows = SchoolData.examSchedules
+    .map((row, idx) => ({ row, idx }))
+    .filter(({ row }) => filterClass === 'ALL' || String(row.className || '').trim() === filterClass)
+    .filter(({ row }) => filterTerm === 'ALL' || String(row.term || '').trim() === filterTerm);
+
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-calendar-days" style="color:#38bdf8"></i> Exam Schedule Directory</h2>
-        <p class="page-subtitle">Create and maintain exam date sheets for UT, Half-Yearly and Final Annual exams.</p>
+        <p class="page-subtitle">Each class has its own date sheet. Rows saved here are printed on Admit Cards for that class.</p>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
         <button class="btn btn-secondary" onclick="exportExamScheduleCsv()" style="background:#16a34a; color:#ffffff; border:none; font-weight:800; white-space:nowrap;">
           <i class="fa-solid fa-file-csv"></i> Export Schedule CSV
         </button>
+        <button class="btn btn-secondary" onclick="openCopyExamScheduleModal()"><i class="fa-solid fa-copy"></i> Copy To Another Class</button>
         <button class="btn btn-primary" onclick="addExamScheduleRow()">
           <i class="fa-solid fa-plus"></i> Add Exam Row
         </button>
       </div>
     </div>
 
-    <div style="display:flex; gap:12px; margin-bottom:20px; border-bottom:2px solid var(--border-color); padding-bottom:12px; flex-wrap:wrap;">
-      <button class="btn btn-secondary" onclick="window.location.hash='exams-entry'"><i class="fa-solid fa-table-cells"></i> Marks Entry</button>
-      <button class="btn btn-secondary" onclick="window.location.hash='exams-weightage'"><i class="fa-solid fa-sliders"></i> Subject Marks & Weightage</button>
-      <button class="btn btn-secondary" onclick="window.location.hash='exams-report-cards'"><i class="fa-solid fa-award"></i> Report Cards</button>
-      <button class="btn btn-primary" onclick="window.location.hash='exams-schedule'"><i class="fa-solid fa-calendar-days"></i> Exam Schedule</button>
-    </div>
+    ${getExamsSubNavHtml('exams-schedule')}
 
     <div class="glass-card" style="border:2px solid #38bdf8; padding:22px;">
+      <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:16px;">
+        <label style="font-weight:700; color:#38bdf8; font-size:0.85rem;">Class:</label>
+        <select class="session-dropdown" style="width:190px; font-weight:700;" onchange="window.examScheduleFilterClass=this.value; renderExamSchedulePage(document.getElementById('contentBody'))">
+          <option value="ALL" ${filterClass === 'ALL' ? 'selected' : ''}>All Classes</option>
+          ${getSchoolClassNames().map(c => `<option value="${escapeHtml(c)}" ${filterClass === c ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('')}
+        </select>
+        <label style="font-weight:700; color:#38bdf8; font-size:0.85rem;">Exam Term:</label>
+        <select class="session-dropdown" style="width:190px; font-weight:700;" onchange="window.examScheduleFilterTerm=this.value; renderExamSchedulePage(document.getElementById('contentBody'))">
+          <option value="ALL" ${filterTerm === 'ALL' ? 'selected' : ''}>All Terms</option>
+          ${terms.map(t => `<option value="${escapeHtml(t)}" ${filterTerm === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}
+        </select>
+        <span class="badge badge-info">${rows.length} row(s)</span>
+      </div>
+
       <div class="data-table-container" style="overflow-x:auto;">
         <table class="data-table" style="min-width:980px;">
           <thead>
@@ -3966,12 +4018,24 @@ function renderExamSchedulePage(container) {
             </tr>
           </thead>
           <tbody>
-            ${SchoolData.examSchedules.length ? SchoolData.examSchedules.map((row, idx) => `
+            ${rows.length ? rows.map(({ row, idx }) => `
               <tr>
-                <td><input class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="term" value="${escapeHtml(row.term || '')}" placeholder="UT1 / Half-Yearly / Final"></td>
-                <td><input class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="className" value="${escapeHtml(row.className || '')}" placeholder="Class 5"></td>
-                <td><input class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="section" value="${escapeHtml(row.section || 'ALL')}" placeholder="ALL"></td>
-                <td><input class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="subject" value="${escapeHtml(row.subject || '')}" placeholder="Subject"></td>
+                <td>
+                  <input list="examTermPresets" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="term" value="${escapeHtml(row.term || '')}" placeholder="UT1 / Half-Yearly">
+                </td>
+                <td>
+                  <select class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="className">
+                    ${getClassSelectOptionsHtml(row.className || '')}
+                  </select>
+                </td>
+                <td>
+                  <select class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="section">
+                    ${['ALL', 'A', 'B', 'C', 'D'].map(sec => `<option value="${sec}" ${String(row.section || 'ALL').toUpperCase() === sec ? 'selected' : ''}>${sec === 'ALL' ? 'All Sections' : `Section ${sec}`}</option>`).join('')}
+                  </select>
+                </td>
+                <td>
+                  <input list="examSubjectPresets" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="subject" value="${escapeHtml(row.subject || '')}" placeholder="Subject">
+                </td>
                 <td><input type="date" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="date" value="${escapeHtml(row.date || '')}"></td>
                 <td><input type="time" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="startTime" value="${escapeHtml(row.startTime || '')}"></td>
                 <td><input type="time" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="endTime" value="${escapeHtml(row.endTime || '')}"></td>
@@ -3979,16 +4043,18 @@ function renderExamSchedulePage(container) {
                 <td><button class="btn btn-danger" style="padding:6px 10px; font-size:0.78rem;" onclick="deleteExamScheduleRow(${idx})"><i class="fa-solid fa-trash"></i> Delete</button></td>
               </tr>
             `).join('') : `
-              <tr><td colspan="9" style="text-align:center; padding:30px; color:var(--text-muted);">No exam schedule rows yet. Add the first row.</td></tr>
+              <tr><td colspan="9" style="text-align:center; padding:30px; color:var(--text-muted);">No exam rows for this filter. Click Add Exam Row.</td></tr>
             `}
           </tbody>
         </table>
       </div>
-      <div style="display:flex; justify-content:flex-end; margin-top:18px;">
+
+      <datalist id="examTermPresets">${getExamScheduleTerms().map(t => `<option value="${escapeHtml(t)}"></option>`).join('')}</datalist>
+      <datalist id="examSubjectPresets">${(SchoolData.subjects || []).map(s => `<option value="${escapeHtml(s.name || '')}"></option>`).join('')}</datalist>
+
+      <div style="display:flex; justify-content:flex-end; margin-top:18px; gap:10px;">
+        <button class="btn btn-secondary" onclick="window.location.hash='exams-admit-card'"><i class="fa-solid fa-id-card"></i> Print Admit Cards</button>
         <button class="btn btn-primary" onclick="saveExamScheduleRows()"><i class="fa-solid fa-floppy-disk"></i> Save Exam Schedule</button>
-      </div>
-      <div style="margin-top:14px; padding:12px; border-radius:10px; background:rgba(56,189,248,0.1); border:1px solid #38bdf8; color:var(--text-main); font-size:0.86rem;">
-        Backend Google Sheet tab suggestion: <strong>Exam_Schedule_Messages</strong>. The VPS bot can log when this schedule is sent to parents.
       </div>
     </div>
   `;
@@ -3996,9 +4062,16 @@ function renderExamSchedulePage(container) {
 
 function addExamScheduleRow() {
   if (!Array.isArray(SchoolData.examSchedules)) SchoolData.examSchedules = [];
+  saveExamScheduleRows({ silent: true });
+  const filterClass = window.examScheduleFilterClass && window.examScheduleFilterClass !== 'ALL'
+    ? window.examScheduleFilterClass
+    : 'Class 5';
+  const filterTerm = window.examScheduleFilterTerm && window.examScheduleFilterTerm !== 'ALL'
+    ? window.examScheduleFilterTerm
+    : 'UT1';
   SchoolData.examSchedules.push({
-    term: 'UT1',
-    className: 'Class 5',
+    term: filterTerm,
+    className: filterClass,
     section: 'ALL',
     subject: '',
     date: '',
@@ -4010,15 +4083,76 @@ function addExamScheduleRow() {
   renderExamSchedulePage(document.getElementById('contentBody'));
 }
 
-function saveExamScheduleRows() {
+function openCopyExamScheduleModal() {
+  const terms = getExamScheduleTerms();
+  const classes = getSchoolClassNames();
+  document.getElementById('copyExamScheduleModal')?.remove();
+  document.body.insertAdjacentHTML('beforeend', `
+    <div class="modal-overlay active" id="copyExamScheduleModal" style="z-index:99999;">
+      <div class="modal-box" style="max-width:520px; background:#0f172a; border:2px solid #38bdf8; padding:22px; border-radius:16px;">
+        <h3 style="margin:0 0 6px 0; color:#38bdf8;"><i class="fa-solid fa-copy"></i> Copy Date Sheet To Another Class</h3>
+        <p style="font-size:0.82rem; color:#94a3b8; margin:0 0 16px 0;">Copies subjects, dates and times. Adjust the new class afterwards if its papers differ.</p>
+        <div style="display:flex; flex-direction:column; gap:12px;">
+          <div>
+            <label style="font-size:0.8rem; font-weight:700; color:#cbd5e1;">Exam Term</label>
+            <select id="copySchedTerm" class="session-dropdown" style="width:100%;">
+              ${terms.map(t => `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`).join('')}
+            </select>
+          </div>
+          <div>
+            <label style="font-size:0.8rem; font-weight:700; color:#cbd5e1;">Copy From Class</label>
+            <select id="copySchedFrom" class="session-dropdown" style="width:100%;">
+              ${classes.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('')}
+            </select>
+          </div>
+          <div>
+            <label style="font-size:0.8rem; font-weight:700; color:#cbd5e1;">Copy To Class</label>
+            <select id="copySchedTo" class="session-dropdown" style="width:100%;">
+              ${classes.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+        <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:18px;">
+          <button class="btn btn-secondary" onclick="document.getElementById('copyExamScheduleModal').remove()">Cancel</button>
+          <button class="btn btn-primary" onclick="copyExamScheduleToClass()"><i class="fa-solid fa-check"></i> Copy Rows</button>
+        </div>
+      </div>
+    </div>
+  `);
+}
+
+function copyExamScheduleToClass() {
+  const term = document.getElementById('copySchedTerm')?.value || '';
+  const from = document.getElementById('copySchedFrom')?.value || '';
+  const to = document.getElementById('copySchedTo')?.value || '';
+  if (!term || !from || !to || from === to) {
+    showNotification('Pick a term and two different classes.', 'warning');
+    return;
+  }
+  const source = getExamScheduleForClass(term, from, 'ALL');
+  if (!source.length) {
+    showNotification(`No ${term} rows found for ${from}.`, 'warning');
+    return;
+  }
+  source.forEach((row) => {
+    SchoolData.examSchedules.push({ ...row, className: to });
+  });
+  saveSchoolDataToStorage();
+  document.getElementById('copyExamScheduleModal')?.remove();
+  showNotification(`Copied ${source.length} ${term} row(s) from ${from} to ${to}.`, 'success');
+  renderExamSchedulePage(document.getElementById('contentBody'));
+}
+
+function saveExamScheduleRows(options = {}) {
   document.querySelectorAll('.exam-schedule-input').forEach(input => {
     const idx = Number(input.getAttribute('data-index'));
     const field = input.getAttribute('data-field');
     if (!SchoolData.examSchedules[idx]) return;
-    SchoolData.examSchedules[idx][field] = input.value.trim();
+    SchoolData.examSchedules[idx][field] = String(input.value || '').trim();
   });
+  if (options.silent) return;
   saveSchoolDataToStorage();
-  showNotification('Exam schedule saved.', 'success');
+  showNotification('Exam schedule saved. Admit cards will print these dates.', 'success');
   renderExamSchedulePage(document.getElementById('contentBody'));
 }
 
@@ -4027,6 +4161,307 @@ function deleteExamScheduleRow(index) {
   SchoolData.examSchedules.splice(index, 1);
   saveSchoolDataToStorage();
   renderExamSchedulePage(document.getElementById('contentBody'));
+}
+
+/* ============================================================================
+   SUB-DIRECTORY MODULE: ADMIT CARD WITH PRINTED DATE SHEET (#exams-admit-card)
+   Each class prints its own exam schedule on the card.
+   ============================================================================ */
+function renderAdmitCardPage(container) {
+  if (!Array.isArray(SchoolData.examSchedules)) SchoolData.examSchedules = [];
+  const activeUser = getCurrentActiveUser();
+  if (!hasUserAccessPermission(activeUser, 'admit_card_print', 'view')) {
+    container.innerHTML = `
+      <div class="page-header"><div><h2 class="page-title"><i class="fa-solid fa-id-card"></i> Admit Card</h2></div></div>
+      <div class="glass-card"><p style="margin:0; color:#fbbf24;">Access denied: admit card printing is not enabled for your account.</p></div>
+    `;
+    return;
+  }
+
+  const terms = getExamScheduleTerms();
+  const term = window.admitCardTerm || terms[0] || 'UT1';
+  const className = window.admitCardClass || getSchoolClassNames()[0] || 'Class 5';
+  const section = window.admitCardSection || 'ALL';
+  window.admitCardTerm = term;
+  window.admitCardClass = className;
+  window.admitCardSection = section;
+
+  const schedule = getExamScheduleForClass(term, className, section);
+  const students = getStudentsByActiveSession()
+    .filter(s => String(s.currentClass || s.class || '') === className)
+    .filter(s => section === 'ALL' || String(s.currentSection || s.section || '').toUpperCase() === section.toUpperCase())
+    .sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+
+  container.innerHTML = `
+    <div class="page-header">
+      <div>
+        <h2 class="page-title"><i class="fa-solid fa-id-card" style="color:#f472b6"></i> Admit Card</h2>
+        <p class="page-subtitle">Prints the exam date sheet of the selected class on each student's admit card. Set dates in Exam Schedule first.</p>
+      </div>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="window.location.hash='exams-schedule'"><i class="fa-solid fa-calendar-days"></i> Edit Date Sheet</button>
+        <button class="btn btn-primary" style="background:linear-gradient(135deg, #ec4899 0%, #be185d 100%); border:none;" onclick="printSelectedAdmitCards()"><i class="fa-solid fa-print"></i> Print Selected Admit Cards</button>
+      </div>
+    </div>
+
+    ${getExamsSubNavHtml('exams-admit-card')}
+
+    <div class="glass-card" style="border:2px solid #f472b6; padding:20px; margin-bottom:20px;">
+      <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+        <label style="font-weight:700; color:#f472b6; font-size:0.85rem;">Exam Term:</label>
+        <select class="session-dropdown" style="width:190px; font-weight:700;" onchange="window.admitCardTerm=this.value; renderAdmitCardPage(document.getElementById('contentBody'))">
+          ${terms.map(t => `<option value="${escapeHtml(t)}" ${t === term ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}
+        </select>
+
+        <label style="font-weight:700; color:#f472b6; font-size:0.85rem;">Class:</label>
+        <select class="session-dropdown" style="width:180px; font-weight:700;" onchange="window.admitCardClass=this.value; renderAdmitCardPage(document.getElementById('contentBody'))">
+          ${getSchoolClassNames().map(c => `<option value="${escapeHtml(c)}" ${c === className ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('')}
+        </select>
+
+        <label style="font-weight:700; color:#f472b6; font-size:0.85rem;">Section:</label>
+        <select class="session-dropdown" style="width:150px; font-weight:700;" onchange="window.admitCardSection=this.value; renderAdmitCardPage(document.getElementById('contentBody'))">
+          ${['ALL', 'A', 'B', 'C', 'D'].map(sec => `<option value="${sec}" ${sec === section ? 'selected' : ''}>${sec === 'ALL' ? 'All Sections' : `Section ${sec}`}</option>`).join('')}
+        </select>
+
+        <span class="badge ${schedule.length ? 'badge-success' : 'badge-warning'}">${schedule.length} paper(s) in date sheet</span>
+        <span class="badge badge-info">${students.length} student(s)</span>
+      </div>
+
+      ${!schedule.length ? `
+        <div style="margin-top:14px; padding:12px; border-radius:10px; background:rgba(245,158,11,0.12); border:1px solid #f59e0b; font-size:0.86rem;">
+          <i class="fa-solid fa-triangle-exclamation" style="color:#fbbf24;"></i>
+          No <strong>${escapeHtml(term)}</strong> date sheet for <strong>${escapeHtml(className)}</strong> yet.
+          Open <a href="#exams-schedule" style="color:#38bdf8;">Exam Schedule</a> and add rows — each class keeps its own dates.
+        </div>
+      ` : `
+        <div class="data-table-container" style="margin-top:16px;">
+          <table class="data-table" style="font-size:0.85rem;">
+            <thead><tr><th>Subject</th><th>Date</th><th>Day</th><th>Time</th><th>Max Marks</th></tr></thead>
+            <tbody>
+              ${schedule.map(r => {
+                const d = formatExamDateWithDay(r.date);
+                return `<tr>
+                  <td><strong>${escapeHtml(r.subject || '—')}</strong></td>
+                  <td>${d.date}</td>
+                  <td>${d.day || '—'}</td>
+                  <td>${escapeHtml(formatExamTimeRange(r))}</td>
+                  <td>${escapeHtml(String(r.maxMarks || '—'))}</td>
+                </tr>`;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>
+      `}
+    </div>
+
+    <div class="glass-card" style="padding:20px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; flex-wrap:wrap; gap:10px;">
+        <h3 style="margin:0; color:#38bdf8; font-family:var(--font-heading);"><i class="fa-solid fa-users"></i> Select Students</h3>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-secondary" onclick="toggleAllAdmitCardStudents(true)">Select All</button>
+          <button class="btn btn-secondary" onclick="toggleAllAdmitCardStudents(false)">Clear</button>
+        </div>
+      </div>
+
+      ${students.length ? `
+        <div class="data-table-container" style="max-height:420px; overflow-y:auto;">
+          <table class="data-table">
+            <thead>
+              <tr><th style="width:60px;">Print</th><th>Student</th><th>Father's Name</th><th>Admission No</th><th>Roll No</th><th>Class & Sec</th><th>Action</th></tr>
+            </thead>
+            <tbody>
+              ${students.map(s => `
+                <tr>
+                  <td><input type="checkbox" class="admit-card-chk" data-adm="${escapeHtml(String(s.admissionNo || ''))}" checked style="width:18px; height:18px; cursor:pointer;"></td>
+                  <td><strong style="color:#38bdf8;">${escapeHtml(s.name || '')}</strong></td>
+                  <td>${escapeHtml(s.parentName || '')}</td>
+                  <td><code>${escapeHtml(String(s.admissionNo || ''))}</code></td>
+                  <td>${escapeHtml(String(s.currentRollNo || s.rollNo || '—'))}</td>
+                  <td><span class="badge badge-purple">${escapeHtml(s.currentClass || '')} - ${escapeHtml(s.currentSection || '')}</span></td>
+                  <td><button class="btn btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="printSingleAdmitCard('${escapeHtml(String(s.admissionNo || ''))}')"><i class="fa-solid fa-print"></i> Print</button></td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      ` : `<p style="color:var(--text-muted); margin:0;">No students found in ${escapeHtml(className)}${section === 'ALL' ? '' : ` Section ${escapeHtml(section)}`} for this session.</p>`}
+    </div>
+  `;
+}
+
+function toggleAllAdmitCardStudents(checked) {
+  document.querySelectorAll('.admit-card-chk').forEach(box => { box.checked = !!checked; });
+}
+
+function buildAdmitCardHtml(student, term, schedule) {
+  const school = getSchoolProfile();
+  const session = SchoolData.activeSession || '';
+  const sigs = SchoolData.signatures || {};
+  const principalSig = school.principalSignatureDataUrl || sigs.principalSig || '';
+  // Print window is about:blank — relative asset paths would not resolve there.
+  const logo = school.logoDataUrl || absoluteAssetUrl('assets/school_logo.png');
+
+  const rowsHtml = schedule.length
+    ? schedule.map((r, i) => {
+        const d = formatExamDateWithDay(r.date);
+        return `
+          <tr>
+            <td style="text-align:center;">${i + 1}</td>
+            <td><strong>${escapeHtml(r.subject || '')}</strong></td>
+            <td style="text-align:center;">${d.date}</td>
+            <td style="text-align:center;">${d.day || ''}</td>
+            <td style="text-align:center;">${escapeHtml(formatExamTimeRange(r))}</td>
+            <td style="text-align:center;">${escapeHtml(String(r.maxMarks || ''))}</td>
+          </tr>
+        `;
+      }).join('')
+    : `<tr><td colspan="6" style="text-align:center; padding:14px; font-style:italic;">Date sheet not published yet.</td></tr>`;
+
+  return `
+    <div class="admit-card">
+      <div class="ac-head">
+        <img class="ac-logo" src="${logo}" alt="logo">
+        <div class="ac-school">
+          <h1>${escapeHtml(school.name)}</h1>
+          <p>${escapeHtml(school.address)}</p>
+          <h2>ADMIT CARD &mdash; ${escapeHtml(term)} (${escapeHtml(session)})</h2>
+        </div>
+      </div>
+
+      <table class="ac-info">
+        <tr>
+          <td><span>Student Name</span><strong>${escapeHtml(student.name || '')}</strong></td>
+          <td><span>Admission No</span><strong>${escapeHtml(String(student.admissionNo || ''))}</strong></td>
+        </tr>
+        <tr>
+          <td><span>Father's Name</span><strong>${escapeHtml(student.parentName || '')}</strong></td>
+          <td><span>Roll No</span><strong>${escapeHtml(String(student.currentRollNo || student.rollNo || '—'))}</strong></td>
+        </tr>
+        <tr>
+          <td><span>Class &amp; Section</span><strong>${escapeHtml(student.currentClass || '')} - ${escapeHtml(student.currentSection || '')}</strong></td>
+          <td><span>Date of Birth</span><strong>${escapeHtml(typeof formatDobToDDMMYYYY === 'function' ? formatDobToDDMMYYYY(student.dob) : (student.dob || '—'))}</strong></td>
+        </tr>
+      </table>
+
+      <div class="ac-section-title">Examination Date Sheet</div>
+      <table class="ac-sched">
+        <thead>
+          <tr><th style="width:8%;">#</th><th>Subject</th><th style="width:18%;">Date</th><th style="width:11%;">Day</th><th style="width:22%;">Time</th><th style="width:12%;">Max</th></tr>
+        </thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
+
+      <div class="ac-rules">
+        <strong>Instructions:</strong> Reach the exam hall 15 minutes early. Bring this admit card daily. Mobile phones and unfair means are strictly prohibited. Clear all pending dues before the exam.
+      </div>
+
+      <div class="ac-sign">
+        <div class="ac-sign-box">
+          <div class="ac-sign-line"></div>
+          <span>Class Teacher</span>
+        </div>
+        <div class="ac-sign-box">
+          ${principalSig ? `<img src="${principalSig}" class="ac-sign-img" alt="">` : `<div class="ac-sign-line"></div>`}
+          <span>Principal</span>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function getAdmitCardPrintStyles() {
+  return `
+    @page { size: A4 portrait; margin: 8mm; }
+    * { box-sizing: border-box; }
+    body { font-family: 'Inter', Arial, sans-serif; margin:0; background:#fff; color:#0f172a;
+      -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+    .admit-card { border:2px solid #0f172a; border-radius:6px; padding:10px 12px; margin-bottom:8mm;
+      height:138mm; display:flex; flex-direction:column; page-break-inside:avoid; }
+    .admit-card:nth-child(2n) { margin-bottom:0; page-break-after:always; }
+    .ac-head { display:flex; align-items:center; gap:10px; border-bottom:2px solid #0f172a; padding-bottom:6px; }
+    .ac-logo { width:54px; height:54px; object-fit:contain; }
+    .ac-school { text-align:center; flex:1; }
+    .ac-school h1 { margin:0; font-size:15px; letter-spacing:.3px; text-transform:uppercase; }
+    .ac-school p { margin:1px 0 3px; font-size:10px; color:#475569; }
+    .ac-school h2 { margin:0; font-size:12px; background:#0f172a; color:#fff; display:inline-block;
+      padding:2px 12px; border-radius:3px; letter-spacing:.5px; }
+    .ac-info { width:100%; border-collapse:collapse; margin-top:8px; }
+    .ac-info td { border:1px solid #cbd5e1; padding:4px 8px; width:50%; font-size:11px; }
+    .ac-info span { display:block; font-size:8.5px; text-transform:uppercase; color:#64748b; letter-spacing:.4px; }
+    .ac-info strong { font-size:11.5px; }
+    .ac-section-title { margin:8px 0 4px; font-size:10.5px; font-weight:800; text-transform:uppercase;
+      letter-spacing:.6px; border-left:4px solid #0f172a; padding-left:6px; }
+    .ac-sched { width:100%; border-collapse:collapse; }
+    .ac-sched th { background:#e2e8f0; border:1px solid #94a3b8; padding:3px 5px; font-size:9.5px; text-transform:uppercase; }
+    .ac-sched td { border:1px solid #cbd5e1; padding:3px 5px; font-size:10.5px; }
+    .ac-rules { margin-top:auto; padding-top:6px; font-size:8.6px; color:#334155; line-height:1.45; }
+    .ac-sign { display:flex; justify-content:space-between; margin-top:8px; }
+    .ac-sign-box { width:42%; text-align:center; }
+    .ac-sign-line { height:22px; border-bottom:1px solid #0f172a; }
+    .ac-sign-img { height:26px; object-fit:contain; display:block; margin:0 auto; }
+    .ac-sign-box span { font-size:9px; font-weight:700; display:block; margin-top:2px; }
+  `;
+}
+
+function openAdmitCardPrintWindow(cardsHtml, title) {
+  const printWindow = window.open('', '_blank', 'width=900,height=1200');
+  if (!printWindow) {
+    showNotification('Popup blocked. Allow popups for this site to print admit cards.', 'warning');
+    return;
+  }
+  printWindow.document.write(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>${title}</title>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+        <style>${getAdmitCardPrintStyles()}</style>
+      </head>
+      <body>
+        ${cardsHtml}
+        <script>
+          window.onload = function () {
+            setTimeout(function () { window.print(); }, 400);
+          };
+        <\/script>
+      </body>
+    </html>
+  `);
+  printWindow.document.close();
+}
+
+function printSingleAdmitCard(admissionNo) {
+  const term = window.admitCardTerm || 'UT1';
+  const student = getStudentsByActiveSession().find(s => String(s.admissionNo) === String(admissionNo));
+  if (!student) {
+    showNotification('Student not found.', 'error');
+    return;
+  }
+  const schedule = getExamScheduleForClass(term, student.currentClass || student.class, student.currentSection || 'ALL');
+  openAdmitCardPrintWindow(buildAdmitCardHtml(student, term, schedule), `Admit Card - ${student.name}`);
+}
+
+function printSelectedAdmitCards() {
+  const term = window.admitCardTerm || 'UT1';
+  const picked = Array.from(document.querySelectorAll('.admit-card-chk'))
+    .filter(box => box.checked)
+    .map(box => box.getAttribute('data-adm'));
+
+  if (!picked.length) {
+    showNotification('Tick at least one student to print.', 'warning');
+    return;
+  }
+
+  const all = getStudentsByActiveSession();
+  const cards = picked.map((adm) => {
+    const student = all.find(s => String(s.admissionNo) === String(adm));
+    if (!student) return '';
+    const schedule = getExamScheduleForClass(term, student.currentClass || student.class, student.currentSection || 'ALL');
+    return buildAdmitCardHtml(student, term, schedule);
+  }).filter(Boolean).join('');
+
+  openAdmitCardPrintWindow(cards, `Admit Cards - ${term} - ${window.admitCardClass || ''}`);
+  showNotification(`Prepared ${picked.length} admit card(s) for printing.`, 'success');
 }
 
 function currentSessionSafe() {
@@ -4056,6 +4491,16 @@ function exportExamScheduleCsv() {
    ENTERPRISE GRANULAR USER ACCESS RIGHTS MANAGER MODAL (MATCHING SCREENSHOTS)
    ============================================================================ */
 const ERP_MODULES_LIST = {
+  dashboard: [
+    { key: "dash_total_students", name: "Dashboard card: Total Enrolled Students", viewOnly: true },
+    { key: "dash_present_today", name: "Dashboard card: Present Today", viewOnly: true },
+    { key: "dash_absent_today", name: "Dashboard card: Absent Today", viewOnly: true },
+    { key: "dash_pending_dues", name: "Dashboard card: Pending Dues (school total)", viewOnly: true },
+    { key: "dash_attendance_preview", name: "Dashboard: Attendance Register Preview table", viewOnly: true },
+    { key: "dash_collect_fee_button", name: "Dashboard button: Collect Fee Now", viewOnly: true },
+    { key: "dash_new_admission_button", name: "Dashboard button: New Admission", viewOnly: true },
+    { key: "dash_left_students_button", name: "Dashboard button: Left / Inactive Students", viewOnly: true }
+  ],
   students: [
     { key: "student_admission", name: "Student Admission Registration (#admissions)" },
     { key: "student_directory", name: "Student Directory & Bio Details (#students)" },
@@ -4079,6 +4524,8 @@ const ERP_MODULES_LIST = {
     { key: "class_weightage_config", name: "Class Weightage Rules & Raw Test Config (#exams-weightage)" },
     { key: "class_subject_setup", name: "Class Exam Subject & Max Marks Setup (#exams-structure)" },
     { key: "report_cards_print", name: "Report Cards Printing & Class Ranks (#exams-report-cards)" },
+    { key: "exam_schedule_manage", name: "Exam Schedule / Date Sheet per Class (#exams-schedule)" },
+    { key: "admit_card_print", name: "Admit Card Printing with Date Sheet (#exams-admit-card)" },
     { key: "exam_exports", name: "Excel Export & Class Sheet Download" }
   ],
   faculty: [
@@ -4100,6 +4547,171 @@ const ERP_MODULES_LIST = {
 };
 
 window.activeAccessTab = 'students';
+
+const ERP_ACCESS_TAB_LABELS = {
+  dashboard: 'Dashboard Widgets',
+  students: 'Students & Admission',
+  fees: 'Fee & Receipts',
+  exams: 'Exams & Marks',
+  faculty: 'Faculty & Subjects',
+  master: 'Master Config'
+};
+
+function getAccessRightsTabBarHtml(activeTab, reopenCall) {
+  return `
+    <div style="display:flex; gap:8px; margin-bottom:16px; border-bottom:2px solid #334155; padding-bottom:10px; flex-wrap:wrap;">
+      ${Object.entries(ERP_ACCESS_TAB_LABELS).map(([key, label]) => `
+        <button class="btn ${activeTab === key ? 'btn-primary' : 'btn-secondary'}" style="padding:8px 16px; font-size:0.85rem; font-weight:700;" onclick="window.activeAccessTab='${key}'; ${reopenCall}">
+          ${label}
+        </button>
+      `).join('')}
+    </div>
+  `;
+}
+
+/** Shared permission grid. View-only modules (dashboard cards) hide Add/Modify/Delete. */
+function getAccessRightsGridHtml(modules, getRights) {
+  return `
+    <div style="background:#0f172a; border-radius:10px; border:1px solid #334155; overflow:auto; max-height:52vh; margin-bottom:18px;">
+      <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.88rem;">
+        <thead>
+          <tr style="background:#0284c7; color:#ffffff;">
+            <th style="text-align:left; padding:10px 16px;">Module Name</th>
+            <th style="padding:10px; width:96px;">View<br><button type="button" class="btn btn-secondary" style="padding:1px 6px; font-size:0.65rem; margin-top:3px;" onclick="toggleAccessRightsColumn('view')">All</button></th>
+            <th style="padding:10px; width:96px;">Add<br><button type="button" class="btn btn-secondary" style="padding:1px 6px; font-size:0.65rem; margin-top:3px;" onclick="toggleAccessRightsColumn('add')">All</button></th>
+            <th style="padding:10px; width:110px;">Modify / Edit<br><button type="button" class="btn btn-secondary" style="padding:1px 6px; font-size:0.65rem; margin-top:3px;" onclick="toggleAccessRightsColumn('modify')">All</button></th>
+            <th style="padding:10px; width:96px;">Delete<br><button type="button" class="btn btn-secondary" style="padding:1px 6px; font-size:0.65rem; margin-top:3px;" onclick="toggleAccessRightsColumn('delete')">All</button></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${modules.map(mod => {
+            const rights = getRights(mod.key) || { view: false, add: false, modify: false, delete: false };
+            const cell = (action) => mod.viewOnly && action !== 'view'
+              ? `<td style="padding:10px; color:#475569;">—</td>`
+              : `<td style="padding:10px;"><input type="checkbox" class="acc-right-chk" data-mod="${mod.key}" data-action="${action}" ${rights[action] ? 'checked' : ''} style="width:18px; height:18px; cursor:pointer;"></td>`;
+            return `
+              <tr style="border-bottom:1px solid #1e293b;">
+                <td style="text-align:left; padding:10px 16px;"><strong style="color:#ffffff;">${mod.name}</strong></td>
+                ${cell('view')}${cell('add')}${cell('modify')}${cell('delete')}
+              </tr>
+            `;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function toggleAccessRightsColumn(action) {
+  const boxes = Array.from(document.querySelectorAll(`.acc-right-chk[data-action="${action}"]`));
+  if (!boxes.length) return;
+  const turnOn = boxes.some(b => !b.checked);
+  boxes.forEach(b => { b.checked = turnOn; });
+}
+
+function collectAccessRightsFromGrid(existingRights) {
+  const rights = existingRights ? JSON.parse(JSON.stringify(existingRights)) : {};
+  document.querySelectorAll('.acc-right-chk').forEach((chk) => {
+    const modKey = chk.getAttribute('data-mod');
+    const action = chk.getAttribute('data-action');
+    if (!rights[modKey]) rights[modKey] = { view: false, add: false, modify: false, delete: false };
+    rights[modKey][action] = chk.checked;
+  });
+  return rights;
+}
+
+/* ============================================================================
+   ROLE PERMISSIONS — one screen sets rights for every user holding that role
+   ============================================================================ */
+function openRolePermissionsModal(roleName) {
+  if (!isErpAdminUser(getCurrentActiveUser())) {
+    showNotification('Only Super Admin / Principal can change role permissions.', 'warning');
+    return;
+  }
+  const roles = getErpRoleNames();
+  const role = roleName && roles.includes(roleName) ? roleName : (window.activeRolePermRole || roles[0]);
+  window.activeRolePermRole = role;
+
+  document.getElementById('rolePermissionsModal')?.remove();
+
+  const tab = window.activeAccessTab || 'dashboard';
+  const modules = ERP_MODULES_LIST[tab] || ERP_MODULES_LIST.dashboard;
+  const template = getRolePermissionTemplate(role);
+  const defaults = getDefaultAccessRightsForRole(role);
+  const memberCount = (SchoolData.staffUsers || []).filter(u => String(u.role || '').trim() === role).length;
+
+  const modalHtml = `
+    <div class="modal-overlay active" id="rolePermissionsModal" style="z-index:999999; backdrop-filter:blur(8px);">
+      <div class="modal-box" style="max-width:900px; width:96%; background:#0f172a; color:#ffffff; padding:24px; border-radius:18px; border:2px solid #a855f7; box-shadow:0 25px 50px -12px rgba(0,0,0,0.85);">
+        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; padding-bottom:14px; margin-bottom:16px;">
+          <h3 style="margin:0; color:#c084fc; font-size:1.25rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+            <i class="fa-solid fa-users-gear"></i> Role Permissions
+          </h3>
+          <button onclick="document.getElementById('rolePermissionsModal').remove()" style="background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer; font-size:1rem;">X</button>
+        </div>
+
+        <div style="display:flex; align-items:center; gap:14px; margin-bottom:8px; background:#1e293b; padding:12px 16px; border-radius:10px; border:1px solid #334155; flex-wrap:wrap;">
+          <label style="font-size:0.9rem; font-weight:700; color:#c084fc;">Role:</label>
+          <select id="rolePermRoleSelect" class="session-dropdown" style="width:260px; font-weight:700;" onchange="openRolePermissionsModal(this.value)">
+            ${roles.map(r => `<option value="${escapeHtml(r)}" ${r === role ? 'selected' : ''}>${escapeHtml(r)}</option>`).join('')}
+          </select>
+          <span class="badge badge-purple" style="font-size:0.8rem;">${memberCount} staff on this role</span>
+          <span class="badge ${template ? 'badge-success' : 'badge-warning'}" style="font-size:0.8rem;">${template ? 'Custom template saved' : 'Using role defaults'}</span>
+        </div>
+        <p style="font-size:0.78rem; color:#94a3b8; margin:0 0 14px 0;">
+          Set once here instead of per teacher. Saving applies to every staff account with this role. Individual staff can still be fine-tuned from <strong>Access Rights</strong>.
+        </p>
+
+        ${getAccessRightsTabBarHtml(tab, `openRolePermissionsModal('${String(role).replace(/'/g, "\\'")}')`)}
+
+        ${getAccessRightsGridHtml(modules, (key) => (template && template[key]) || defaults[key])}
+
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px;">
+          <div style="background:#1e293b; color:#fbbf24; padding:8px 16px; border-radius:8px; font-weight:700; font-size:0.82rem;">
+            <i class="fa-solid fa-triangle-exclamation"></i> Saving overwrites per-user rights for all ${memberCount} ${escapeHtml(role)} account(s).
+          </div>
+          <div style="display:flex; gap:10px;">
+            <button class="btn btn-secondary" onclick="resetRolePermissionTemplate('${String(role).replace(/'/g, "\\'")}')">Reset to default</button>
+            <button class="btn btn-secondary" onclick="document.getElementById('rolePermissionsModal').remove()">Cancel</button>
+            <button class="btn btn-primary" style="background:linear-gradient(135deg, #a855f7 0%, #7c3aed 100%); border:none; padding:10px 24px; font-weight:800;" onclick="saveRolePermissionsModal('${String(role).replace(/'/g, "\\'")}')">
+              Save & apply to all ${escapeHtml(role)}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.insertAdjacentHTML('beforeend', modalHtml);
+}
+
+function saveRolePermissionsModal(role) {
+  if (!isErpAdminUser(getCurrentActiveUser())) {
+    showNotification('Only Super Admin / Principal can change role permissions.', 'warning');
+    return;
+  }
+  const base = getRolePermissionTemplate(role) || getDefaultAccessRightsForRole(role);
+  const rights = collectAccessRightsFromGrid(base);
+  saveRolePermissionTemplate(role, rights);
+  const applied = applyRoleTemplateToUsers(role);
+
+  saveSchoolDataToStorage();
+  document.getElementById('rolePermissionsModal')?.remove();
+  showNotification(`Role permissions saved for ${role} — applied to ${applied} staff account(s).`, 'success');
+  if (document.getElementById('contentBody')) renderUsersPage(document.getElementById('contentBody'));
+}
+
+function resetRolePermissionTemplate(role) {
+  if (!window.confirm(`Reset ${role} back to built-in default permissions?`)) return;
+  const templates = getRolePermissionTemplates();
+  delete templates[String(role || '').trim()];
+  (SchoolData.staffUsers || []).forEach((u) => {
+    if (String(u.role || '').trim() !== String(role || '').trim()) return;
+    u.accessRights = getDefaultAccessRightsForRole(u.role);
+  });
+  saveSchoolDataToStorage();
+  showNotification(`${role} reset to default permissions.`, 'info');
+  openRolePermissionsModal(role);
+}
 
 function openUserAccessRightsModal(userId) {
   const user = SchoolData.staffUsers.find(u => u.id === userId) || SchoolData.staffUsers[0];
@@ -4137,61 +4749,9 @@ function openUserAccessRightsModal(userId) {
           <span class="badge badge-purple" style="font-size:0.8rem;">Role: ${user.role}</span>
         </div>
 
-        <!-- CATEGORIZED MODULE TABS MATCHING SCREENSHOT -->
-        <div style="display:flex; gap:8px; margin-bottom:16px; border-bottom:2px solid #334155; padding-bottom:10px; flex-wrap:wrap;">
-          <button class="btn ${tab === 'students' ? 'btn-primary' : 'btn-secondary'}" style="padding:8px 16px; font-size:0.85rem; font-weight:700;" onclick="window.activeAccessTab='students'; openUserAccessRightsModal('${user.id}')">
-            Students & Admission
-          </button>
-          <button class="btn ${tab === 'fees' ? 'btn-primary' : 'btn-secondary'}" style="padding:8px 16px; font-size:0.85rem; font-weight:700;" onclick="window.activeAccessTab='fees'; openUserAccessRightsModal('${user.id}')">
-            Fee & Receipts
-          </button>
-          <button class="btn ${tab === 'exams' ? 'btn-primary' : 'btn-secondary'}" style="padding:8px 16px; font-size:0.85rem; font-weight:700;" onclick="window.activeAccessTab='exams'; openUserAccessRightsModal('${user.id}')">
-            Exams & Marks
-          </button>
-          <button class="btn ${tab === 'faculty' ? 'btn-primary' : 'btn-secondary'}" style="padding:8px 16px; font-size:0.85rem; font-weight:700;" onclick="window.activeAccessTab='faculty'; openUserAccessRightsModal('${user.id}')">
-            Faculty & Subjects
-          </button>
-          <button class="btn ${tab === 'master' ? 'btn-primary' : 'btn-secondary'}" style="padding:8px 16px; font-size:0.85rem; font-weight:700;" onclick="window.activeAccessTab='master'; openUserAccessRightsModal('${user.id}')">
-            Master Config
-          </button>
-        </div>
+        ${getAccessRightsTabBarHtml(tab, `openUserAccessRightsModal('${user.id}')`)}
 
-        <!-- ACCESS RIGHTS GRID TABLE MATCHING SCREENSHOT -->
-        <div style="background:#0f172a; border-radius:10px; border:1px solid #334155; overflow:hidden; margin-bottom:18px;">
-          <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.88rem;">
-            <thead>
-              <tr style="background:#0284c7; color:#ffffff;">
-                <th style="text-align:left; padding:10px 16px;">Module Name</th>
-                <th style="padding:10px; width:100px;">View</th>
-                <th style="padding:10px; width:100px;">Add</th>
-                <th style="padding:10px; width:100px;">Modify / Edit</th>
-                <th style="padding:10px; width:100px;">Delete</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${modules.map(mod => {
-                const rights = (user.accessRights && user.accessRights[mod.key]) ? user.accessRights[mod.key] : { view: true, add: false, modify: false, delete: false };
-                return `
-                  <tr style="border-bottom:1px solid #1e293b;">
-                    <td style="text-align:left; padding:10px 16px;"><strong style="color:#ffffff;">${mod.name}</strong></td>
-                    <td style="padding:10px;">
-                      <input type="checkbox" class="acc-right-chk" data-mod="${mod.key}" data-action="view" ${rights.view ? 'checked' : ''} style="width:18px; height:18px; cursor:pointer;">
-                    </td>
-                    <td style="padding:10px;">
-                      <input type="checkbox" class="acc-right-chk" data-mod="${mod.key}" data-action="add" ${rights.add ? 'checked' : ''} style="width:18px; height:18px; cursor:pointer;">
-                    </td>
-                    <td style="padding:10px;">
-                      <input type="checkbox" class="acc-right-chk" data-mod="${mod.key}" data-action="modify" ${rights.modify ? 'checked' : ''} style="width:18px; height:18px; cursor:pointer;">
-                    </td>
-                    <td style="padding:10px;">
-                      <input type="checkbox" class="acc-right-chk" data-mod="${mod.key}" data-action="delete" ${rights.delete ? 'checked' : ''} style="width:18px; height:18px; cursor:pointer;">
-                    </td>
-                  </tr>
-                `;
-              }).join('')}
-            </tbody>
-          </table>
-        </div>
+        ${getAccessRightsGridHtml(modules, (key) => (user.accessRights && user.accessRights[key]) || getDefaultAccessRightsForRole(user.role)[key])}
 
         <!-- FOOTER ALERT & SAVE BUTTON MATCHING SCREENSHOT -->
         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px;">
@@ -4220,15 +4780,7 @@ function saveUserAccessRightsModal(userId) {
     user.accessRights = getDefaultAccessRightsForRole(user.role);
   }
 
-  const chks = document.querySelectorAll('.acc-right-chk');
-  chks.forEach(chk => {
-    const modKey = chk.getAttribute('data-mod');
-    const action = chk.getAttribute('data-action');
-    if (!user.accessRights[modKey]) {
-      user.accessRights[modKey] = { view: false, add: false, modify: false, delete: false };
-    }
-    user.accessRights[modKey][action] = chk.checked;
-  });
+  user.accessRights = collectAccessRightsFromGrid(user.accessRights);
 
   // Keep matrix flags in sync with Access Rights (real enforcement uses both)
   if (user.accessRights.total_revenue_view) {
@@ -4342,6 +4894,10 @@ function repairStaffFinancialVisibilityRights() {
   return changed;
 }
 
+/**
+ * Resolution order: user override → role template (set in Role Permissions) → role default.
+ * Unknown modules are denied so a new feature never leaks to every role.
+ */
 function hasUserAccessPermission(user, moduleKey, action = 'view') {
   if (!user) return false;
   if (isErpAdminUser(user)) return true;
@@ -4353,12 +4909,16 @@ function hasUserAccessPermission(user, moduleKey, action = 'view') {
     }
   }
 
+  const template = getRolePermissionTemplate(user.role);
+  if (template && template[moduleKey] && template[moduleKey][action] !== undefined) {
+    return !!template[moduleKey][action];
+  }
+
   const roleRights = getDefaultAccessRightsForRole(user.role);
   if (roleRights && roleRights[moduleKey] && roleRights[moduleKey][action] !== undefined) {
     return !!roleRights[moduleKey][action];
   }
 
-  // Deny by default — never grant unknown modules
   return false;
 }
 
@@ -4415,14 +4975,37 @@ function blockExamSheetExportIfDenied() {
   return true;
 }
 
+const ERP_DASHBOARD_WIDGET_DEFAULTS = {
+  'Super Admin': 'ALL',
+  Principal: 'ALL',
+  Accountant: ['dash_total_students', 'dash_pending_dues', 'dash_collect_fee_button', 'dash_left_students_button'],
+  Receptionist: ['dash_total_students', 'dash_present_today', 'dash_absent_today', 'dash_attendance_preview', 'dash_collect_fee_button', 'dash_new_admission_button'],
+  Teacher: ['dash_total_students', 'dash_present_today', 'dash_absent_today', 'dash_attendance_preview']
+};
+
+function getDefaultDashboardWidgetKeys(role) {
+  const roleStr = String(role || '');
+  if (roleStr === 'Super Admin' || roleStr === 'Principal') return 'ALL';
+  if (ERP_DASHBOARD_WIDGET_DEFAULTS[roleStr]) return ERP_DASHBOARD_WIDGET_DEFAULTS[roleStr];
+  if (roleStr.includes('Teacher')) return ERP_DASHBOARD_WIDGET_DEFAULTS.Teacher;
+  return ['dash_total_students', 'dash_present_today', 'dash_absent_today'];
+}
+
 function getDefaultAccessRightsForRole(role) {
   const isAdmin = role === 'Super Admin' || role === 'Principal';
   const isReceptionist = role === 'Receptionist';
   const isAccountant = role === 'Accountant';
-  const isTeacher = role.includes('Teacher');
+  const isTeacher = String(role || '').includes('Teacher');
+  const dashAllowed = getDefaultDashboardWidgetKeys(role);
+  const dashboardKeys = ERP_MODULES_LIST.dashboard.map(m => m.key);
 
   const base = {};
   Object.values(ERP_MODULES_LIST).flat().forEach(mod => {
+    if (dashboardKeys.includes(mod.key)) {
+      const allowed = dashAllowed === 'ALL' || dashAllowed.includes(mod.key);
+      base[mod.key] = { view: allowed, add: false, modify: false, delete: false };
+      return;
+    }
     if (isAdmin) {
       base[mod.key] = { view: true, add: true, modify: true, delete: true };
     } else if (isReceptionist) {
@@ -4433,7 +5016,7 @@ function getDefaultAccessRightsForRole(role) {
         base[mod.key] = { view: true, add: true, modify: false, delete: false };
       } else if (['total_revenue_view', 'total_dues_view', 'reports_analytics', 'fee_receipt_deletion'].includes(mod.key)) {
         base[mod.key] = { view: false, add: false, modify: false, delete: false };
-      } else if (mod.key === 'report_cards_print' || mod.key === 'exam_marks_entry') {
+      } else if (['report_cards_print', 'exam_marks_entry', 'admit_card_print'].includes(mod.key)) {
         base[mod.key] = { view: true, add: false, modify: false, delete: false };
       } else {
         base[mod.key] = { view: false, add: false, modify: false, delete: false };
@@ -4447,7 +5030,7 @@ function getDefaultAccessRightsForRole(role) {
     } else if (isTeacher) {
       if (['exam_marks_entry', 'report_cards_print', 'exam_exports', 'attendance_register', 'student_directory'].includes(mod.key)) {
         base[mod.key] = { view: true, add: true, modify: true, delete: false };
-      } else if (['teacher_subject_mappings', 'timetable_management'].includes(mod.key)) {
+      } else if (['teacher_subject_mappings', 'timetable_management', 'exam_schedule_manage', 'admit_card_print'].includes(mod.key)) {
         base[mod.key] = { view: true, add: false, modify: false, delete: false };
       } else {
         base[mod.key] = { view: false, add: false, modify: false, delete: false };
@@ -4458,6 +5041,58 @@ function getDefaultAccessRightsForRole(role) {
   });
 
   return base;
+}
+
+/* ============================================================================
+   ROLE PERMISSION TEMPLATES — set once per role, every user of that role follows
+   ============================================================================ */
+const ERP_ROLE_LIST = ['Super Admin', 'Principal', 'Accountant', 'Receptionist', 'Class Teacher & Subject Teacher', 'Subject Teacher'];
+
+function getErpRoleNames() {
+  const fromUsers = (SchoolData.staffUsers || []).map(u => String(u.role || '').trim()).filter(Boolean);
+  return [...new Set([...ERP_ROLE_LIST, ...fromUsers])];
+}
+
+function getRolePermissionTemplates() {
+  if (!SchoolData.rolePermissionTemplates || typeof SchoolData.rolePermissionTemplates !== 'object') {
+    SchoolData.rolePermissionTemplates = {};
+  }
+  return SchoolData.rolePermissionTemplates;
+}
+
+function getRolePermissionTemplate(role) {
+  const templates = getRolePermissionTemplates();
+  const key = String(role || '').trim();
+  return templates[key] || null;
+}
+
+function saveRolePermissionTemplate(role, rights) {
+  const templates = getRolePermissionTemplates();
+  templates[String(role || '').trim()] = rights;
+}
+
+/** Push a role template onto every staff user holding that role. */
+function applyRoleTemplateToUsers(role) {
+  const template = getRolePermissionTemplate(role);
+  if (!template) return 0;
+  let count = 0;
+  (SchoolData.staffUsers || []).forEach((u) => {
+    if (String(u.role || '').trim() !== String(role || '').trim()) return;
+    u.accessRights = JSON.parse(JSON.stringify(template));
+    u.viewTotalRevenue = !!template.total_revenue_view?.view;
+    u.viewDueBalance = !!template.total_dues_view?.view;
+    u.canManageFees = !!(template.fee_collection?.view || template.fee_collection?.add);
+    u.canAdmitStudents = !!template.student_admission?.add;
+    u.canAccessTelegramBot = !!template.telegram_bot_admin?.view;
+    count += 1;
+  });
+  return count;
+}
+
+function canUserSeeDashboardWidget(widgetKey, user = getCurrentActiveUser()) {
+  if (!user) return false;
+  if (isErpAdminUser(user)) return true;
+  return hasUserAccessPermission(user, widgetKey, 'view') === true;
 }
 
 function staffUsernameFromName(name) {
