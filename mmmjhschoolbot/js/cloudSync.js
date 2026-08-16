@@ -841,9 +841,9 @@
       handleRouting();
       return;
     }
-    // Silent live sync: still refresh fee/receipt screens so other PCs see new slips
+    // Silent live sync: still refresh fee/receipt/users screens so staff Telegram links appear
     const hash = String(window.location.hash || '').toLowerCase();
-    if (/receipt|fee|dashboard|student|backup/.test(hash)) {
+    if (/receipt|fee|dashboard|student|backup|users/.test(hash)) {
       handleRouting();
     }
   }

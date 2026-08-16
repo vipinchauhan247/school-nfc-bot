@@ -229,9 +229,44 @@ async function preserveSnapshotStaffPasswords(schoolId, payload) {
   });
   const next = { ...payload };
   next.staffUsers = payload.staffUsers.map(user => {
-    if (user?.password) return user;
     const previous = byKey.get(normalizeUsername(user?.id)) || byKey.get(normalizeUsername(user?.username));
-    return previous?.password ? { ...user, password: previous.password } : user;
+    let merged = user;
+    if (!user?.password && previous?.password) {
+      merged = { ...merged, password: previous.password };
+    }
+    if (!previous) return merged;
+    const localChat = String(merged.telegramChatId || '').trim();
+    const remoteChat = String(previous.telegramChatId || '').trim();
+    // Never blank a Telegram self-link just because a stale ERP tab pushed without it.
+    if (!localChat && remoteChat) {
+      merged = {
+        ...merged,
+        telegramChatId: remoteChat,
+        telegramUserName: merged.telegramUserName || previous.telegramUserName || '',
+        telegramLinkSource: previous.telegramLinkSource || merged.telegramLinkSource || '',
+        telegramLinkedAt: previous.telegramLinkedAt || merged.telegramLinkedAt || ''
+      };
+    } else if (localChat && remoteChat && localChat !== remoteChat) {
+      const localAt = Date.parse(merged.telegramLinkedAt || '') || 0;
+      const remoteAt = Date.parse(previous.telegramLinkedAt || '') || 0;
+      if (remoteAt > localAt) {
+        merged = {
+          ...merged,
+          telegramChatId: remoteChat,
+          telegramUserName: previous.telegramUserName || '',
+          telegramLinkSource: previous.telegramLinkSource || '',
+          telegramLinkedAt: previous.telegramLinkedAt || ''
+        };
+      }
+    } else if (localChat && remoteChat && localChat === remoteChat) {
+      merged = {
+        ...merged,
+        telegramUserName: merged.telegramUserName || previous.telegramUserName || '',
+        telegramLinkSource: merged.telegramLinkSource || previous.telegramLinkSource || '',
+        telegramLinkedAt: merged.telegramLinkedAt || previous.telegramLinkedAt || ''
+      };
+    }
+    return merged;
   });
   return next;
 }
@@ -966,9 +1001,13 @@ async function upsertStaffTelegramLink({ username, password, chatId, telegramUse
   if (unlink) {
     staff[idx].telegramChatId = '';
     staff[idx].telegramUserName = '';
+    staff[idx].telegramLinkSource = '';
+    staff[idx].telegramLinkedAt = '';
   } else {
     staff[idx].telegramChatId = cleanChat;
     staff[idx].telegramUserName = String(telegramUserName || '').trim();
+    staff[idx].telegramLinkSource = 'Telegram /stafflink';
+    staff[idx].telegramLinkedAt = new Date().toISOString();
   }
 
   payload.staffUsers = staff;

@@ -3671,9 +3671,12 @@ function renderUsersPage(container) {
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-user-shield" style="color:#38bdf8"></i> User Management & Staff Rights Directory</h2>
-        <p class="page-subtitle">Staff Telegram is <strong>not</strong> on the Students Google Sheet. Teachers link with @mmmjhschoolbot: <code>/stafflink username password</code></p>
+        <p class="page-subtitle">Staff Telegram is <strong>not</strong> on the Students Google Sheet. Teachers: <code>/stafflink username password</code> on @mmmjhschoolbot — Chat ID then appears here after cloud refresh.</p>
       </div>
-      <button class="btn btn-primary" onclick="openAddNewUserModal()"><i class="fa-solid fa-user-plus"></i> Add New Staff User Account</button>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="refreshStaffTelegramLinksFromCloud()"><i class="fa-solid fa-cloud-arrow-down"></i> Refresh Telegram Links</button>
+        <button class="btn btn-primary" onclick="openAddNewUserModal()"><i class="fa-solid fa-user-plus"></i> Add New Staff User Account</button>
+      </div>
     </div>
 
     <!-- USER STAFF RIGHTS PERMISSION CHECKBOX MATRIX -->
@@ -3740,7 +3743,9 @@ function renderUsersPage(container) {
                       ${u.telegramChatId ? `<button type="button" class="btn btn-secondary" style="padding:3px 8px; font-size:0.7rem; color:#f87171;" onclick="clearStaffTelegramChatId('${u.id}')">Clear</button>` : ''}
                     </div>
                     <div style="font-size:0.72rem; margin-top:4px; color:${u.telegramChatId ? '#34d399' : '#fbbf24'};">
-                      ${u.telegramChatId ? `Linked${u.telegramUserName ? ' · ' + escapeHtml(u.telegramUserName) : ''}` : 'Not linked — admin can paste here'}
+                      ${u.telegramChatId
+                        ? `Linked${u.telegramUserName ? ' · ' + escapeHtml(u.telegramUserName) : ''}${String(u.telegramLinkSource || '').includes('stafflink') ? ' · via Telegram' : ' · in ERP'}`
+                        : 'Not linked — admin can paste here'}
                     </div>
                     <div style="font-size:0.68rem; color:#64748b; margin-top:2px;">Or teacher: /stafflink ${escapeHtml(u.username || '')} &lt;password&gt;</div>
                   </td>
@@ -4659,11 +4664,20 @@ function saveStaffTelegramChatIdFromInput(userId) {
       if (other.id !== u.id && String(other.telegramChatId || '').trim() === clean) {
         other.telegramChatId = '';
         other.telegramUserName = '';
+        other.telegramLinkSource = '';
+        other.telegramLinkedAt = '';
       }
     });
   }
   u.telegramChatId = clean;
-  if (!clean) u.telegramUserName = '';
+  if (!clean) {
+    u.telegramUserName = '';
+    u.telegramLinkSource = '';
+    u.telegramLinkedAt = '';
+  } else {
+    u.telegramLinkSource = 'ERP User Management';
+    u.telegramLinkedAt = new Date().toISOString();
+  }
   saveSchoolDataToStorage();
   showNotification(
     clean ? `Telegram Chat ID saved for ${u.name} in ERP.` : `Telegram Chat ID cleared for ${u.name}.`,
@@ -4683,11 +4697,33 @@ function clearStaffTelegramChatId(userId) {
   if (!window.confirm(`Clear Telegram Chat ID for ${u.name}?`)) return;
   u.telegramChatId = '';
   u.telegramUserName = '';
+  u.telegramLinkSource = '';
+  u.telegramLinkedAt = '';
   const input = document.getElementById(`staffTgChat_${userId}`);
   if (input) input.value = '';
   saveSchoolDataToStorage();
   showNotification(`Telegram unlinked for ${u.name}.`, 'info');
   renderUsersPage(document.getElementById('contentBody'));
+}
+
+async function refreshStaffTelegramLinksFromCloud() {
+  showNotification('Refreshing staff Telegram links from cloud…', 'info');
+  try {
+    if (typeof pullSchoolDataFromCloud === 'function') {
+      await pullSchoolDataFromCloud({ force: true });
+    } else if (typeof window.pullSchoolDataFromCloud === 'function') {
+      await window.pullSchoolDataFromCloud({ force: true });
+    } else {
+      showNotification('Cloud sync not loaded. Refresh the page, then try again.', 'warning');
+      return;
+    }
+    const linked = (SchoolData.staffUsers || []).filter((u) => String(u.telegramChatId || '').trim()).length;
+    showNotification(`Staff Telegram links updated from cloud (${linked} linked).`, 'success');
+    renderUsersPage(document.getElementById('contentBody'));
+  } catch (err) {
+    console.error(err);
+    showNotification(`Cloud refresh failed: ${err.message || err}`, 'error');
+  }
 }
 
 function sendStaffCredentialsViaTelegram(userId) {
