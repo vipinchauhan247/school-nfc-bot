@@ -34,7 +34,13 @@ Admin can also paste Chat ID and click **Save** (shows **in ERP**).
 1. **Render** (bot): upload/redeploy
    - `api/mmmjhs-bot.js`
    - `api/erp-cloud.js`
-2. **Vercel** (website): upload `js/app.js` and bump `?v=`
+2. **Vercel** (website): upload `js/app.js` and bump `?v=` (example `?v=20260816_pass_show`)
 3. Do **not** touch @Vipinbellbot / NFC bot.
+
+## Staff password Show (User Management)
+Cloud stores **hashed** passwords — old ones cannot be recovered.
+After **Reset Pass** or **Add User**, a popup shows Username + Password with **Copy login**.
+That plaintext is kept only on this office browser so **Show / Copy** work after refresh.
+If the row says “Secure in cloud”, click **Reset Pass**, set a new password (min 8), then use Show.
 
 Requires Render env: Supabase + `ERP_CLOUD_SCHOOL_ID` (same as ERP cloud).

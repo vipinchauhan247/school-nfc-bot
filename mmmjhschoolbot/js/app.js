@@ -1910,7 +1910,11 @@ async function callErpSecurityApi(action, options = {}) {
   const method = options.method || 'POST';
   const schoolId = String(window.ERP_CLOUD_SCHOOL_ID || 'mmm-jhs');
   const params = new URLSearchParams({ action, schoolId });
-  const sessionToken = String(options.sessionToken || options.query?.sessionToken || options.body?.sessionToken || '').trim();
+  // Always attach logged-in session unless login itself (Reset Pass / create user were missing this).
+  let sessionToken = String(options.sessionToken || options.query?.sessionToken || options.body?.sessionToken || '').trim();
+  if (!sessionToken && action !== 'authLogin') {
+    sessionToken = getErpSessionToken();
+  }
   if (method === 'GET' && options.query) {
     Object.entries(options.query).forEach(([key, value]) => {
       if (key === 'sessionToken') return;
@@ -1954,11 +1958,26 @@ async function validateStoredErpSession() {
 function getCurrentActiveUser() {
   const activeId = window.activeUserId || sessionStorage.getItem(ERP_SESSION_USER_KEY);
   if (!activeId || !getErpSessionToken()) return null;
-  if (!activeId) return null;
 
   const staff = SchoolData.staffUsers || [];
-  const found = staff.find(u => u.id === activeId || u.username === activeId);
-  return found || null;
+  const key = String(activeId).trim();
+  const keyLower = key.toLowerCase();
+  return staff.find(u =>
+    String(u.id || '') === key ||
+    String(u.uniqueId || '') === key ||
+    String(u.username || '').toLowerCase() === keyLower
+  ) || null;
+}
+
+function findStaffUserByLooseId(userId) {
+  const key = String(userId || '').trim();
+  if (!key) return null;
+  const keyLower = key.toLowerCase();
+  return (SchoolData.staffUsers || []).find(u =>
+    String(u.id || '') === key ||
+    String(u.uniqueId || '') === key ||
+    String(u.username || '').toLowerCase() === keyLower
+  ) || null;
 }
 
 function getUserInitials(name) {
@@ -3665,6 +3684,7 @@ function ensureStaffUserIds() {
    ============================================================================ */
 function renderUsersPage(container) {
   ensureStaffUserIds();
+  hydrateStaffPasswordsFromAdminVault();
   const users = SchoolData.staffUsers;
 
   container.innerHTML = `
@@ -3729,9 +3749,10 @@ function renderUsersPage(container) {
                     <span style="font-size:0.8rem; color:#94a3b8;">User:</span> <code style="color:#38bdf8; font-weight:bold;">${u.username || 'admin'}</code><br>
                     <span style="font-size:0.8rem; color:#94a3b8;">Pass:</span>
                     ${canRevealStaffPasswords() ? `
-                      <code id="staffPassText_${u.id}" style="color:#fbbf24; font-weight:bold;">••••••••</code>
-                      <button type="button" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem; margin-left:6px;" onclick="toggleStaffPasswordVisible('${u.id}')">Show</button>
-                      <button type="button" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem;" onclick="copyStaffLoginCredentials('${u.id}')">Copy</button>
+                      <code id="${staffPassDomId(u.id)}" style="color:#fbbf24; font-weight:bold;">••••••••</code>
+                      <button type="button" class="btn btn-secondary" data-pass-toggle="1" style="padding:2px 8px; font-size:0.7rem; margin-left:6px;" onclick="toggleStaffPasswordVisible('${String(u.id).replace(/'/g, "\\'")}')">Show</button>
+                      <button type="button" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem;" onclick="copyStaffLoginCredentials('${String(u.id).replace(/'/g, "\\'")}')">Copy</button>
+                      <div style="font-size:0.68rem; color:${getStaffPasswordForAdminReveal(u) ? '#34d399' : '#fbbf24'}; margin-top:4px;">${getStaffPasswordForAdminReveal(u) ? 'Viewable on this PC — click Show' : 'Secure in cloud — Reset Pass, then Show'}</div>
                     ` : `<code style="color:#64748b; font-weight:bold;">••••••••</code>`}
                   </td>
 
@@ -4727,7 +4748,7 @@ async function refreshStaffTelegramLinksFromCloud() {
 }
 
 function sendStaffCredentialsViaTelegram(userId) {
-  const u = SchoolData.staffUsers.find(x => x.id === userId);
+  const u = findStaffUserByLooseId(userId);
   if (!u) return;
 
   const chatId = u.telegramChatId || "";
@@ -4735,7 +4756,16 @@ function sendStaffCredentialsViaTelegram(userId) {
     showNotification(`No Telegram Chat ID for ${u.name}. Ask them to send /stafflink ${u.username || 'username'} <password> to @mmmjhschoolbot, or use Set Chat ID.`, 'warning');
     return;
   }
-  const msgText = `*Staff Login Credentials Notice*\n\nDear *${u.name}*,\n\nYour ERP Staff Portal login credentials have been generated:\n\n- *Username:* \`${u.username || 'admin'}\`\n- *Password:* \`${u.password || 'teacher123'}\`\n- *Assigned Role:* ${u.role}\n- *Assigned Subject:* ${u.assignedSubject || 'ALL'}\n\nWebsite Portal: https://mmmjhschool.com`;
+  const viewablePass = getStaffPasswordForAdminReveal(u);
+  if (!viewablePass) {
+    const resetNow = window.confirm(
+      `No viewable password for ${u.name} on this PC (cloud is hashed).\n\n` +
+      `OK = Reset Pass first, then send via Telegram.`
+    );
+    if (resetNow) resetStaffPassword(userId);
+    return;
+  }
+  const msgText = `*Staff Login Credentials Notice*\n\nDear *${u.name}*,\n\nYour ERP Staff Portal login credentials have been generated:\n\n- *Username:* \`${u.username || 'admin'}\`\n- *Password:* \`${viewablePass}\`\n- *Assigned Role:* ${u.role}\n- *Assigned Subject:* ${u.assignedSubject || 'ALL'}\n\nWebsite Portal: https://mmmjhschool.com`;
 
   sendRawTelegramReply(chatId, msgText);
 
@@ -4790,8 +4820,8 @@ function sendStaffTelegramMessage() {
 }
 
 function canRevealStaffPasswords() {
-  const role = String(getCurrentActiveUser()?.role || '');
-  return role === 'Super Admin' || role === 'Principal';
+  const role = String(getCurrentActiveUser()?.role || '').toLowerCase().trim();
+  return role.includes('super admin') || role.includes('principal') || role === 'admin';
 }
 
 /** Office-only reveal cache (this browser). Cloud keeps hashed login only — cannot recover old passwords. */
@@ -4812,7 +4842,7 @@ function writeAdminStaffPasswordVault(vault) {
 }
 
 function rememberStaffPasswordForAdmin(user, password) {
-  if (!canRevealStaffPasswords()) return;
+  // Always vault when Reset/Create succeeds — caller is already an admin action.
   const pass = String(password || '').trim();
   if (!pass || !user) return;
   const vault = readAdminStaffPasswordVault();
@@ -4825,8 +4855,10 @@ function rememberStaffPasswordForAdmin(user, password) {
   };
   const userKey = String(user.username || '').trim().toLowerCase();
   const idKey = String(user.id || '').trim().toLowerCase();
+  const uniqueKey = String(user.uniqueId || '').trim().toLowerCase();
   if (userKey) vault[userKey] = entry;
   if (idKey) vault[idKey] = entry;
+  if (uniqueKey) vault[uniqueKey] = entry;
   writeAdminStaffPasswordVault(vault);
   // Keep in-memory too so Show works before next render/pull
   user.password = pass;
@@ -4836,8 +4868,10 @@ function forgetStaffPasswordForAdmin(user) {
   const vault = readAdminStaffPasswordVault();
   const userKey = String(user?.username || '').trim().toLowerCase();
   const idKey = String(user?.id || '').trim().toLowerCase();
+  const uniqueKey = String(user?.uniqueId || '').trim().toLowerCase();
   if (userKey) delete vault[userKey];
   if (idKey) delete vault[idKey];
+  if (uniqueKey) delete vault[uniqueKey];
   writeAdminStaffPasswordVault(vault);
 }
 
@@ -4848,7 +4882,67 @@ function getStaffPasswordForAdminReveal(user) {
   const vault = readAdminStaffPasswordVault();
   const byUser = vault[String(user.username || '').trim().toLowerCase()];
   const byId = vault[String(user.id || '').trim().toLowerCase()];
-  return String((byUser || byId)?.password || '').trim();
+  const byUnique = vault[String(user.uniqueId || '').trim().toLowerCase()];
+  return String((byUser || byId || byUnique)?.password || '').trim();
+}
+
+function hydrateStaffPasswordsFromAdminVault() {
+  (SchoolData.staffUsers || []).forEach((u) => {
+    if (String(u.password || '').trim()) return;
+    const pass = getStaffPasswordForAdminReveal(u);
+    if (pass) u.password = pass;
+  });
+}
+
+function staffPassDomId(userId) {
+  return `staffPassText_${String(userId || '').replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+}
+
+function closeStaffPasswordRevealModal() {
+  document.getElementById('staffPassRevealModal')?.remove();
+}
+
+function showStaffPasswordRevealModal(user, password, title) {
+  closeStaffPasswordRevealModal();
+  const pass = String(password || '').trim();
+  if (!user || !pass) return;
+  const modal = document.createElement('div');
+  modal.id = 'staffPassRevealModal';
+  modal.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(2,6,23,0.78);display:flex;align-items:center;justify-content:center;padding:16px;';
+  modal.innerHTML = `
+    <div style="background:#0f172a;border:2px solid #38bdf8;border-radius:14px;max-width:440px;width:100%;padding:22px;box-shadow:0 20px 50px rgba(0,0,0,0.45);">
+      <h3 style="margin:0 0 8px;color:#38bdf8;font-family:var(--font-heading);">${escapeHtml(title || 'Staff password ready')}</h3>
+      <p style="margin:0 0 14px;color:#94a3b8;font-size:0.88rem;">Cloud login is hashed. This plaintext is kept only on this office PC for Show/Copy.</p>
+      <div style="background:#020617;border:1px solid #334155;border-radius:10px;padding:12px;margin-bottom:14px;">
+        <div style="color:#94a3b8;font-size:0.78rem;margin-bottom:4px;">Staff</div>
+        <div style="color:#e2e8f0;font-weight:700;margin-bottom:10px;">${escapeHtml(user.name || '')}</div>
+        <div style="color:#94a3b8;font-size:0.78rem;margin-bottom:4px;">Username</div>
+        <code style="color:#38bdf8;font-size:1rem;font-weight:800;">${escapeHtml(user.username || '')}</code>
+        <div style="color:#94a3b8;font-size:0.78rem;margin:12px 0 4px;">Password</div>
+        <code id="staffPassRevealModalPass" style="color:#fbbf24;font-size:1.05rem;font-weight:800;word-break:break-all;">${escapeHtml(pass)}</code>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button type="button" class="btn btn-primary" id="staffPassRevealCopyBtn"><i class="fa-solid fa-copy"></i> Copy login</button>
+        <button type="button" class="btn btn-secondary" id="staffPassRevealCloseBtn">Close</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  document.getElementById('staffPassRevealCloseBtn')?.addEventListener('click', closeStaffPasswordRevealModal);
+  modal.addEventListener('click', (e) => { if (e.target === modal) closeStaffPasswordRevealModal(); });
+  document.getElementById('staffPassRevealCopyBtn')?.addEventListener('click', () => {
+    const text = `MMM JHS ERP login\nWebsite: https://www.mmmjhschool.com\nUsername: ${user.username || ''}\nPassword: ${pass}`;
+    const done = () => showNotification(`Copied login for ${user.name}.`, 'success');
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(() => {
+        window.prompt('Copy these credentials:', text);
+        done();
+      });
+    } else {
+      window.prompt('Copy these credentials:', text);
+      done();
+    }
+  });
 }
 
 function toggleStaffPasswordVisible(userId) {
@@ -4856,11 +4950,14 @@ function toggleStaffPasswordVisible(userId) {
     showNotification('Only Super Admin / Principal can reveal staff passwords.', 'warning');
     return;
   }
-  const user = (SchoolData.staffUsers || []).find(u => u.id === userId);
-  const el = document.getElementById(`staffPassText_${userId}`);
+  const user = findStaffUserByLooseId(userId);
+  const el = document.getElementById(staffPassDomId(userId));
   const row = el?.closest('td');
   const btn = row?.querySelector('button[data-pass-toggle="1"]') || row?.querySelector('button');
-  if (!user || !el) return;
+  if (!user || !el) {
+    showNotification('Could not find that staff row. Refresh User Management and try again.', 'warning');
+    return;
+  }
   const showing = el.getAttribute('data-showing') === '1';
   if (showing) {
     el.textContent = '••••••••';
@@ -4882,6 +4979,7 @@ function toggleStaffPasswordVisible(userId) {
   el.textContent = password;
   el.setAttribute('data-showing', '1');
   if (btn) btn.textContent = 'Hide';
+  showStaffPasswordRevealModal(user, password, 'Password (viewable on this PC)');
 }
 
 function copyStaffLoginCredentials(userId) {
@@ -4889,7 +4987,7 @@ function copyStaffLoginCredentials(userId) {
     showNotification('Only Super Admin / Principal can copy staff passwords.', 'warning');
     return;
   }
-  const user = (SchoolData.staffUsers || []).find(u => u.id === userId);
+  const user = findStaffUserByLooseId(userId);
   if (!user) return;
   const password = getStaffPasswordForAdminReveal(user);
   if (!password) {
@@ -4915,8 +5013,11 @@ function copyStaffLoginCredentials(userId) {
 }
 
 function resetStaffPassword(userId) {
-  const u = SchoolData.staffUsers.find(x => x.id === userId);
-  if (!u) return;
+  const u = findStaffUserByLooseId(userId);
+  if (!u) {
+    showNotification('Staff user not found.', 'error');
+    return;
+  }
 
   const newPass = prompt(`Set a new password for ${u.name} (${u.username}). Min 8 characters.`);
   if (newPass && newPass.trim()) {
@@ -4941,21 +5042,15 @@ function resetStaffPassword(userId) {
           pushSchoolDataToCloud({ skipMergePull: true }).catch((err) => console.warn('Password snapshot mirror:', err));
         }
         renderUsersPage(document.getElementById('contentBody'));
-        // Auto-show the new password in the table
+        // Always show a modal with the new password (do not rely only on table DOM).
+        showStaffPasswordRevealModal(u, password, 'Password reset — copy now');
         setTimeout(() => {
-          const el = document.getElementById(`staffPassText_${u.id}`);
+          const el = document.getElementById(staffPassDomId(u.id));
           if (el) {
             el.textContent = password;
             el.setAttribute('data-showing', '1');
           }
         }, 50);
-        window.alert(
-          `Password updated for ${u.name}\n\n` +
-          `Username: ${u.username}\n` +
-          `Password: ${password}\n\n` +
-          `This works for ERP login.\n` +
-          `Show/Copy will keep working on this office PC after refresh.`
-        );
         showNotification(`Password reset for ${u.name}. It is now visible via Show on this PC.`, 'success');
       } catch (error) {
         showNotification(error.message || 'Could not save password to secure login.', 'error');
@@ -5119,6 +5214,7 @@ function saveNewStaffUser() {
   };
 
   SchoolData.staffUsers.push(newUser);
+  rememberStaffPasswordForAdmin(newUser, password);
 
   document.getElementById('addUserModal')?.remove();
   // Skip debounced merge-push — staff list must upload exactly as in memory
@@ -5138,7 +5234,9 @@ function saveNewStaffUser() {
           await callErpSecurityApi('authAdminResetPassword', {
             body: { userId: newUser.id, username: newUser.username, newPassword: password }
           });
-          showNotification(`Created ${name} [${username}] with secure login password.`, 'success');
+          rememberStaffPasswordForAdmin(newUser, password);
+          showStaffPasswordRevealModal(newUser, password, 'New staff account — copy password');
+          showNotification(`Created ${name} [${username}] — password is viewable via Show on this PC.`, 'success');
         } catch (err) {
           showNotification(`User saved, but secure password setup failed: ${err.message}. Use Reset Pass.`, 'warning');
         }
