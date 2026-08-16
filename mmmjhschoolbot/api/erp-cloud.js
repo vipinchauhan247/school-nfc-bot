@@ -1251,6 +1251,18 @@ async function readSnapshot(schoolId) {
   return Array.isArray(rows) && rows.length ? rows[0] : null;
 }
 
+/**
+ * Change probe for polling. Selects only the timestamp, so both the API response
+ * and the Supabase read stay a few bytes instead of the whole roster.
+ */
+async function readSnapshotVersion(schoolId) {
+  const rows = await supabaseRequest(
+    'GET',
+    `erp_snapshots?school_id=eq.${encodeURIComponent(schoolId)}&select=saved_at,version&limit=1`
+  );
+  return Array.isArray(rows) && rows.length ? rows[0] : null;
+}
+
 async function writeSnapshot(schoolId, payload, savedBy) {
   payload = await preserveSnapshotStaffPasswords(schoolId, payload);
   const row = {
@@ -1333,7 +1345,7 @@ async function route(req, res, action) {
     return true;
   }
   if ([
-    'cloudPull', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments',
+    'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments',
     'rebuildSnapshot', 'wipeRoster', 'authLogin', 'authLogout', 'authSession', 'authChangePassword',
     'authAdminResetPassword', 'authAudit', 'tcIssue', 'tcGet', 'tcList', 'tcVerify', 'tcRevoke'
   ].includes(act)) {
@@ -1350,6 +1362,11 @@ async function erpCloudHandler(req, res) {
     const action = String(req.query.action || '').trim();
     if (req.method === 'GET' && action === 'cloudConfig') {
       return handleCloudConfig(req, res);
+    }
+
+    // Uptime pings land here: no database read, no roster, a few bytes.
+    if (action === 'health') {
+      return json(res, 200, { ok: true, service: 'erp-cloud' });
     }
 
     if (!supabaseConfig()) {
@@ -1379,6 +1396,18 @@ async function erpCloudHandler(req, res) {
 
     if (!authorize(req)) {
       return json(res, 403, { ok: false, error: 'Invalid cloud sync secret.' });
+    }
+
+    // Poll target: tells the browser whether the roster changed without sending it.
+    if (req.method === 'GET' && action === 'cloudVersion') {
+      const row = await readSnapshotVersion(schoolId);
+      return json(res, 200, {
+        ok: true,
+        configured: true,
+        schoolId,
+        savedAt: row?.saved_at || '',
+        version: row?.version || ''
+      });
     }
 
     if (req.method === 'GET' && action === 'nativeStudents') {
