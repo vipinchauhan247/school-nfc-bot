@@ -1914,10 +1914,11 @@ const ERP_SESSION_TOKEN_KEY = 'MMM_ERP_SessionToken';
 const ERP_SESSION_USER_KEY = 'MMM_ERP_SessionUserId';
 
 function getErpSecurityApiBase() {
-  const configured = typeof window.getErpCloudApiBase === 'function'
-    ? String(window.getErpCloudApiBase() || '')
-    : 'https://mmmjhschoolbot.onrender.com/api/mmmjhs-bot';
-  return configured.replace(/\/api\/mmmjhs-bot(?:\?.*)?$/i, '/api/erp-cloud');
+  // Use the same API entry point as cloud sync (mmmjhs-bot routes auth to erp-cloud).
+  // Direct /api/erp-cloud on Vercel can miss session headers on some deploys.
+  if (typeof getMmmjhsBotApiBase === 'function') return getMmmjhsBotApiBase();
+  if (typeof window.getErpCloudApiBase === 'function') return window.getErpCloudApiBase();
+  return 'https://mmmjhschoolbot.onrender.com/api/mmmjhs-bot';
 }
 
 function getErpSessionToken() {

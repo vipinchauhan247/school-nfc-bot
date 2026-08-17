@@ -1357,6 +1357,19 @@ async function route(req, res, action) {
 
 async function erpCloudHandler(req, res) {
   try {
+    // Vercel serverless: ensure query/body are parsed when invoked directly as /api/erp-cloud
+    if (!req.query || typeof req.query !== 'object') req.query = {};
+    if (!req.query.action && req.url) {
+      try {
+        const parsed = new URL(String(req.url), 'http://localhost');
+        parsed.searchParams.forEach((value, key) => { req.query[key] = value; });
+      } catch (e) {}
+    }
+    if (typeof req.body === 'string' && req.body.trim()) {
+      try { req.body = JSON.parse(req.body); } catch (e) { req.body = {}; }
+    }
+    if (!req.body || typeof req.body !== 'object') req.body = {};
+
     if (req.method === 'OPTIONS') return empty(res);
 
     const action = String(req.query.action || '').trim();
