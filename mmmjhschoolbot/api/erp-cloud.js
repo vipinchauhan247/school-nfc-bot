@@ -176,10 +176,12 @@ async function readStaffCredential(schoolId, usernameOrId) {
 async function saveStaffCredential(schoolId, user, password) {
   const salt = crypto.randomBytes(16).toString('hex');
   const iterations = 210000;
+  const userId = String(user.id || user.username || '').trim();
+  const usernameLower = normalizeUsername(user.username || user.id);
   const row = {
     school_id: schoolId,
-    user_id: String(user.id || user.username || '').trim(),
-    username_lower: normalizeUsername(user.username || user.id),
+    user_id: userId,
+    username_lower: usernameLower,
     user_name: String(user.name || '').trim(),
     role: String(user.role || '').trim(),
     password_salt: salt,
@@ -188,6 +190,24 @@ async function saveStaffCredential(schoolId, user, password) {
     active: user.active !== false && String(user.status || '').toLowerCase() !== 'inactive',
     updated_at: new Date().toISOString()
   };
+  // Roster rebuilds can change user_id while username stays the same — clear stale row.
+  try {
+    const stale = await supabaseRequest(
+      'GET',
+      `erp_staff_credentials?school_id=eq.${encodeURIComponent(schoolId)}&username_lower=eq.${encodeURIComponent(usernameLower)}&select=id,user_id&limit=1`
+    );
+    const prev = Array.isArray(stale) && stale.length ? stale[0] : null;
+    if (prev && String(prev.user_id || '') !== userId) {
+      await supabaseRequest(
+        'DELETE',
+        `erp_staff_credentials?id=eq.${encodeURIComponent(prev.id)}`,
+        undefined,
+        'return=minimal'
+      );
+    }
+  } catch (err) {
+    console.error('[ERP-AUTH] stale credential cleanup failed:', err.message);
+  }
   const rows = await supabaseRequest(
     'POST',
     'erp_staff_credentials?on_conflict=school_id,user_id',
@@ -1263,6 +1283,19 @@ async function readSnapshotVersion(schoolId) {
   return Array.isArray(rows) && rows.length ? rows[0] : null;
 }
 
+async function syncStaffCredentialsFromPayload(schoolId, payload) {
+  const staff = Array.isArray(payload?.staffUsers) ? payload.staffUsers : [];
+  for (const user of staff) {
+    const plain = String(user?.password || '').trim();
+    if (plain.length < 8) continue;
+    try {
+      await saveStaffCredential(schoolId, user, plain);
+    } catch (err) {
+      console.error('[ERP-AUTH] credential sync failed:', user?.username || user?.id, err.message);
+    }
+  }
+}
+
 async function writeSnapshot(schoolId, payload, savedBy) {
   payload = await preserveSnapshotStaffPasswords(schoolId, payload);
   const row = {
@@ -1306,6 +1339,11 @@ async function writeSnapshot(schoolId, payload, savedBy) {
   }
 
   const saved = Array.isArray(data) ? data[0] : data;
+  try {
+    await syncStaffCredentialsFromPayload(schoolId, payload);
+  } catch (err) {
+    console.error('[ERP-AUTH] bulk credential sync failed:', err.message);
+  }
   return { snapshot: saved, fees };
 }
 
