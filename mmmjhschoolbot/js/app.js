@@ -9301,10 +9301,12 @@ function applyCsvImportItemToStudent(student, item, currentSession, mode = 'fill
   if (hasCsvValue(item.cls)) {
     student.sessionDetails[currentSession].class = item.cls;
     student.currentClass = item.cls;
+    student.class = item.cls;
   }
   if (hasCsvValue(item.sec)) {
     student.sessionDetails[currentSession].section = item.sec;
     student.currentSection = item.sec;
+    student.section = item.sec;
   }
 }
 
@@ -9632,6 +9634,10 @@ function importParsedStudentsFromCsv() {
   }
 
   saveSchoolDataToStorage();
+  if (typeof flushCloudPushNow === 'function') flushCloudPushNow();
+  else if (typeof pushSchoolDataToCloud === 'function') {
+    pushSchoolDataToCloud({ skipMergePull: true }).catch((err) => console.warn('Student CSV cloud sync failed:', err));
+  }
 }
 
 /* ============================================================================
