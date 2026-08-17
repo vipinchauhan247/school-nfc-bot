@@ -2004,11 +2004,10 @@ const ERP_SESSION_TOKEN_KEY = 'MMM_ERP_SessionToken';
 const ERP_SESSION_USER_KEY = 'MMM_ERP_SessionUserId';
 
 function getErpSecurityApiBase() {
-  // Use the same API entry point as cloud sync (mmmjhs-bot routes auth to erp-cloud).
-  // Direct /api/erp-cloud on Vercel can miss session headers on some deploys.
   if (typeof getMmmjhsBotApiBase === 'function') return getMmmjhsBotApiBase();
   if (typeof window.getErpCloudApiBase === 'function') return window.getErpCloudApiBase();
-  return 'https://mmmjhschoolbot.onrender.com/api/mmmjhs-bot';
+  if (typeof isLiveSchoolWebsiteHost === 'function' && isLiveSchoolWebsiteHost()) return '/api/mmmjhs-bot';
+  return MMMJHS_BOT_RENDER_URL;
 }
 
 function getErpSessionToken() {
@@ -17689,7 +17688,15 @@ async function refreshStudentTelegramRegistrationForSend(student) {
   }
 }
 
-const MMMJHS_BOT_API_URL = 'https://mmmjhschoolbot.onrender.com/api/mmmjhs-bot';
+const MMMJHS_BOT_RENDER_URL = 'https://mmmjhschoolbot.onrender.com/api/mmmjhs-bot';
+
+function isLiveSchoolWebsiteHost() {
+  const h = String(window.location.hostname || '').replace(/^www\./, '').toLowerCase();
+  return h === 'mmmjhschool.com'
+    || h.endsWith('.vercel.app')
+    || h === 'madanmohanmalviyaschool.com'
+    || h.includes('mmmjhschool');
+}
 
 function getMmmjhsBotApiBase() {
   const override = String(window.MMMJHS_BOT_API_URL || '').trim();
@@ -17699,7 +17706,9 @@ function getMmmjhsBotApiBase() {
     const botPort = String(window.MMMJHS_BOT_LOCAL_PORT || '8080').trim();
     return `${window.location.protocol}//${host}:${botPort}/api/mmmjhs-bot`;
   }
-  return MMMJHS_BOT_API_URL;
+  // Live school site → same-origin Vercel /api (never burn Render bandwidth from browsers)
+  if (isLiveSchoolWebsiteHost()) return '/api/mmmjhs-bot';
+  return MMMJHS_BOT_RENDER_URL;
 }
 
 function mmmjhsBotEndpoint(action) {
@@ -17794,7 +17803,7 @@ async function syncStudentFeesToGoogleSheet(options) {
     return;
   }
   const payloads = students.map(buildStudentFeeSheetSyncPayload);
-  const batchSize = 200;
+  const batchSize = 75;
   const batches = [];
   for (let i = 0; i < payloads.length; i += batchSize) {
     batches.push(payloads.slice(i, i + batchSize));
@@ -17819,7 +17828,7 @@ async function syncStudentFeesToGoogleSheet(options) {
       if (Array.isArray(data.results)) allResults.push(...data.results);
     }
     const base = getMmmjhsBotApiBase();
-    const localHint = /localhost|127\.0\.0\.1/.test(base) ? ' (local bot)' : '';
+    const localHint = /localhost|127\.0\.0\.1/.test(base) ? ' (local bot)' : (base.startsWith('/') ? ' (Vercel)' : '');
     const summary = { ok: true, dryRun, updated, missing, results: allResults, batches: batches.length };
     if (dryRun) {
       console.log('Fee sync preview:', summary);
@@ -17837,7 +17846,7 @@ async function syncStudentFeesToGoogleSheet(options) {
   } catch (err) {
     console.error('Fee sync error:', err);
     showNotification(
-      `Fee sync failed: ${err.message}. For local test: run "npm start" in mmm-school-erp with GOOGLE_SCRIPT_URL set.`,
+      `Fee sync failed: ${err.message}. On Vercel: add GOOGLE_SCRIPT_URL in Project → Settings → Environment Variables (copy the same /exec URL from Render). Cloud sync must use /api on your site, not Render.`,
       'error'
     );
     return { ok: false, error: err.message };

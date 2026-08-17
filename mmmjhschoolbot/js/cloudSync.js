@@ -46,6 +46,14 @@
     if (secret !== undefined) localStorage.setItem(LS_SECRET, String(secret || '').trim());
   }
 
+  function isLiveSchoolWebsiteHost() {
+    const h = String(window.location.hostname || '').replace(/^www\./, '').toLowerCase();
+    return h === 'mmmjhschool.com'
+      || h.endsWith('.vercel.app')
+      || h === 'madanmohanmalviyaschool.com'
+      || h.includes('mmmjhschool');
+  }
+
   function getErpCloudApiBase() {
     if (typeof getMmmjhsBotApiBase === 'function') return getMmmjhsBotApiBase();
     const host = window.location.hostname;
@@ -53,6 +61,7 @@
       const port = String(window.MMMJHS_BOT_LOCAL_PORT || '8085').trim();
       return `${window.location.protocol}//${host}:${port}/api/mmmjhs-bot`;
     }
+    if (isLiveSchoolWebsiteHost()) return '/api/mmmjhs-bot';
     return 'https://mmmjhschoolbot.onrender.com/api/mmmjhs-bot';
   }
 
@@ -92,7 +101,7 @@
         return await fetch(url, opts);
       } catch (err) {
         lastErr = err && err.name === 'AbortError'
-          ? new Error('Cloud request timed out. Check Render / internet and refresh.')
+          ? new Error('Cloud request timed out. Check internet and refresh — live site should use Vercel /api, not Render.')
           : err;
         if (attempt < max) await new Promise((resolve) => setTimeout(resolve, 2500));
       } finally {
@@ -136,7 +145,7 @@
       return JSON.parse(text);
     } catch (err) {
       if (res.status === 404) {
-        throw new Error('Cloud API not found on Render (404). Redeploy render-server.js + api/erp-cloud.js.');
+        throw new Error('Cloud API not found (404). Deploy api/mmmjhs-bot.js + api/erp-cloud.js on Vercel and hard-refresh the site.');
       }
       throw new Error(`Cloud fetch failed (HTTP ${res.status}): ${text.slice(0, 120)}`);
     }
