@@ -326,8 +326,12 @@ function previewSelectedImage(input, previewId) {
   if (!file || !preview) return;
   const reader = new FileReader();
   reader.onload = () => {
-    preview.src = reader.result;
-    preview.style.display = 'block';
+    if (preview.tagName === 'IMG') {
+      preview.src = reader.result;
+      preview.style.display = 'block';
+      return;
+    }
+    preview.innerHTML = `<img src="${reader.result}" alt="" style="width:58px;height:58px;border-radius:50%;object-fit:cover;border:2px solid #38bdf8;display:block;">`;
   };
   reader.readAsDataURL(file);
 }
@@ -2540,7 +2544,7 @@ function renderDashboard(container) {
                 return `
                   <tr>
                     <td style="display:flex; align-items:center; gap:10px;">
-                      <img src="${s.photo}" style="width:34px; height:34px; border-radius:50%; object-fit:cover;">
+                      ${getStudentDirectoryPhotoHtml(s, 34)}
                       <div>
                         <strong style="color:var(--text-main);">${s.name}</strong><br>
                         <small style="color:var(--text-muted);">${s.parentName}</small>
@@ -3810,7 +3814,7 @@ function renderExamsReportCardsSubdirectoryPage(container) {
                   <td style="text-align:center;">${rankBadge}</td>
                   <td>
                     <div style="display:flex; align-items:center; gap:10px;">
-                      <img src="${s.photo}" style="width:36px; height:36px; border-radius:50%; object-fit:cover; border:1px solid #6366f1;">
+                      ${getStudentDirectoryPhotoHtml(s, 36)}
                       <div>
                         <strong style="color:var(--text-main);">${s.name}</strong>
                         <span class="adm-no-chip">Adm ${s.admissionNo}</span>
@@ -7665,7 +7669,7 @@ function viewHalfYearlyReportCard(admissionNo) {
           <!-- STUDENT GRAPHIC INFO CARD -->
           <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:12px 18px; margin-bottom:16px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
             <div style="display:flex; align-items:center; gap:14px;">
-              <img src="${student.photo}" style="width:55px; height:55px; border-radius:50%; border:2.5px solid #6366f1; object-fit:cover;">
+              ${getStudentDirectoryPhotoHtml(student, 55)}
               <div>
                 <h3 style="font-size:1.15rem; margin:0 0 2px 0; color:#0f172a; font-weight:700;">${student.name}</h3>
                 <div style="display:flex; gap:8px; font-size:0.78rem; color:#475569;">
@@ -7905,7 +7909,7 @@ function viewFinalAnnualReportCard(admissionNo) {
           <!-- STUDENT GRAPHIC INFO CARD -->
           <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:12px 18px; margin-bottom:16px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
             <div style="display:flex; align-items:center; gap:14px;">
-              <img src="${student.photo}" style="width:55px; height:55px; border-radius:50%; border:2.5px solid #10b981; object-fit:cover;">
+              ${getStudentDirectoryPhotoHtml(student, 55)}
               <div>
                 <h3 style="font-size:1.15rem; margin:0 0 2px 0; color:#0f172a; font-weight:700;">${student.name}</h3>
                 <div style="display:flex; gap:8px; font-size:0.78rem; color:#475569;">
@@ -8825,7 +8829,7 @@ function renderStudentsPage(container) {
               return `
                 <tr class="student-dir-row" data-name="${s.name.toLowerCase()}" data-adm="${s.admissionNo}" data-class="${s.currentClass}">
                   <td style="display:flex; align-items:center; gap:10px;">
-                    <img src="${s.photo}" style="width:36px; height:36px; border-radius:50%; object-fit:cover;">
+                    ${getStudentDirectoryPhotoHtml(s, 36)}
                     <div>
                       <strong style="color:var(--text-main);">${s.name}</strong><br>
                       <small style="color:var(--text-muted);">${s.gender} | <strong style="color:var(--accent-primary);">DOB: ${formatDobToDDMMYYYY(s.dob)}</strong></small>
@@ -8912,6 +8916,27 @@ function resolveStudentPhotoSrc(student) {
   if (/supabase\.co\/storage\/v1\/object\/public\//i.test(photo)) return photo;
   if (/^https?:\/\//i.test(photo)) return photo;
   return photo;
+}
+
+function getStudentInitials(name) {
+  const parts = String(name || 'Student').trim().split(/\s+/).filter(Boolean);
+  return parts.slice(0, 2).map(part => part[0]).join('').toUpperCase() || '?';
+}
+
+/** Student list/profile avatar — never show random Unsplash strangers; initials if no real photo. */
+function getStudentDirectoryPhotoHtml(student, sizePx = 36) {
+  const photo = resolveStudentPhotoSrc(student);
+  const initials = escapeHtml(getStudentInitials(student?.name));
+  const fontSize = Math.max(10, Math.round(sizePx * 0.32));
+  const boxStyle = `width:${sizePx}px;height:${sizePx}px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#334155;color:#94a3b8;font-size:${fontSize}px;font-weight:800;flex-shrink:0;`;
+  if (!photo) {
+    return `<div style="${boxStyle}">${initials}</div>`;
+  }
+  const uid = `sdph-${String(student?.admissionNo || 'x').replace(/\W/g, '')}-${sizePx}`;
+  return `<span style="position:relative;width:${sizePx}px;height:${sizePx}px;flex-shrink:0;display:inline-block;">
+    <img id="${uid}" src="${photo}" alt="" style="width:${sizePx}px;height:${sizePx}px;border-radius:50%;object-fit:cover;" onerror="this.style.display='none'; var fb=document.getElementById('${uid}-fb'); if(fb) fb.style.display='flex';">
+    <div id="${uid}-fb" style="display:none;${boxStyle}">${initials}</div>
+  </span>`;
 }
 
 function loadJsZipLibrary() {
@@ -9687,7 +9712,7 @@ function openEditStudentModal(admissionNo) {
           </div>
 
           <div style="display:flex; gap:12px; align-items:center; background:#111827; padding:12px; border-radius:10px; border:1px solid #334155;">
-            <img id="editStudPhotoPreview" src="${student.photo || 'https://images.unsplash.com/photo-1544717305-2782549b5136?w=150'}" style="width:58px; height:58px; border-radius:50%; object-fit:cover; border:2px solid #38bdf8;">
+            <div id="editStudPhotoPreview">${getStudentDirectoryPhotoHtml(student, 58)}</div>
             <div style="flex:1;">
               <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Upload Student Profile Picture</label>
               <input type="file" id="editStudPhotoFile" accept="image/*" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" onchange="previewSelectedImage(this, 'editStudPhotoPreview')">
@@ -11103,7 +11128,7 @@ function openClassStudentsModal(className, targetSection = null) {
                   <td><code>${String(idx + 1).padStart(2, '0')}</code></td>
                   <td>
                     <div style="display:flex; align-items:center; gap:10px;">
-                      <img src="${s.photo || 'https://images.unsplash.com/photo-1544717305-2782549b5136?w=150'}" style="width:34px; height:34px; border-radius:50%; object-fit:cover;">
+                      ${getStudentDirectoryPhotoHtml(s, 34)}
                       <strong class="theme-panel-name" style="font-size:0.95rem;">${s.name}</strong>
                     </div>
                   </td>
@@ -13999,7 +14024,7 @@ function openQuickFeeSelectModal() {
             return `
               <div class="quick-fee-student-item" data-search="${s.name.toLowerCase()} ${s.admissionNo} ${s.parentPhone}" style="display:flex; justify-content:space-between; align-items:center; padding:12px; border-bottom:1px solid #334155; gap:12px;">
                 <div style="display:flex; align-items:center; gap:12px;">
-                  <img src="${s.photo || 'https://images.unsplash.com/photo-1544717305-2782549b5136?w=150&auto=format&fit=crop&q=80'}" style="width:40px; height:40px; border-radius:50%; object-fit:cover;">
+                  ${getStudentDirectoryPhotoHtml(s, 40)}
                   <div>
                     <strong style="color:var(--text-main); font-size:0.95rem;">${s.name}</strong> 
                     <span style="color:var(--accent-primary); font-size:0.8rem;">(${s.currentClass || 'Class 5'} - ${s.currentSection || 'A'})</span><br>
@@ -19091,7 +19116,7 @@ function openNfcTapSuccessModal(student, timeStr) {
         </div>
 
         <div style="display:flex; align-items:center; justify-content:center; gap:16px; background:#1e293b; padding:14px; border-radius:12px; border:1px solid #334155; margin-bottom:18px; text-align:left;">
-          <img src="${student.photo}" style="width:60px; height:60px; border-radius:50%; border:2px solid #10b981; object-fit:cover;">
+          ${getStudentDirectoryPhotoHtml(student, 60)}
           <div>
             <h3 style="margin:0 0 2px 0; color:#ffffff; font-size:1.15rem; font-weight:700;">${student.name}</h3>
             <div style="font-size:0.8rem; color:#94a3b8;">
@@ -20269,7 +20294,7 @@ function setupGlobalSearch() {
         resultsContainer.innerHTML = matches.map(s => `
           <div style="display:flex; justify-content:space-between; align-items:center; padding:12px; border-bottom:1px solid var(--border-color); cursor:pointer;" onclick="closeSearchAndOpenProfile('${s.admissionNo}')">
             <div style="display:flex; align-items:center; gap:12px;">
-              <img src="${s.photo}" style="width:38px; height:38px; border-radius:50%; object-fit:cover;">
+              ${getStudentDirectoryPhotoHtml(s, 38)}
               <div>
                 <strong>${s.name}</strong> (${s.currentClass || 'LKG'})<br>
                 <small style="color:var(--text-muted);">Adm: ${s.admissionNo} | Father: ${s.parentName}</small>
@@ -20342,7 +20367,9 @@ function openStudentProfile(admissionNo) {
           <button onclick="document.getElementById('studentProfileModal').remove()" style="position:absolute; top:16px; right:16px; background:rgba(255,255,255,0.15); color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer; font-size:1.1rem; display:flex; align-items:center; justify-content:center;">X</button>
           
           <div style="display:flex; gap:20px; align-items:center; flex-wrap:wrap;">
-            <img src="${student.photo || 'https://images.unsplash.com/photo-1544717305-2782549b5136?w=150&auto=format&fit=crop&q=80'}" style="width:90px; height:90px; border-radius:50%; object-fit:cover; border:3px solid #818cf8; box-shadow:0 10px 20px rgba(0,0,0,0.4);">
+            <div style="border:3px solid #818cf8; border-radius:50%; box-shadow:0 10px 20px rgba(0,0,0,0.4); overflow:hidden; flex-shrink:0;">
+              ${getStudentDirectoryPhotoHtml(student, 90)}
+            </div>
             <div>
               <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
                 <h2 style="margin:0; color:#ffffff; font-size:1.5rem; font-weight:800; font-family:var(--font-heading, sans-serif);">${student.name}</h2>
