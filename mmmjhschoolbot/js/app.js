@@ -9219,6 +9219,36 @@ function canCurrentUserReactivateStudents() {
 }
 
 /** Return a left/inactive student to the active roster for the current session. */
+async function recoverLeftStudentsFromTcRegister() {
+  if (!canCurrentUserReactivateStudents()) {
+    showNotification('Only Super Admin or Principal can recover roster records.', 'warning');
+    return;
+  }
+  if (!window.confirm('Restore left/inactive students from the permanent cloud TC register?\n\nThis re-links issued transfer certificates to student records. It cannot recreate deleted staff logins.')) {
+    return;
+  }
+  try {
+    const result = await callErpSecurityApi('recoverFromTcRegister', { method: 'POST', body: {} });
+    if (typeof pullSchoolDataFromCloud === 'function') {
+      await pullSchoolDataFromCloud({ force: true });
+    } else if (typeof window.pullSchoolDataFromCloud === 'function') {
+      await window.pullSchoolDataFromCloud({ force: true });
+    }
+    showNotification(
+      `TC recovery done: ${result.tcCount || 0} certificate(s), ${result.restored || 0} student(s) re-added, ${result.markedLeft || 0} marked left.`,
+      'success'
+    );
+    if (String(window.location.hash || '').includes('left-students')) {
+      renderLeftStudentsPage(document.getElementById('contentBody'));
+    } else if (String(window.location.hash || '').includes('tc-register')) {
+      renderTcRegisterPage(document.getElementById('contentBody'));
+    }
+  } catch (error) {
+    showNotification(`TC recovery failed: ${error.message || error}`, 'error');
+  }
+}
+
+/** Return a left/inactive student to the active roster for the current session. */
 function reactivateInactiveStudent(admissionNo) {
   if (!canCurrentUserReactivateStudents()) {
     showNotification('Only Super Admin or Principal can bring back inactive students.', 'warning');
@@ -9288,6 +9318,7 @@ function renderLeftStudentsPage(container) {
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
         <button class="btn btn-secondary" style="background:#0284c7; color:#fff; border:none; font-weight:800;" onclick="window.location.hash='tc-register'"><i class="fa-solid fa-file-shield"></i> TC Register (Cloud)</button>
+        ${canReactivate ? `<button class="btn btn-secondary" style="background:#7c3aed; color:#fff; border:none; font-weight:800;" onclick="recoverLeftStudentsFromTcRegister()"><i class="fa-solid fa-rotate"></i> Recover from TC Register</button>` : ''}
         <button class="btn btn-primary" onclick="window.location.hash='students'"><i class="fa-solid fa-users"></i> Active Students</button>
       </div>
     </div>
@@ -9399,6 +9430,7 @@ function renderTcRegisterPage(container) {
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
         <button class="btn btn-secondary" onclick="renderTcRegisterPage(document.getElementById('contentBody'))"><i class="fa-solid fa-rotate"></i> Reload</button>
+        ${canCurrentUserReactivateStudents() ? `<button class="btn btn-secondary" style="background:#7c3aed; color:#fff; border:none; font-weight:800;" onclick="recoverLeftStudentsFromTcRegister()"><i class="fa-solid fa-user-clock"></i> Recover Left Students</button>` : ''}
         <button class="btn btn-primary" onclick="window.location.hash='left-students'"><i class="fa-solid fa-user-clock"></i> Left / Inactive Students</button>
       </div>
     </div>

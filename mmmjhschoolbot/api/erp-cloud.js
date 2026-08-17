@@ -696,11 +696,99 @@ async function handleTcGet(req, res, schoolId) {
 async function handleTcList(req, res, schoolId) {
   const session = await requireErpSession(req, res);
   if (!session) return;
+  const certificates = await listTcCertificatesInternal(schoolId);
+  return json(res, 200, { ok: true, certificates });
+}
+
+async function listTcCertificatesInternal(schoolId) {
   const rows = await supabaseRequest(
     'GET',
     `erp_tc_certificates?school_id=eq.${encodeURIComponent(schoolId)}&select=id,student_id,admission_no,certificate_no,academic_session,student_snapshot,issued_at,issued_by_name,status,revoked_at&order=issued_at.desc&limit=2000`
   );
-  return json(res, 200, { ok: true, certificates: Array.isArray(rows) ? rows : [] });
+  return Array.isArray(rows) ? rows : [];
+}
+
+/** Merge permanent TC register back into roster — restores left/inactive students after a bad rebuild. */
+function applyTcCertificatesToPayload(payload, certificates) {
+  if (!payload || !Array.isArray(payload.students) || !Array.isArray(certificates) || !certificates.length) {
+    return { payload, restored: 0, markedLeft: 0 };
+  }
+
+  const byAdmission = new Map();
+  payload.students.forEach((student) => {
+    const key = normalizeAdmission(student?.admissionNo || student?.AdmissionNo);
+    if (key) byAdmission.set(key, student);
+  });
+
+  let restored = 0;
+  let markedLeft = 0;
+  certificates.forEach((cert) => {
+    const adm = normalizeAdmission(cert?.admission_no);
+    if (!adm) return;
+    const snap = cert.student_snapshot && typeof cert.student_snapshot === 'object' ? cert.student_snapshot : {};
+    let student = byAdmission.get(adm);
+    if (!student) {
+      student = {
+        ...snap,
+        admissionNo: adm,
+        name: String(snap.name || '').trim() || `Student ${adm}`,
+        currentClass: snap.currentClass || snap.class || '',
+        currentSection: snap.currentSection || snap.section || '',
+        parentName: snap.parentName || '',
+        status: 'Left',
+        feeRecords: snap.feeRecords && typeof snap.feeRecords === 'object' ? snap.feeRecords : {}
+      };
+      payload.students.push(student);
+      byAdmission.set(adm, student);
+      restored += 1;
+    }
+
+    const wasActive = String(student.status || '').toLowerCase() === 'active'
+      || !['left', 'inactive', 'withdrawn', 'transferred'].includes(String(student.status || '').toLowerCase());
+    student.status = 'Left';
+    student.tcCertificateNo = cert.certificate_no || student.tcCertificateNo || '';
+    student.tcNo = cert.certificate_no || student.tcNo || '';
+    student.leftAt = student.leftAt || cert.issued_at || new Date().toISOString();
+    student.leftReason = student.leftReason || 'Transfer certificate issued';
+    if (snap.name && !student.name) student.name = snap.name;
+    if (snap.parentName && !student.parentName) student.parentName = snap.parentName;
+    if (wasActive) markedLeft += 1;
+  });
+
+  return { payload, restored, markedLeft };
+}
+
+async function handleRecoverFromTcRegister(req, res, schoolId) {
+  if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST required.' });
+  const session = await requireErpSession(req, res);
+  if (!session) return;
+  if (!isTcAdministrator(session)) {
+    return json(res, 403, { ok: false, error: 'Super Admin / Principal access is required.' });
+  }
+
+  const snapshot = await readSnapshot(schoolId);
+  if (!snapshot?.payload || !Array.isArray(snapshot.payload.students)) {
+    return json(res, 404, { ok: false, error: 'School cloud roster not found.' });
+  }
+
+  const certificates = await listTcCertificatesInternal(schoolId);
+  const merged = applyTcCertificatesToPayload({ ...snapshot.payload, students: snapshot.payload.students.slice() }, certificates);
+  if (!certificates.length) {
+    return json(res, 200, { ok: true, configured: true, tcCount: 0, restored: 0, markedLeft: 0, message: 'No issued TCs in cloud register.' });
+  }
+
+  merged.payload.savedAt = new Date().toISOString();
+  const written = await writeSnapshot(schoolId, merged.payload, `recover-tc:${session.username}`);
+  return json(res, 200, {
+    ok: true,
+    configured: true,
+    schoolId,
+    tcCount: certificates.length,
+    restored: merged.restored,
+    markedLeft: merged.markedLeft,
+    studentCount: merged.payload.students.length,
+    savedAt: written?.snapshot?.saved_at || merged.payload.savedAt
+  });
 }
 
 async function handleTcRevoke(req, res, schoolId) {
@@ -1237,7 +1325,21 @@ async function ensureSnapshotHasStudents(schoolId) {
     return { snapshot, rebuilt: false, studentCount: count };
   }
 
-  const rebuilt = await rebuildPayloadFromNative(schoolId, snapshot?.payload || {});
+  // Never rebuild from native if staff/teachers exist — native table is students-only
+  // and a rebuild would wipe staff logins, Telegram links, and left-student history.
+  const basePayload = snapshot?.payload || {};
+  const hasStaffMeta = (Array.isArray(basePayload.staffUsers) && basePayload.staffUsers.length > 0)
+    || (Array.isArray(basePayload.teachers) && basePayload.teachers.length > 0);
+  if (hasStaffMeta) {
+    return {
+      snapshot: snapshot || null,
+      rebuilt: false,
+      studentCount: 0,
+      error: 'Snapshot is empty but staff/teachers metadata exists — refusing native rebuild. Contact admin or restore from Supabase backup.'
+    };
+  }
+
+  const rebuilt = await rebuildPayloadFromNative(schoolId, basePayload);
   if (!rebuilt.ok || !rebuilt.payload) {
     return {
       snapshot: snapshot || null,
@@ -1568,7 +1670,7 @@ async function route(req, res, action) {
   }
   if ([
     'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'photoPatch', 'photoStorageUpload', 'nativeStudents', 'nativeMigrate', 'nativePayments',
-    'rebuildSnapshot', 'wipeRoster', 'authLogin', 'authLogout', 'authSession', 'authChangePassword',
+    'rebuildSnapshot', 'wipeRoster', 'recoverFromTcRegister', 'authLogin', 'authLogout', 'authSession', 'authChangePassword',
     'authAdminResetPassword', 'authAudit', 'tcIssue', 'tcGet', 'tcList', 'tcVerify', 'tcRevoke'
   ].includes(act)) {
     await erpCloudHandler(req, res);
@@ -1749,6 +1851,13 @@ async function erpCloudHandler(req, res) {
         } catch (err) {
           console.error('[ERP-CLOUD] native payment overlay failed:', err.message);
         }
+        try {
+          const certificates = await listTcCertificatesInternal(schoolId);
+          const tcMerged = applyTcCertificatesToPayload(snapshot.payload, certificates);
+          snapshot.payload = tcMerged.payload;
+        } catch (err) {
+          console.error('[ERP-CLOUD] TC register overlay failed:', err.message);
+        }
       }
       return json(res, 200, {
         ok: true,
@@ -1759,6 +1868,10 @@ async function erpCloudHandler(req, res) {
         native: true,
         feesNative: true
       });
+    }
+
+    if (req.method === 'POST' && action === 'recoverFromTcRegister') {
+      return handleRecoverFromTcRegister(req, res, schoolId);
     }
 
     if (req.method === 'POST' && action === 'photoPatch') {
