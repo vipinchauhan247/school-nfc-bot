@@ -19,7 +19,12 @@ window.ERP_CLOUD_ONLY = true;
 (function () {
   if (window.MMMJHS_BOT_API_URL) return;
   const host = String(window.location.hostname || '').replace(/^www\./, '').toLowerCase();
-  if (host === 'mmmjhschool.com' || host.endsWith('.vercel.app')) {
+  if (
+    host === 'mmmjhschool.com'
+    || host.endsWith('.vercel.app')
+    || host === 'madanmohanmalviyaschool.com'
+    || host.includes('mmmjhschool')
+  ) {
     window.MMMJHS_BOT_API_URL = '/api/mmmjhs-bot';
   }
 })();
