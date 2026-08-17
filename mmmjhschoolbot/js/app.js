@@ -186,13 +186,19 @@ function getPrintLogoSource() {
 }
 
 function getSchoolLogoHtml(size = 62) {
-  const profile = getSchoolProfile();
-  const logoSrc = profile.logoDataUrl || 'assets/school_logo.png';
+  const logoSrc = getPrintLogoSource();
   return `<img src="${logoSrc}" alt="School Logo" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center; border:2px solid #d4af37; background:#ffffff; padding:2px;">`;
 }
 
+/** Official crest on report-card headers (dark gradient) — transparent logo, no white box. */
+function getReportCardLogoHtml(size = 65) {
+  const logoSrc = getPrintLogoSource();
+  return `<img src="${logoSrc}" alt="School Logo" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center; border:2px solid #d4af37; flex-shrink:0;">`;
+}
+
 function getTransferCertificateLogoHtml(size = 78) {
-  return `<img src="assets/school_logo_tc.png" alt="School Logo" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center;">`;
+  const logoSrc = getPrintLogoSource();
+  return `<img src="${logoSrc}" alt="School Logo" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center;">`;
 }
 
 function applySchoolProfileToShell() {
@@ -205,8 +211,80 @@ function applySchoolProfileToShell() {
 }
 
 function getClassTeacherForStudent(student) {
-  const cls = (SchoolData.classes || []).find(c => c.name === (student.currentClass || student.class));
-  return cls?.teacher || '';
+  const clsName = student.currentClass || student.class;
+  const sec = normalizeClassSectionKey(student.currentSection || student.section || 'A');
+  const cls = (SchoolData.classes || []).find(c => c.name === clsName);
+  if (!cls) return '';
+  const map = getClassSectionTeachers(cls);
+  return map[sec] || cls.teacher || '';
+}
+
+function normalizeClassSectionKey(section) {
+  const sec = String(section || 'A').trim().toUpperCase();
+  return sec || 'A';
+}
+
+function getClassSectionTeachers(classObj) {
+  if (!classObj) return {};
+  const map = { ...(classObj.sectionTeachers || {}) };
+  if (classObj.teacher) {
+    (classObj.sections || ['A']).forEach((section) => {
+      const key = normalizeClassSectionKey(section);
+      if (!map[key]) map[key] = classObj.teacher;
+    });
+  }
+  return map;
+}
+
+function setClassSectionTeacher(classObj, section, teacherName) {
+  if (!classObj) return;
+  if (!classObj.sectionTeachers) classObj.sectionTeachers = {};
+  const key = normalizeClassSectionKey(section);
+  const name = String(teacherName || '').trim();
+  if (name) classObj.sectionTeachers[key] = name;
+  else delete classObj.sectionTeachers[key];
+  const primarySection = normalizeClassSectionKey((classObj.sections || ['A'])[0]);
+  classObj.teacher = classObj.sectionTeachers[primarySection] || Object.values(classObj.sectionTeachers)[0] || '';
+}
+
+function getSessionDateBounds(session) {
+  const match = String(session || SchoolData.activeSession || '2026-27').match(/(\d{4})-(\d{2})/);
+  if (!match) return null;
+  const startYear = parseInt(match[1], 10);
+  const endYear = startYear + 1;
+  return { start: `${startYear}-04-01`, end: `${endYear}-03-31` };
+}
+
+function isDateInSession(dateKey, session) {
+  const bounds = getSessionDateBounds(session);
+  if (!bounds || !dateKey) return true;
+  const day = String(dateKey).slice(0, 10);
+  return day >= bounds.start && day <= bounds.end;
+}
+
+function getStudentAttendanceSummaryForReport(student, session = SchoolData.activeSession) {
+  const logs = student?.attendanceLogs || {};
+  let daysPresent = 0;
+  let daysAbsent = 0;
+  let daysLate = 0;
+  Object.entries(logs).forEach(([dateKey, log]) => {
+    if (!isDateInSession(dateKey, session)) return;
+    const status = String(log?.status || '').trim().toLowerCase();
+    if (status === 'present') daysPresent += 1;
+    else if (status === 'late') { daysPresent += 1; daysLate += 1; }
+    else if (status === 'absent') daysAbsent += 1;
+  });
+  const workingDays = daysPresent + daysAbsent;
+  const percentage = workingDays ? Math.round((daysPresent / workingDays) * 100) : null;
+  return { daysPresent, daysAbsent, daysLate, workingDays, percentage, session };
+}
+
+function formatReportCardAttendanceLine(summary) {
+  if (!summary || !summary.workingDays) {
+    return 'Attendance: Not recorded for this session yet';
+  }
+  const lateNote = summary.daysLate ? ` (incl. ${summary.daysLate} late)` : '';
+  return `Attendance: ${summary.daysPresent} / ${summary.workingDays} working days${lateNote} — ${summary.percentage}%`;
 }
 
 function getTeacherSignatureByName(teacherName) {
@@ -254,7 +332,7 @@ if (!SchoolData.userPermissions) {
     "Super Admin": { weightage: true, teachers: true, students: true, fees: true, reportCards: true, timetable: true, attendance: true },
     "Principal": { weightage: true, teachers: true, students: true, fees: true, reportCards: true, timetable: true, attendance: true },
     "Accountant": { weightage: false, teachers: false, students: true, fees: true, reportCards: false, timetable: false, attendance: true },
-    "Class Teacher": { weightage: true, teachers: false, students: true, fees: false, reportCards: true, timetable: true, attendance: true },
+    "Class Teacher": { weightage: false, teachers: false, students: true, fees: false, reportCards: true, timetable: true, attendance: true },
     "Exam Incharge": { weightage: true, teachers: false, students: true, fees: false, reportCards: true, timetable: false, attendance: true }
   };
 }
@@ -1811,10 +1889,22 @@ function handleRouting() {
       case 'exams-entry': renderExamsPage(container, 'entry'); break;
       case 'exams-structure':
         window.location.hash = 'exams-weightage';
+        if (!canUserConfigureExamWeightage()) {
+          showNotification('Access Denied: Subject Marks & Weightage config is restricted for your account.', 'warning');
+          renderExamsPage(container, 'entry');
+          break;
+        }
         renderExamsWeightageSubdirectoryPage(container);
         break;
       case 'exams-report-cards': renderExamsReportCardsSubdirectoryPage(container); break;
-      case 'exams-weightage': renderExamsWeightageSubdirectoryPage(container); break;
+      case 'exams-weightage':
+        if (!canUserConfigureExamWeightage()) {
+          showNotification('Access Denied: Subject Marks & Weightage config is restricted for your account.', 'warning');
+          renderExamsPage(container, 'entry');
+          break;
+        }
+        renderExamsWeightageSubdirectoryPage(container);
+        break;
       case 'exams-schedule': renderExamSchedulePage(container); break;
       case 'exams-admit-card': renderAdmitCardPage(container); break;
       case 'users': renderUsersPage(container); break;
@@ -2795,6 +2885,8 @@ function renderExamsPage(container, mode = 'entry') {
     allSubjects = allSubjectsList.filter(sub => sub.code === selectedSubjectFilter);
   }
   const canExportExamSheets = canCurrentUserExportExamSheets();
+  const canConfigureWeightage = canUserConfigureExamWeightage();
+  const showWeightageInHeaders = canUserViewExamWeightage();
 
   container.innerHTML = `
     <div class="page-header">
@@ -2803,9 +2895,11 @@ function renderExamsPage(container, mode = 'entry') {
         <p class="page-subtitle">Enter All Subject Exam Scores Side-By-Side Per Student & Manage Class Weightage Rules</p>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        ${canConfigureWeightage ? `
         <button class="btn btn-primary" style="background:#f59e0b; border:none;" onclick="window.location.hash='exams-weightage'">
           <i class="fa-solid fa-sliders"></i> Subject Exam Marks & Weightage
         </button>
+        ` : ''}
         ${canExportExamSheets ? `
           <button class="btn btn-primary" style="background:linear-gradient(135deg, #10b981 0%, #059669 100%); border:none;" onclick="exportClassHalfYearlyExcel('${activeClass}')">
             <i class="fa-solid fa-file-excel"></i> Half-Yearly Excel
@@ -2889,7 +2983,7 @@ function renderExamsPage(container, mode = 'entry') {
           <div style="padding:8px 14px; background:rgba(16, 185, 129, 0.15); border:1px solid #10b981; border-radius:8px; color:#10b981; font-weight:700; font-size:0.82rem;">
             Subject-wise exam max marks and weightage are active for ${activeClass}.
           </div>
-          ${(getCurrentActiveUser().role === 'Super Admin' || getCurrentActiveUser().role === 'Principal') ? `
+          ${canConfigureWeightage ? `
             <button class="btn btn-secondary" onclick="window.location.hash='exams-weightage'"><i class="fa-solid fa-gear"></i> Edit Weightage</button>
           ` : ''}
         </div>
@@ -3068,16 +3162,16 @@ function renderExamsPage(container, mode = 'entry') {
                 const finWeight = getSubjectExamComponentWeightage(activeClass, sub.code || sub.name, 'fin');
                 if (examTerm === 'half_yearly') {
                   return `
-                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${sub.code} UT1 (${ut1Max} -> ${ut1Weight})</th>
-                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${sub.code} UT2 (${ut2Max} -> ${ut2Weight})</th>
-                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${sub.code} HY (${hyMax} -> ${hyWeight})</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'UT1', ut1Max, ut1Weight, showWeightageInHeaders)}</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'UT2', ut2Max, ut2Weight, showWeightageInHeaders)}</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'HY', hyMax, hyWeight, showWeightageInHeaders)}</th>
                     <th style="position:sticky; top:46px; z-index:20; background:#0f172a; color:#fbbf24; border:1px solid #475569; padding:8px; font-size:0.95rem;">${sub.code} TOT (100)</th>
                   `;
                 } else if (examTerm === 'final_annual') {
                   return `
-                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${sub.code} T2 UT1 (${ut3Max} -> ${ut3Weight})</th>
-                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${sub.code} T2 UT2 (${ut4Max} -> ${ut4Weight})</th>
-                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${sub.code} FINAL (${finMax} -> ${finWeight})</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'T2 UT1', ut3Max, ut3Weight, showWeightageInHeaders)}</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'T2 UT2', ut4Max, ut4Weight, showWeightageInHeaders)}</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'FINAL', finMax, finWeight, showWeightageInHeaders)}</th>
                     <th style="position:sticky; top:46px; z-index:20; background:#064e3b; color:#a7f3d0; border:1px solid #065f46; padding:8px; font-size:0.95rem;">${sub.code} TOT (100)</th>
                   `;
                 } else {
@@ -3772,13 +3866,13 @@ function renderUsersPage(container) {
         </button>
       </div>
 
-      <div class="data-table-container">
-        <table class="data-table" style="text-align:center; font-size:0.88rem;">
+      <div class="data-table-container users-matrix-scroll custom-matrix-scroll">
+        <table class="data-table users-permissions-matrix" style="text-align:center; font-size:0.88rem; min-width:1400px;">
           <thead>
             <tr style="background:#0f172a; color:#ffffff;">
-              <th style="text-align:left; padding:12px;">Staff User Name</th>
+              <th class="users-sticky-name" style="text-align:left; padding:12px;">Staff User Name</th>
+              <th class="users-sticky-role" style="text-align:left; padding:12px;">Role / Designation</th>
               <th style="text-align:left; padding:12px;">Staff ID</th>
-              <th style="text-align:left; padding:12px;">Role / Designation</th>
               <th style="text-align:left; padding:12px; background:rgba(2, 132, 199, 0.2); color:#38bdf8;">Username & Password</th>
               <th style="text-align:left; padding:12px; background:rgba(56, 189, 248, 0.15); color:#38bdf8;">Telegram Chat ID</th>
               <th style="text-align:left; padding:12px; background:rgba(99, 102, 241, 0.2); color:#818cf8;">Teacher Subject Mappings</th>
@@ -3799,9 +3893,9 @@ function renderUsersPage(container) {
 
               return `
                 <tr style="border-bottom:1px solid #334155;">
-                  <td style="text-align:left; font-weight:800; color:#38bdf8; padding:12px;">${u.name}</td>
+                  <td class="users-sticky-name" style="text-align:left; font-weight:800; color:#38bdf8; padding:12px;">${u.name}</td>
+                  <td class="users-sticky-role" style="text-align:left; padding:12px; color:#cbd5e1; font-weight:700;">${u.role}</td>
                   <td style="text-align:left; padding:12px;"><code style="color:#fbbf24; font-weight:800;">${u.uniqueId || u.id}</code></td>
-                  <td style="text-align:left; padding:12px; color:#cbd5e1; font-weight:700;">${u.role}</td>
 
                   <!-- USERNAME & PASSWORD -->
                   <td style="text-align:left; padding:12px;">
@@ -3848,17 +3942,17 @@ function renderUsersPage(container) {
 
                   <!-- CAN MANAGE FEES -->
                   <td style="padding:12px;">
-                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${u.canManageFees || u.role === 'Accountant' || u.role === 'Super Admin' ? 'checked' : ''} data-uid="${u.id}" data-field="canManageFees">
+                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${(!isTeacher && u.canManageFees) || u.role === 'Accountant' || u.role === 'Super Admin' || u.role === 'Principal' || u.role === 'Receptionist' ? 'checked' : ''} data-uid="${u.id}" data-field="canManageFees" ${isTeacher ? 'disabled title="Teachers cannot collect fees by default"' : ''}>
                   </td>
 
                   <!-- VIEW REVENUE -->
                   <td style="padding:12px;">
-                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${u.viewTotalRevenue ? 'checked' : ''} data-uid="${u.id}" data-field="viewTotalRevenue">
+                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${(!isTeacher && u.viewTotalRevenue) || u.role === 'Accountant' || u.role === 'Super Admin' || u.role === 'Principal' ? 'checked' : ''} data-uid="${u.id}" data-field="viewTotalRevenue" ${isTeacher ? 'disabled title="Teachers cannot view school revenue totals"' : ''}>
                   </td>
 
                   <!-- VIEW DUES -->
                   <td style="padding:12px;">
-                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${u.viewDueBalance ? 'checked' : ''} data-uid="${u.id}" data-field="viewDueBalance">
+                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${(!isTeacher && u.viewDueBalance) || u.role === 'Accountant' || u.role === 'Super Admin' || u.role === 'Principal' ? 'checked' : ''} data-uid="${u.id}" data-field="viewDueBalance" ${isTeacher ? 'disabled title="Teachers cannot view school-wide dues totals"' : ''}>
                   </td>
 
                   <!-- TELEGRAM BOT HUB ACCESS -->
@@ -3904,11 +3998,11 @@ function renderUsersPage(container) {
 function getExamsSubNavHtml(active) {
   const tabs = [
     { hash: 'exams-entry', icon: 'fa-table-cells', label: 'Marks Entry' },
-    { hash: 'exams-weightage', icon: 'fa-sliders', label: 'Subject Marks & Weightage' },
+    { hash: 'exams-weightage', icon: 'fa-sliders', label: 'Subject Marks & Weightage', requiresWeightageConfig: true },
     { hash: 'exams-report-cards', icon: 'fa-award', label: 'Report Cards' },
     { hash: 'exams-schedule', icon: 'fa-calendar-days', label: 'Exam Schedule' },
     { hash: 'exams-admit-card', icon: 'fa-id-card', label: 'Admit Card' }
-  ];
+  ].filter(t => !t.requiresWeightageConfig || canUserConfigureExamWeightage());
   return `
     <div style="display:flex; gap:12px; margin-bottom:20px; border-bottom:2px solid var(--border-color); padding-bottom:12px; flex-wrap:wrap;">
       ${tabs.map(t => `
@@ -4057,9 +4151,19 @@ function renderExamSchedulePage(container) {
                 <td>
                   <input list="examSubjectPresets" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="subject" value="${escapeHtml(row.subject || '')}" placeholder="Subject" style="min-width:170px;">
                 </td>
-                <td><input type="date" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="date" value="${escapeHtml(row.date || '')}"></td>
-                <td><input type="time" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="startTime" value="${escapeHtml(row.startTime || '')}"></td>
-                <td><input type="time" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="endTime" value="${escapeHtml(row.endTime || '')}"></td>
+                <td><input type="date" class="session-dropdown date-filter-input exam-schedule-input" data-index="${idx}" data-field="date" value="${escapeHtml(row.date || '')}"></td>
+                <td>
+                  <div class="exam-schedule-time-wrap">
+                    <i class="fa-solid fa-clock exam-schedule-clock-icon" aria-hidden="true"></i>
+                    <input type="time" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="startTime" value="${escapeHtml(row.startTime || '')}">
+                  </div>
+                </td>
+                <td>
+                  <div class="exam-schedule-time-wrap">
+                    <i class="fa-solid fa-clock exam-schedule-clock-icon" aria-hidden="true"></i>
+                    <input type="time" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="endTime" value="${escapeHtml(row.endTime || '')}">
+                  </div>
+                </td>
                 <td><input type="number" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="maxMarks" value="${escapeHtml(row.maxMarks || '')}" placeholder="30" style="min-width:80px;"></td>
                 <td><button class="btn btn-danger" style="padding:6px 10px; font-size:0.78rem;" onclick="deleteExamScheduleRow(${idx})"><i class="fa-solid fa-trash"></i> Delete</button></td>
               </tr>
@@ -4690,6 +4794,7 @@ const ERP_MODULES_LIST = {
   ],
   exams: [
     { key: "exam_marks_entry", name: "Exam Marks Entry Broadsheet (#exams-entry)" },
+    { key: "exam_weightage_view", name: "View Weightage Values in Marks Entry Headers", viewOnly: true },
     { key: "class_weightage_config", name: "Class Weightage Rules & Raw Test Config (#exams-weightage)" },
     { key: "class_subject_setup", name: "Class Exam Subject & Max Marks Setup (#exams-structure)" },
     { key: "report_cards_print", name: "Report Cards Printing & Class Ranks (#exams-report-cards)" },
@@ -5103,6 +5208,83 @@ function repairStaffFinancialVisibilityRights() {
     SchoolData._finRightsV2 = true;
     changed = true;
   }
+
+  if (!SchoolData._finRightsV3) {
+    (SchoolData.staffUsers || []).forEach((u) => {
+      if (!isTeacherRoleUser(u)) return;
+      if (u.viewDueBalance || u.viewTotalRevenue || u.canManageFees) changed = true;
+      u.viewDueBalance = false;
+      u.viewTotalRevenue = false;
+      u.canManageFees = false;
+      u.hideFees = true;
+      ensureStaffAccessRight(u, 'total_dues_view', 'view', false);
+      ensureStaffAccessRight(u, 'total_revenue_view', 'view', false);
+      ensureStaffAccessRight(u, 'fee_collection', 'view', false);
+      ensureStaffAccessRight(u, 'fee_collection', 'add', false);
+      ensureStaffAccessRight(u, 'fee_collection', 'modify', false);
+      ensureStaffAccessRight(u, 'student_dues_view', 'view', false);
+      ensureStaffAccessRight(u, 'fee_receipt_print', 'view', false);
+      ensureStaffAccessRight(u, 'fee_receipt_deletion', 'view', false);
+      ensureStaffAccessRight(u, 'fee_receipt_deletion', 'delete', false);
+      ensureStaffAccessRight(u, 'telegram_fee_notice', 'view', false);
+      changed = true;
+    });
+    SchoolData._finRightsV3 = true;
+  }
+
+  if (!SchoolData._finRightsV4) {
+    const feeKeys = (ERP_MODULES_LIST.fees || []).map((m) => m.key);
+    const teacherExamConfigKeys = ['class_weightage_config', 'class_subject_setup'];
+    const denyAllActions = (rightsObj, key) => {
+      if (!rightsObj[key]) rightsObj[key] = {};
+      ['view', 'add', 'modify', 'delete'].forEach((action) => {
+        rightsObj[key][action] = false;
+      });
+    };
+
+    (SchoolData.staffUsers || []).forEach((u) => {
+      const role = String(u.role || '').trim();
+      if (isErpAdminUser(u) || role === 'Accountant') return;
+
+      if (role === 'Receptionist') {
+        ['view', 'add', 'modify', 'delete'].forEach((action) => {
+          ensureStaffAccessRight(u, 'fee_receipt_deletion', action, false);
+        });
+        changed = true;
+        return;
+      }
+
+      if (isTeacherRoleUser(u) || role === 'Exam Incharge' || role === 'Subject Teacher') {
+        feeKeys.forEach((key) => {
+          ['view', 'add', 'modify', 'delete'].forEach((action) => {
+            ensureStaffAccessRight(u, key, action, false);
+          });
+        });
+        teacherExamConfigKeys.forEach((key) => {
+          ['view', 'add', 'modify', 'delete'].forEach((action) => {
+            ensureStaffAccessRight(u, key, action, false);
+          });
+        });
+        u.viewDueBalance = false;
+        u.viewTotalRevenue = false;
+        u.canManageFees = false;
+        u.hideFees = true;
+        changed = true;
+      }
+    });
+
+    ['Class Teacher & Subject Teacher', 'Subject Teacher', 'Class Teacher', 'Exam Incharge'].forEach((roleName) => {
+      const template = getRolePermissionTemplate(roleName);
+      if (!template) return;
+      feeKeys.forEach((key) => denyAllActions(template, key));
+      if (roleName !== 'Exam Incharge') {
+        teacherExamConfigKeys.forEach((key) => denyAllActions(template, key));
+      }
+      changed = true;
+    });
+
+    SchoolData._finRightsV4 = true;
+  }
   return changed;
 }
 
@@ -5139,6 +5321,54 @@ function canCurrentUserExportExamSheets() {
   return hasUserAccessPermission(user, 'exam_exports', 'view') === true;
 }
 
+function canUserViewExamWeightage(user = getCurrentActiveUser()) {
+  return hasUserAccessPermission(user, 'exam_weightage_view', 'view') === true;
+}
+
+function canUserConfigureExamWeightage(user = getCurrentActiveUser()) {
+  return hasUserAccessPermission(user, 'class_weightage_config', 'view') === true;
+}
+
+function formatExamComponentHeaderLabel(subjectCode, componentLabel, maxMarks, weightageMarks, showWeightage) {
+  const code = subjectCode || '';
+  if (showWeightage) {
+    return `${code} ${componentLabel} (${maxMarks} -> ${weightageMarks})`;
+  }
+  return `${code} ${componentLabel} (${maxMarks})`;
+}
+
+function getStudentClassSectionLabel(student) {
+  if (!student) return '';
+  const cls = student.currentClass || student.class || '';
+  const sec = student.currentSection || student.section || '';
+  return sec ? `${cls} - ${sec}` : cls;
+}
+
+function getStudentFeeDueSnapshot(admissionNo) {
+  const student = findStudentByAdmissionNo(admissionNo);
+  if (!student) {
+    return {
+      classSection: '',
+      tuitionDue: '',
+      annualDue: '',
+      examDue: '',
+      prevDue: '',
+      totalDue: ''
+    };
+  }
+  const status = getStudentFeeCategoryStatus(student);
+  const prevDue = Number(student.currentFeeInfo?.previousSessionDue || 0);
+  const tuitionDueOnly = Math.max(0, Number(status.tuitionDue || 0) - prevDue);
+  return {
+    classSection: getStudentClassSectionLabel(student),
+    tuitionDue: tuitionDueOnly,
+    annualDue: status.annualDue,
+    examDue: status.examDue,
+    prevDue,
+    totalDue: status.totalDue
+  };
+}
+
 function canCurrentUserExportStudents() {
   const user = getCurrentActiveUser();
   return hasUserAccessPermission(user, 'student_exports', 'view') === true;
@@ -5153,6 +5383,12 @@ function canCurrentUserBulkDeleteStudents() {
 function canCurrentUserDeleteSubjects() {
   const role = String(getCurrentActiveUser()?.role || '').toLowerCase().trim();
   return role.includes('super admin') || role.includes('principal');
+}
+
+function canCurrentUserDeleteFeeReceipts(user = getCurrentActiveUser()) {
+  if (!user) return false;
+  if (isErpAdminUser(user)) return true;
+  return hasUserAccessPermission(user, 'fee_receipt_deletion', 'delete') === true;
 }
 
 function canCurrentUserAddSubjects() {
@@ -5240,10 +5476,18 @@ function getDefaultAccessRightsForRole(role) {
         base[mod.key] = { view: false, add: false, modify: false, delete: false };
       }
     } else if (isTeacher) {
-      if (['exam_marks_entry', 'report_cards_print', 'exam_exports', 'attendance_register', 'student_directory'].includes(mod.key)) {
+      if (mod.key.includes('fee') || mod.key.includes('revenue') || mod.key.includes('dues') || mod.key === 'telegram_fee_notice') {
+        base[mod.key] = { view: false, add: false, modify: false, delete: false };
+      } else if (['exam_marks_entry', 'report_cards_print', 'exam_exports', 'attendance_register', 'student_directory'].includes(mod.key)) {
         base[mod.key] = { view: true, add: true, modify: true, delete: false };
       } else if (['teacher_subject_mappings', 'timetable_management', 'exam_schedule_manage', 'admit_card_print'].includes(mod.key)) {
         base[mod.key] = { view: true, add: false, modify: false, delete: false };
+      } else {
+        base[mod.key] = { view: false, add: false, modify: false, delete: false };
+      }
+    } else if (role === 'Exam Incharge') {
+      if (['exam_marks_entry', 'report_cards_print', 'exam_exports', 'exam_weightage_view', 'class_weightage_config', 'class_subject_setup', 'exam_schedule_manage', 'admit_card_print', 'student_directory', 'attendance_register'].includes(mod.key)) {
+        base[mod.key] = { view: true, add: true, modify: true, delete: false };
       } else {
         base[mod.key] = { view: false, add: false, modify: false, delete: false };
       }
@@ -6124,6 +6368,10 @@ function saveUserPermissionsMatrix() {
     const field = box.getAttribute('data-field');
     const uObj = SchoolData.staffUsers.find(x => x.id === uid);
     if (uObj) {
+      if (isTeacherRoleUser(uObj) && ['canManageFees', 'viewTotalRevenue', 'viewDueBalance'].includes(field)) {
+        uObj[field] = false;
+        return;
+      }
       uObj[field] = box.checked;
       // Sync Access Rights modules so dashboard/fees enforcement matches the matrix
       if (field === 'viewTotalRevenue') {
@@ -7074,6 +7322,10 @@ function viewCombinedConsolidatedReportCard(admissionNo) {
   const roll = student.currentRollNo || student.rollNo || '1';
   const sigs = SchoolData.signatures || {};
   const school = getSchoolProfile();
+  const classTeacherName = getClassTeacherForStudent(student) || sigs.teacherName || 'Class Teacher';
+  const classTeacherSignature = getTeacherSignatureByName(classTeacherName) || sigs.teacherSig || '';
+  const attendanceSummary = getStudentAttendanceSummaryForReport(student, currentSession);
+  const attendanceLine = formatReportCardAttendanceLine(attendanceSummary);
 
   const subjects = [
     { name: "English Language & Literature", ut1: 15, ut2: 15, hy: 70, ut3: 15, ut4: 14, fin: 68 },
@@ -7126,7 +7378,7 @@ function viewCombinedConsolidatedReportCard(admissionNo) {
           <!-- 1-PAGE COMBINED HEADER WITH EMBLEM -->
           <div style="display:flex; align-items:center; justify-content:space-between; border-bottom:3px double #0f172a; padding-bottom:10px; margin-bottom:12px;">
             <div style="display:flex; align-items:center; gap:14px;">
-              ${getSchoolLogoHtml(60)}
+              ${getReportCardLogoHtml(60)}
               <div>
                 <h2 style="font-family:'Playfair Display', serif; font-size:1.3rem; margin:0; color:#0f172a; text-transform:uppercase;">${school.name}</h2>
                 <p style="margin:2px 0 0 0; font-size:0.75rem; color:#475569; font-weight:600;">${school.address} - Session ${currentSession}</p>
@@ -7144,6 +7396,7 @@ function viewCombinedConsolidatedReportCard(admissionNo) {
             <div><strong>Admission No:</strong> <code>${student.admissionNo}</code></div>
             <div><strong>Class:</strong> ${cls} - ${sec} (Roll: ${roll})</div>
             <div><strong>Father:</strong> ${student.parentName} | <strong>Mother:</strong> ${student.motherName || 'N/A'} | <strong>DOB:</strong> <span style="color:#0284c7; font-weight:700;">${formatDobToDDMMYYYY(student.dob)}</span></div>
+            <div><strong>${attendanceLine}</strong> | <strong>Class Teacher:</strong> ${classTeacherName}</div>
           </div>
 
           <!-- SIDE-BY-SIDE DUAL TERM COMBINED MARKS TABLE -->
@@ -7219,10 +7472,10 @@ function viewCombinedConsolidatedReportCard(admissionNo) {
             <!-- TEACHER SIG -->
             <div style="text-align:center;">
               <div style="height:38px; display:flex; align-items:flex-end; justify-content:center;">
-                ${sigs.teacherSig ? `
-                  <img src="${sigs.teacherSig}" style="max-height:38px; max-width:110px; object-fit:contain;">
+                ${classTeacherSignature ? `
+                  <img src="${classTeacherSignature}" style="max-height:38px; max-width:110px; object-fit:contain;">
                 ` : `
-                  <span style="font-family:'Caveat', cursive; font-size:1.15rem; color:#4f46e5; font-weight:bold;">${sigs.teacherName || 'Varsha Chauhan'}</span>
+                  <span style="font-family:'Caveat', cursive; font-size:1.15rem; color:#4f46e5; font-weight:bold;">${classTeacherName}</span>
                 `}
               </div>
               <div style="border-top:1px solid #94a3b8; padding-top:2px; font-weight:600; color:#475569;">Class Teacher Signature</div>
@@ -7283,14 +7536,16 @@ function viewHalfYearlyReportCard(admissionNo) {
   const roll = student.currentRollNo || student.rollNo || '1';
   const sigs = SchoolData.signatures || {};
   const school = getSchoolProfile();
+  const currentSession = SchoolData.activeSession;
   const classTeacherName = getClassTeacherForStudent(student) || sigs.teacherName || 'Class Teacher';
   const classTeacherSignature = getTeacherSignatureByName(classTeacherName) || sigs.teacherSig || '';
   const principalSignature = school.principalSignatureDataUrl || sigs.principalSig || '';
+  const attendanceSummary = getStudentAttendanceSummaryForReport(student, currentSession);
+  const attendanceLine = formatReportCardAttendanceLine(attendanceSummary);
   const isPrimary = (cls.includes('Nursery') || cls.includes('LKG') || cls.includes('UKG') || cls.includes('Class 1') || cls.includes('Class 2') || cls.includes('Class 3') || cls.includes('Class 4') || cls.includes('Class 5'));
   
   const utMax = isPrimary ? 15 : 10;
   const hyMax = isPrimary ? 70 : 80;
-  const currentSession = SchoolData.activeSession;
 
   const configuredSubs = getSubjectsForClassAndExam(cls, 'half_yearly');
   const subjects = configuredSubs.map(s => {
@@ -7361,7 +7616,7 @@ function viewHalfYearlyReportCard(admissionNo) {
         <!-- LUXURY GRADIENT HEADER WITH OFFICIAL LOGO EMBLEM -->
         <div style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #1e1b4b 100%); color:#ffffff; padding:20px 24px; border-top-left-radius:16px; border-top-right-radius:16px; display:flex; align-items:center; justify-content:space-between; position:relative; border-bottom:4px solid #f59e0b;">
           <div style="display:flex; align-items:center; gap:16px;">
-            ${getSchoolLogoHtml(65)}
+            ${getReportCardLogoHtml(65)}
             <div>
               <h1 style="font-family:'Playfair Display', serif; font-size:1.4rem; letter-spacing:1px; margin:0; color:#ffffff;">${school.name.toUpperCase()}</h1>
               <p style="margin:2px 0 0 0; font-size:0.8rem; color:#cbd5e1; font-weight:500;">${school.address}</p>
@@ -7392,6 +7647,8 @@ function viewHalfYearlyReportCard(admissionNo) {
               <div><strong>Father Name:</strong> ${student.parentName}</div>
               <div><strong>Mother Name:</strong> ${student.motherName || 'N/A'}</div>
               <div><strong>Date of Birth:</strong> <strong style="color:#0284c7;">${formatDobToDDMMYYYY(student.dob)}</strong></div>
+              <div><strong>${attendanceLine}</strong></div>
+              <div><strong>Class Teacher:</strong> ${classTeacherName}</div>
             </div>
 
             <div style="display:flex; align-items:center; gap:12px;">
@@ -7513,14 +7770,16 @@ function viewFinalAnnualReportCard(admissionNo) {
   const roll = student.currentRollNo || student.rollNo || '1';
   const sigs = SchoolData.signatures || {};
   const school = getSchoolProfile();
+  const currentSession = SchoolData.activeSession;
   const classTeacherName = getClassTeacherForStudent(student) || sigs.teacherName || 'Class Teacher';
   const classTeacherSignature = getTeacherSignatureByName(classTeacherName) || sigs.teacherSig || '';
   const principalSignature = school.principalSignatureDataUrl || sigs.principalSig || '';
+  const attendanceSummary = getStudentAttendanceSummaryForReport(student, currentSession);
+  const attendanceLine = formatReportCardAttendanceLine(attendanceSummary);
   const isPrimary = (cls.includes('Nursery') || cls.includes('LKG') || cls.includes('UKG') || cls.includes('Class 1') || cls.includes('Class 2') || cls.includes('Class 3') || cls.includes('Class 4') || cls.includes('Class 5'));
   
   const utMax = isPrimary ? 15 : 10;
   const hyMax = isPrimary ? 70 : 80;
-  const currentSession = SchoolData.activeSession;
 
   const configuredSubs = getSubjectsForClassAndExam(cls, 'final_annual');
   const subjects = configuredSubs.map(s => {
@@ -7597,7 +7856,7 @@ function viewFinalAnnualReportCard(admissionNo) {
         <!-- LUXURY GRADIENT HEADER WITH OFFICIAL CREST LOGO -->
         <div style="background: linear-gradient(135deg, #065f46 0%, #047857 50%, #0f172a 100%); color:#ffffff; padding:20px 24px; border-top-left-radius:16px; border-top-right-radius:16px; display:flex; align-items:center; justify-content:space-between; border-bottom:4px solid #f59e0b; position:relative;">
           <div style="display:flex; align-items:center; gap:16px;">
-            ${getSchoolLogoHtml(65)}
+            ${getReportCardLogoHtml(65)}
             <div>
               <h1 style="font-family:'Playfair Display', serif; font-size:1.4rem; letter-spacing:1px; margin:0; color:#ffffff;">${school.name.toUpperCase()}</h1>
               <p style="margin:2px 0 0 0; font-size:0.8rem; color:#a7f3d0; font-weight:500;">${school.address} - Session ${currentSession}</p>
@@ -7628,6 +7887,8 @@ function viewFinalAnnualReportCard(admissionNo) {
               <div><strong>Father Name:</strong> ${student.parentName}</div>
               <div><strong>Mother Name:</strong> ${student.motherName || 'N/A'}</div>
               <div><strong>Date of Birth:</strong> <strong style="color:#059669;">${formatDobToDDMMYYYY(student.dob)}</strong></div>
+              <div><strong>${attendanceLine}</strong></div>
+              <div><strong>Class Teacher:</strong> ${classTeacherName}</div>
             </div>
 
             <div>
@@ -8503,7 +8764,7 @@ function renderStudentsPage(container) {
 
     <div class="glass-card">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:12px;">
-        <input type="text" id="studentSearchInput" placeholder="Search student name, adm no, or NFC UID..." class="session-dropdown" style="width:300px;" onkeyup="filterStudentsDirectoryTable()">
+        <input type="text" id="studentSearchInput" placeholder="Search student name or admission no..." class="session-dropdown" style="width:300px;" onkeyup="filterStudentsDirectoryTable()">
         <select id="studentClassFilter" class="session-dropdown" onchange="filterStudentsDirectoryTable()">
           ${getClassSelectOptionsHtml('ALL', { includeAll: true })}
         </select>
@@ -8516,7 +8777,6 @@ function renderStudentsPage(container) {
               <th>Student Name</th>
               <th>Admission No</th>
               <th>Class & Sec</th>
-              <th>NFC UID</th>
               <th>Parent Info</th>
               <th>Fee Status</th>
               <th>Actions</th>
@@ -8528,21 +8788,16 @@ function renderStudentsPage(container) {
               const dueAmount = (fee.dueMonths.length * getStudentMonthlyTuitionRate(s)) + (fee.previousSessionDue || 0);
 
               return `
-                <tr class="student-dir-row" data-name="${s.name.toLowerCase()}" data-adm="${s.admissionNo}" data-uid="${s.nfcUid.toLowerCase()}" data-class="${s.currentClass}">
+                <tr class="student-dir-row" data-name="${s.name.toLowerCase()}" data-adm="${s.admissionNo}" data-class="${s.currentClass}">
                   <td style="display:flex; align-items:center; gap:10px;">
                     <img src="${s.photo}" style="width:36px; height:36px; border-radius:50%; object-fit:cover;">
                     <div>
                       <strong style="color:var(--text-main);">${s.name}</strong><br>
-                      <small style="color:var(--text-muted);">${s.gender} | <strong style="color:#38bdf8;">DOB: ${formatDobToDDMMYYYY(s.dob)}</strong></small>
+                      <small style="color:var(--text-muted);">${s.gender} | <strong style="color:var(--accent-primary);">DOB: ${formatDobToDDMMYYYY(s.dob)}</strong></small>
                     </div>
                   </td>
                   <td><code>${s.admissionNo}</code></td>
                   <td><span class="badge badge-purple">${s.currentClass} - ${s.currentSection}</span></td>
-                  <td>
-                    ${s.nfcUid && s.nfcUid.trim().length > 0 
-                      ? `<code style="color:#38bdf8; font-weight:800; background:rgba(56,189,248,0.1); padding:3px 7px; border-radius:6px; border:1px solid rgba(56,189,248,0.3);"><i class="fa-solid fa-microchip"></i> ${s.nfcUid}</code>` 
-                      : `<span style="color:#64748b; font-weight:600; font-size:0.85rem;">--</span>`}
-                  </td>
                   <td>
                     <div style="font-size:0.8rem;">
                       <strong>${s.parentName}</strong><br>
@@ -8585,10 +8840,9 @@ function filterStudentsDirectoryTable() {
   rows.forEach(r => {
     const name = r.getAttribute('data-name') || '';
     const adm = r.getAttribute('data-adm') || '';
-    const uid = r.getAttribute('data-uid') || '';
     const cls = r.getAttribute('data-class') || '';
 
-    const matchQuery = !query || name.includes(query) || adm.includes(query) || uid.includes(query);
+    const matchQuery = !query || name.includes(query) || adm.includes(query);
     const matchClass = targetClass === 'ALL' || cls === targetClass;
 
     r.style.display = (matchQuery && matchClass) ? '' : 'none';
@@ -9049,7 +9303,7 @@ function openBulkStudentCsvModal() {
         <div style="background:rgba(14,165,233,0.12); border:1px solid rgba(14,165,233,0.45); border-radius:10px; padding:12px; margin-bottom:14px; color:#bae6fd; font-size:0.78rem; font-weight:700;">
           <div style="display:flex; gap:10px; align-items:flex-start; margin-bottom:10px;">
             <i class="fa-solid fa-shield-halved" style="margin-top:2px; color:#38bdf8;"></i>
-            <span>Safe import: existing students are matched by Admission No. Blank CSV cells never erase saved ERP details.</span>
+            <span>Safe import: existing students are matched by <strong>Admission No</strong>. Class, Section, Gender and Date of Admission from CSV always replace ERP values when the CSV cell is filled.</span>
           </div>
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
             <label style="display:flex; gap:8px; align-items:flex-start; background:#0f172a; border:1px solid #334155; border-radius:8px; padding:9px;">
@@ -9062,8 +9316,8 @@ function openBulkStudentCsvModal() {
             </label>
           </div>
           <label style="display:flex; gap:8px; align-items:center; margin-top:10px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.45); border-radius:8px; padding:9px; color:#fde68a;">
-            <input type="checkbox" id="addMissingStudentsOnCsvImport" onchange="updateCsvImportPreviewStats()">
-            <span>Add CSV admission numbers that are not already in ERP as new students</span>
+            <input type="checkbox" id="addMissingStudentsOnCsvImport" onchange="updateCsvImportPreviewStats()" ${!(SchoolData.students || []).length ? 'checked' : ''}>
+            <span>Add CSV admission numbers that are not already in ERP as new students${!(SchoolData.students || []).length ? ' <strong>(required — student list is empty)</strong>' : ''}</span>
           </label>
         </div>
 
@@ -9161,6 +9415,38 @@ function applyCsvValue(student, field, csvValue, mode) {
   if (shouldApplyCsvValue(student[field], csvValue, mode)) student[field] = csvValue;
 }
 
+function normalizeCsvGender(raw) {
+  const g = String(raw || '').trim().toLowerCase();
+  if (!g) return '';
+  if (g === 'm' || g === 'male' || g === 'boy') return 'Male';
+  if (g === 'f' || g === 'female' || g === 'girl') return 'Female';
+  return String(raw).trim();
+}
+
+function normalizeCsvPhone(raw) {
+  let s = String(raw ?? '').trim();
+  if (!s) return '';
+  if (/e\+/i.test(s)) {
+    const n = Number(s);
+    if (Number.isFinite(n)) s = String(Math.round(n));
+  }
+  s = s.replace(/\D/g, '');
+  if (s.length === 10) return s;
+  if (s.length === 12 && s.startsWith('91')) return s.slice(2);
+  return s || String(raw).trim();
+}
+
+function normalizeCsvSection(raw) {
+  const sec = String(raw || '').trim().toUpperCase();
+  if (!sec) return '';
+  return sec.length === 1 ? sec : sec.replace(/[^A-Z0-9]/g, '').slice(0, 2);
+}
+
+function applyCsvRegisterField(student, field, csvValue) {
+  if (!hasCsvValue(csvValue)) return;
+  student[field] = csvValue;
+}
+
 function applyCsvImportItemToStudent(student, item, currentSession, mode = 'fillBlanks') {
   applyCsvValue(student, 'name', item.name, mode);
   applyCsvValue(student, 'parentName', item.father, mode);
@@ -9185,6 +9471,23 @@ function applyCsvImportItemToStudent(student, item, currentSession, mode = 'fill
   }
   if (shouldApplyCsvValue(student.currentClass, item.cls, mode)) student.currentClass = item.cls;
   if (shouldApplyCsvValue(student.currentSection, item.sec, mode)) student.currentSection = item.sec;
+
+  // Register fields from CSV always win (class, gender, admission date) — fixes wrong UKG-B when CSV says Class 6.
+  applyCsvRegisterField(student, 'name', item.name);
+  applyCsvRegisterField(student, 'gender', item.gender);
+  applyCsvRegisterField(student, 'dateOfAdmission', item.dateOfAdmission);
+  applyCsvRegisterField(student, 'pen', item.pen);
+  applyCsvRegisterField(student, 'caste', item.caste);
+  if (hasCsvValue(item.cls)) {
+    student.sessionDetails[currentSession].class = item.cls;
+    student.currentClass = item.cls;
+    student.class = item.cls;
+  }
+  if (hasCsvValue(item.sec)) {
+    student.sessionDetails[currentSession].section = item.sec;
+    student.currentSection = item.sec;
+    student.section = item.sec;
+  }
 }
 
 function normalizeClassName(rawClass) {
@@ -9327,12 +9630,12 @@ function handleStudentCsvFileSelect(event) {
         admNo: cleanAdmNo,
         name: fullName,
         cls: normCls,
-        sec: (secIdx !== -1 && cleanVals[secIdx]) ? cleanVals[secIdx] : '',
+        sec: (secIdx !== -1 && cleanVals[secIdx]) ? normalizeCsvSection(cleanVals[secIdx]) : '',
         father: cleanVals[fatherIdx] || 'Parent',
         mother: (motherIdx !== -1 && cleanVals[motherIdx]) ? cleanVals[motherIdx] : '',
         dob: (dobIdx !== -1 && cleanVals[dobIdx]) ? cleanVals[dobIdx] : '',
-        gender: (genderIdx !== -1 && cleanVals[genderIdx]) ? cleanVals[genderIdx] : 'Male',
-        phone: (phoneIdx !== -1 && cleanVals[phoneIdx]) ? cleanVals[phoneIdx] : '',
+        gender: (genderIdx !== -1 && cleanVals[genderIdx]) ? normalizeCsvGender(cleanVals[genderIdx]) : '',
+        phone: (phoneIdx !== -1 && cleanVals[phoneIdx]) ? normalizeCsvPhone(cleanVals[phoneIdx]) : '',
         address: (addressIdx !== -1 && cleanVals[addressIdx]) ? cleanVals[addressIdx] : '',
         aadhaar: (aadhaarIdx !== -1 && cleanVals[aadhaarIdx]) ? cleanVals[aadhaarIdx] : 'N/A',
         dateOfAdmission: (doaIdx !== -1 && cleanVals[doaIdx]) ? formatAdmissionDateDisplay(cleanVals[doaIdx]) : '',
@@ -9439,7 +9742,7 @@ function importParsedStudentsFromCsv() {
 
     const admNo = item.admNo;
     if (!admNo) return;
-    const existingStudent = SchoolData.students.find(s => String(s.admissionNo).trim() === String(admNo).trim());
+    const existingStudent = findStudentByAdmissionNo(admNo);
     if (existingStudent) {
       applyCsvImportItemToStudent(existingStudent, item, currentSession, importMode);
       updatedExistingContactFields++;
@@ -9473,6 +9776,8 @@ function importParsedStudentsFromCsv() {
       sessionDetails: {
         [currentSession]: { class: item.cls || "Class 5", section: item.sec || "A", rollNo: "01", teacher: "Class Teacher", status: "Active" }
       },
+      currentClass: item.cls || "Class 5",
+      currentSection: item.sec || "A",
       currentFeeInfo: {
         session: currentSession,
         monthlyTuition: item.tuition,
@@ -9498,7 +9803,14 @@ function importParsedStudentsFromCsv() {
   if (modal) modal.remove();
 
   const modeText = importMode === 'fillBlanks' ? 'filled blank ERP fields only' : 'replaced ERP fields using non-blank CSV values';
-  showNotification(`Import complete: ${updatedExistingContactFields} existing record(s) ${modeText}. ${addedCount} new student(s) added. ${skippedNewAdmissionNumbers} unmatched CSV row(s) skipped.`, 'success');
+  const summary = `Import complete: ${updatedExistingContactFields} existing record(s) ${modeText}. ${addedCount} new student(s) added. ${skippedNewAdmissionNumbers} unmatched CSV row(s) skipped.`;
+  if (addedCount === 0 && skippedNewAdmissionNumbers > 0 && !addMissingStudents) {
+    showNotification(`${summary} Turn on "Add CSV admission numbers… as new students" when the list is empty or admission numbers are new.`, 'warning');
+  } else if (addedCount === 0 && updatedExistingContactFields === 0 && skippedNewAdmissionNumbers === 0) {
+    showNotification('Import finished but no rows were applied. Check CSV columns and admission numbers.', 'warning');
+  } else {
+    showNotification(summary, addedCount || updatedExistingContactFields ? 'success' : 'warning');
+  }
   _parsedBulkStudents = [];
 
   const mainContent = document.getElementById('contentBody');
@@ -9509,6 +9821,10 @@ function importParsedStudentsFromCsv() {
   }
 
   saveSchoolDataToStorage();
+  if (typeof flushCloudPushNow === 'function') flushCloudPushNow();
+  else if (typeof pushSchoolDataToCloud === 'function') {
+    pushSchoolDataToCloud({ skipMergePull: true }).catch((err) => console.warn('Student CSV cloud sync failed:', err));
+  }
 }
 
 /* ============================================================================
@@ -10071,17 +10387,17 @@ function openClassStudentsModal(className, targetSection = null) {
   });
 
   const modalHtml = `
-    <div class="modal-overlay active" id="classStudentsModal" style="z-index:99999; backdrop-filter:blur(8px);">
-      <div class="modal-box" style="max-width:96vw; width:96vw; max-height:94vh; background:#0f172a; color:#ffffff; padding:28px; border-radius:20px; border:2px solid #38bdf8; box-shadow:0 25px 50px -12px rgba(0,0,0,0.85); position:relative; display:flex; flex-direction:column;">
-        <button onclick="document.getElementById('classStudentsModal').remove()" style="position:absolute; top:16px; right:20px; background:#334155; color:#ffffff; border:none; width:36px; height:36px; border-radius:50%; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">X</button>
+    <div class="modal-overlay active class-students-modal" id="classStudentsModal" style="z-index:99999; backdrop-filter:blur(8px);">
+      <div class="modal-box theme-panel-modal" style="max-width:96vw; width:96vw; max-height:94vh; padding:28px; border-radius:20px; border:2px solid var(--accent-primary); box-shadow:0 25px 50px -12px rgba(0,0,0,0.35); position:relative; display:flex; flex-direction:column;">
+        <button onclick="document.getElementById('classStudentsModal').remove()" style="position:absolute; top:16px; right:20px; background:var(--bg-card); color:var(--text-main); border:1px solid var(--border-color); width:36px; height:36px; border-radius:50%; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">X</button>
 
         <!-- TOP HEADER BAR -->
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:18px; border-bottom:1px solid #334155; padding-bottom:14px; flex-wrap:wrap; gap:12px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:18px; border-bottom:1px solid var(--border-color); padding-bottom:14px; flex-wrap:wrap; gap:12px;">
           <div>
-            <h3 style="margin:0; color:#38bdf8; font-size:1.4rem; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+            <h3 style="margin:0; color:var(--accent-primary); font-size:1.4rem; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
               <i class="fa-solid fa-users"></i> Class Student Directory: ${className}
             </h3>
-            <p style="margin:4px 0 0 0; font-size:0.88rem; color:#cbd5e1;">Session ${currentSession} - Total ${allClassStudents.length} Enrolled Students</p>
+            <p class="theme-panel-muted" style="margin:4px 0 0 0; font-size:0.88rem;">Session ${currentSession} - Total ${allClassStudents.length} Enrolled Students</p>
           </div>
           
           <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
@@ -10109,10 +10425,10 @@ function openClassStudentsModal(className, targetSection = null) {
         </div>
 
         <!-- FULL WIDTH EXPANDED DATA TABLE -->
-        <div class="data-table-container" style="flex:1; max-height:65vh; overflow-y:auto; border:1px solid #334155; border-radius:12px; background:#0f172a;">
+        <div class="data-table-container theme-panel-table-wrap" style="flex:1; max-height:65vh; overflow-y:auto; border:1px solid var(--border-color); border-radius:12px;">
           <table class="data-table" style="font-size:0.88rem; width:100%;">
             <thead>
-              <tr style="background:#1e293b; color:#38bdf8;">
+              <tr class="theme-panel-table-head">
                 <th style="padding:12px;">Roll</th>
                 <th style="padding:12px;">Student Name</th>
                 <th style="padding:12px;">Admission No</th>
@@ -10120,28 +10436,26 @@ function openClassStudentsModal(className, targetSection = null) {
                 <th style="padding:12px;">Date of Birth (DOB)</th>
                 <th style="padding:12px;">Father's Name</th>
                 <th style="padding:12px;">Parent Phone</th>
-                <th style="padding:12px;">NFC Card UID</th>
                 <th style="padding:12px;">Actions</th>
               </tr>
             </thead>
             <tbody>
               ${displayStudents.length === 0 ? `
-                <tr><td colspan="9" style="text-align:center; padding:40px; color:#cbd5e1; font-size:1rem; font-weight:700;">No students enrolled in ${className} (Section ${currentSectionFilter}) yet.</td></tr>
+                <tr><td colspan="8" style="text-align:center; padding:40px; color:var(--text-muted); font-size:1rem; font-weight:700;">No students enrolled in ${className} (Section ${currentSectionFilter}) yet.</td></tr>
               ` : displayStudents.map((s, idx) => `
-                <tr style="border-bottom:1px solid #334155;">
+                <tr class="theme-panel-row" style="border-bottom:1px solid var(--border-color);">
                   <td><code>${String(idx + 1).padStart(2, '0')}</code></td>
                   <td>
                     <div style="display:flex; align-items:center; gap:10px;">
                       <img src="${s.photo || 'https://images.unsplash.com/photo-1544717305-2782549b5136?w=150'}" style="width:34px; height:34px; border-radius:50%; object-fit:cover;">
-                      <strong style="color:#ffffff; font-size:0.95rem;">${s.name}</strong>
+                      <strong class="theme-panel-name" style="font-size:0.95rem;">${s.name}</strong>
                     </div>
                   </td>
                   <td><code>${s.admissionNo}</code></td>
                   <td><span class="badge badge-purple">${s.currentClass || className} - ${s.currentSection || s.section || 'A'}</span></td>
-                  <td><strong style="color:#38bdf8;">DOB: ${formatDobToDDMMYYYY(s.dob)}</strong></td>
-                  <td>${s.parentName}</td>
-                  <td>${s.parentPhone}</td>
-                  <td><code style="color:#22d3ee; font-weight:bold;">${s.nfcUid}</code></td>
+                  <td><strong style="color:var(--accent-primary);">DOB: ${formatDobToDDMMYYYY(s.dob)}</strong></td>
+                  <td style="color:var(--text-main);">${s.parentName}</td>
+                  <td style="color:var(--text-main);">${s.parentPhone}</td>
                   <td>
                     <div style="display:flex; gap:6px;">
                       <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.78rem;" onclick="document.getElementById('classStudentsModal').remove(); openStudentProfile('${s.admissionNo}');">
@@ -10214,30 +10528,49 @@ function renderClassesPage(container) {
   `;
 }
 
-function getClassTeacherOptionsHtml(selectedTeacher = '', currentClassId = '') {
-  const assignedTeachers = new Map((SchoolData.classes || [])
-    .filter(c => c.id !== currentClassId && c.teacher)
-    .map(c => [String(c.teacher).trim().toLowerCase(), c.name]));
+function getClassTeacherOptionsHtml(selectedTeacher = '', currentClassId = '', currentSection = '') {
+  const assignedSlots = new Set();
+  (SchoolData.classes || []).forEach((cls) => {
+    const map = getClassSectionTeachers(cls);
+    (cls.sections || ['A']).forEach((section) => {
+      const key = normalizeClassSectionKey(section);
+      const teacher = map[key];
+      if (!teacher) return;
+      if (cls.id === currentClassId && normalizeClassSectionKey(currentSection) === key) return;
+      assignedSlots.add(`${String(teacher).trim().toLowerCase()}|${cls.id}|${key}`);
+    });
+  });
 
   const teacherNames = Array.from(new Set((SchoolData.teachers || []).map(t => t.name).filter(Boolean)));
   if (selectedTeacher && !teacherNames.includes(selectedTeacher)) teacherNames.unshift(selectedTeacher);
 
   return teacherNames.map(name => {
-    const assignedClass = assignedTeachers.get(String(name).trim().toLowerCase());
-    const disabled = assignedClass ? 'disabled' : '';
-    const suffix = assignedClass ? ` - already class teacher of ${assignedClass}` : '';
-    return `<option value="${name}" ${name === selectedTeacher ? 'selected' : ''} ${disabled}>${name}${suffix}</option>`;
+    const slotTakenElsewhere = (SchoolData.classes || []).some((cls) => {
+      if (cls.id === currentClassId) return false;
+      const map = getClassSectionTeachers(cls);
+      return Object.entries(map).some(([sec, teacher]) =>
+        String(teacher).trim().toLowerCase() === String(name).trim().toLowerCase() &&
+        normalizeClassSectionKey(currentSection || sec) === sec
+      );
+    });
+    const suffix = slotTakenElsewhere ? ' — assigned elsewhere' : '';
+    return `<option value="${name}" ${name === selectedTeacher ? 'selected' : ''}>${name}${suffix}</option>`;
   }).join('');
 }
 
-function validateUniqueClassTeacher(teacherName, currentClassId = '') {
-  const existing = (SchoolData.classes || []).find(c =>
-    c.id !== currentClassId &&
-    c.teacher &&
-    String(c.teacher).trim().toLowerCase() === String(teacherName).trim().toLowerCase()
-  );
-  if (existing) {
-    showNotification(`${teacherName} is already assigned as class teacher for ${existing.name}. Choose another teacher first.`, 'error');
+function validateUniqueClassTeacher(teacherName, currentClassId = '', currentSection = 'A') {
+  if (!teacherName) return true;
+  const secKey = normalizeClassSectionKey(currentSection);
+  const duplicate = (SchoolData.classes || []).find((cls) => {
+    if (cls.id === currentClassId) return false;
+    const map = getClassSectionTeachers(cls);
+    return Object.entries(map).some(([section, teacher]) =>
+      normalizeClassSectionKey(section) === secKey &&
+      String(teacher).trim().toLowerCase() === String(teacherName).trim().toLowerCase()
+    );
+  });
+  if (duplicate) {
+    showNotification(`${teacherName} is already class teacher for ${duplicate.name} Section ${secKey}.`, 'error');
     return false;
   }
   return true;
@@ -10400,17 +10733,12 @@ function saveClassEdit(classId) {
 }
 
 function canCurrentUserDeleteClasses() {
-  const activeUser = getCurrentActiveUser();
-  return !!activeUser && (
-    activeUser.role === 'Super Admin' ||
-    activeUser.role === 'Principal' ||
-    hasUserAccessPermission(activeUser, 'class_teacher_assignment', 'delete')
-  );
+  return isErpAdminUser(getCurrentActiveUser());
 }
 
 function deleteClass(classId) {
   if (!canCurrentUserDeleteClasses()) {
-    showNotification('Access denied: class teachers cannot delete classes.', 'warning');
+    showNotification('Access denied: only Super Admin / Principal can delete classes.', 'warning');
     return;
   }
 
@@ -11985,19 +12313,19 @@ function saveTeacherPeriodMatrix(teacherName) {
    ============================================================================ */
 if (!SchoolData.classFeeMaster) {
   SchoolData.classFeeMaster = {
-    "Nursery": { monthlyTuition: 1200, annualCharges: 2000, examFee: 400, computerFee: 0, admissionFee: 1000 },
-    "LKG":     { monthlyTuition: 1300, annualCharges: 2000, examFee: 400, computerFee: 0, admissionFee: 1000 },
-    "UKG":     { monthlyTuition: 1400, annualCharges: 2200, examFee: 400, computerFee: 0, admissionFee: 1000 },
-    "Class 1": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, computerFee: 100, admissionFee: 1200 },
-    "Class 2": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, computerFee: 100, admissionFee: 1200 },
-    "Class 3": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, computerFee: 150, admissionFee: 1200 },
-    "Class 4": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, computerFee: 150, admissionFee: 1200 },
-    "Class 5": { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, computerFee: 200, admissionFee: 1200 },
-    "Class 6": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, computerFee: 200, admissionFee: 1500 },
-    "Class 7": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, computerFee: 200, admissionFee: 1500 },
-    "Class 8": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, computerFee: 200, admissionFee: 1500 },
-    "Class 9": { monthlyTuition: 2200, annualCharges: 3500, examFee: 800, computerFee: 300, admissionFee: 2000 },
-    "Class 10":{ monthlyTuition: 2500, annualCharges: 4000, examFee: 1000,computerFee: 300, admissionFee: 2000 }
+    "Nursery": { monthlyTuition: 1200, annualCharges: 2000, examFee: 400, admissionFee: 1000 },
+    "LKG":     { monthlyTuition: 1300, annualCharges: 2000, examFee: 400, admissionFee: 1000 },
+    "UKG":     { monthlyTuition: 1400, annualCharges: 2200, examFee: 400, admissionFee: 1000 },
+    "Class 1": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, admissionFee: 1200 },
+    "Class 2": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, admissionFee: 1200 },
+    "Class 3": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, admissionFee: 1200 },
+    "Class 4": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, admissionFee: 1200 },
+    "Class 5": { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, admissionFee: 1200 },
+    "Class 6": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, admissionFee: 1500 },
+    "Class 7": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, admissionFee: 1500 },
+    "Class 8": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, admissionFee: 1500 },
+    "Class 9": { monthlyTuition: 2200, annualCharges: 3500, examFee: 800, admissionFee: 2000 },
+    "Class 10":{ monthlyTuition: 2500, annualCharges: 4000, examFee: 1000, admissionFee: 2000 }
   };
 }
 
@@ -12008,16 +12336,20 @@ if (!SchoolData.feeScheduleRules) {
   };
 }
 
+Object.keys(SchoolData.classFeeMaster || {}).forEach(cls => {
+  delete SchoolData.classFeeMaster[cls].computerFee;
+  delete SchoolData.classFeeMaster[cls].computerEnabled;
+});
+
 function getStudentFeeMaster(student) {
   const cls = normalizeClassName(student.currentClass || student.class || 'Class 5');
-  const fallback = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, computerFee: 150, annualEnabled: true, examEnabled: true, computerEnabled: true };
+  const fallback = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, annualEnabled: true, examEnabled: true };
   const saved = (SchoolData.classFeeMaster && SchoolData.classFeeMaster[cls]) || fallback;
   return {
     ...fallback,
     ...saved,
     annualEnabled: saved.annualEnabled !== false,
-    examEnabled: saved.examEnabled !== false,
-    computerEnabled: saved.computerEnabled !== false
+    examEnabled: saved.examEnabled !== false
   };
 }
 
@@ -12043,8 +12375,623 @@ function getStudentFeeCategoryStatus(student) {
   const tuitionDue = (overdueMonths.length * getStudentMonthlyTuitionRate(student)) + (fee.previousSessionDue || 0);
   const annualDue = master.annualEnabled && master.annualCharges > 0 && !hasPaidExtraFee(student, 'Annual Charges') ? master.annualCharges : 0;
   const examDue = master.examEnabled && master.examFee > 0 && !hasPaidExtraFee(student, 'Exam Fee') ? master.examFee : 0;
-  const computerDue = master.computerEnabled && master.computerFee > 0 && !hasPaidExtraFee(student, 'Computer') ? master.computerFee : 0;
-  return { tuitionDue, annualDue, examDue, computerDue, totalDue: tuitionDue + annualDue + examDue + computerDue, overdueMonths };
+  return { tuitionDue, annualDue, examDue, totalDue: tuitionDue + annualDue + examDue, overdueMonths };
+}
+
+function getStudentFeePaidBreakdown(student, session = SchoolData.activeSession) {
+  const payments = student.feeRecords?.[session]?.payments || [];
+  let tuitionPaid = 0;
+  let annualPaid = 0;
+  let examPaid = 0;
+  payments.forEach(payment => {
+    tuitionPaid += Number(payment.selectedMonthsTotal || 0);
+    (payment.paidPrevMonths || []).forEach(item => {
+      tuitionPaid += Number(item.amount || 0);
+    });
+    (payment.paidExtraItems || []).forEach(item => {
+      const label = String(item.label || '').toLowerCase();
+      const amt = Number(item.amount || 0);
+      if (label.includes('annual')) annualPaid += amt;
+      else if (label.includes('exam')) examPaid += amt;
+    });
+  });
+  const totalPaid = payments.reduce((sum, p) => sum + Number(p.amount || 0), 0);
+  return { tuitionPaid, annualPaid, examPaid, totalPaid };
+}
+
+function buildFeeBifurcationCsvRows(rows, options = {}) {
+  const includeTotals = options.includeTotals !== false;
+  const header = [
+    'Admission No', 'Student Name', 'Class', 'Section', 'Gender', 'Date Of Admission',
+    'Father Name', 'Parent Phone',
+    'Paid Months', 'Pending Months Up To August',
+    'Tuition Fee Paid', 'Tuition Fee Due',
+    'Annual Fee Paid', 'Annual Fee Due',
+    'Exam Fee Paid', 'Exam Fee Due',
+    'Previous Session Due', 'Total Pending Due',
+    'Last Receipt No', 'Last Payment Date',
+    'Total Fee Paid'
+  ];
+  const csvRows = [header];
+  const totals = {
+    tuitionPaid: 0, tuitionDue: 0, annualPaid: 0, annualDue: 0,
+    examPaid: 0, examDue: 0, prevDue: 0, totalDue: 0, totalPaid: 0
+  };
+
+  rows.forEach(row => {
+    const s = row.student;
+    const paid = getStudentFeePaidBreakdown(s);
+    const lastPayment = row.payments[row.payments.length - 1] || {};
+    const prevDue = Number(row.fee.previousSessionDue || 0);
+    const tuitionDueOnly = Math.max(0, Number(row.status.tuitionDue || 0) - prevDue);
+    const line = [
+      s.admissionNo,
+      s.name,
+      s.currentClass || s.class || '',
+      s.currentSection || s.section || '',
+      s.gender || '',
+      s.dateOfAdmission || '',
+      s.parentName || '',
+      s.parentPhone || '',
+      (row.fee.paidMonths || []).join(', '),
+      row.overdueMonths.join(', '),
+      paid.tuitionPaid,
+      tuitionDueOnly,
+      paid.annualPaid,
+      row.status.annualDue,
+      paid.examPaid,
+      row.status.examDue,
+      prevDue,
+      row.dueAmount,
+      lastPayment.receiptNo || '',
+      lastPayment.date || '',
+      paid.totalPaid
+    ];
+    totals.tuitionPaid += paid.tuitionPaid;
+    totals.tuitionDue += tuitionDueOnly;
+    totals.annualPaid += paid.annualPaid;
+    totals.annualDue += row.status.annualDue;
+    totals.examPaid += paid.examPaid;
+    totals.examDue += row.status.examDue;
+    totals.prevDue += prevDue;
+    totals.totalDue += row.dueAmount;
+    totals.totalPaid += paid.totalPaid;
+    csvRows.push(line);
+  });
+
+  if (includeTotals && rows.length) {
+    csvRows.push([
+      'TOTAL', `${rows.length} students`, '', '', '', '', '', '', '', '',
+      totals.tuitionPaid, totals.tuitionDue,
+      totals.annualPaid, totals.annualDue,
+      totals.examPaid, totals.examDue,
+      totals.prevDue, totals.totalDue,
+      '', '',
+      totals.totalPaid
+    ]);
+  }
+  return csvRows;
+}
+
+function exportFeeBifurcationReport(sourceRows, fileLabel) {
+  const rows = sourceRows || getCurrentFeeLedgerRows();
+  const currentSession = SchoolData.activeSession;
+  const tab = window._currentFeeTab || 'ALL';
+  const targetClass = document.getElementById('feeClassFilter')?.value || 'ALL';
+  downloadCsvFile(`Fee_Report_${fileLabel || tab}_${targetClass.replace(/\s+/g, '_')}_${currentSession}.csv`, buildFeeBifurcationCsvRows(rows));
+  showNotification(`Exported ${rows.length} student fee row(s) with bifurcation totals.`, 'success');
+}
+
+function exportAllStudentsFeeReport() {
+  const currentSession = SchoolData.activeSession;
+  const rows = getStudentsByActiveSession().map(s => {
+    const fee = s.currentFeeInfo || {};
+    const status = getStudentFeeCategoryStatus(s);
+    const payments = s.feeRecords?.[currentSession]?.payments || [];
+    return {
+      student: s,
+      fee,
+      status,
+      payments,
+      paidAmount: payments.reduce((acc, p) => acc + (p.amount || 0), 0),
+      overdueMonths: status.overdueMonths,
+      dueAmount: status.totalDue
+    };
+  });
+  exportFeeBifurcationReport(rows, 'All_Students');
+}
+
+function getPaymentPaidBreakdown(payment) {
+  let tuitionPaid = Number(payment?.selectedMonthsTotal || 0);
+  (payment?.paidPrevMonths || []).forEach(item => {
+    tuitionPaid += Number(item.amount || 0);
+  });
+  let annualPaid = 0;
+  let examPaid = 0;
+  (payment?.paidExtraItems || []).forEach(item => {
+    const label = String(item.label || '').toLowerCase();
+    const amt = Number(item.amount || 0);
+    if (label.includes('annual')) annualPaid += amt;
+    else if (label.includes('exam')) examPaid += amt;
+  });
+  return {
+    tuitionPaid,
+    annualPaid,
+    examPaid,
+    totalPaid: Number(payment?.amount || 0)
+  };
+}
+
+function parseReceiptDateValue(dateStr) {
+  const raw = String(dateStr || '').trim();
+  if (!raw) return null;
+  if (/^\d{4}-\d{2}-\d{2}/.test(raw)) {
+    const d = new Date(`${raw.slice(0, 10)}T12:00:00`);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  const dmy = raw.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  if (dmy) {
+    const day = parseInt(dmy[1], 10);
+    const month = parseInt(dmy[2], 10) - 1;
+    let year = parseInt(dmy[3], 10);
+    if (year < 100) year += 2000;
+    const d = new Date(year, month, day, 12, 0, 0);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function getReceiptDateFilterRange() {
+  const monthVal = document.getElementById('receiptMonthFilter')?.value
+    || document.getElementById('recentReceiptMonthFilter')?.value
+    || '';
+  const fromVal = document.getElementById('receiptFromDate')?.value
+    || document.getElementById('recentReceiptFromDate')?.value
+    || '';
+  const toVal = document.getElementById('receiptToDate')?.value
+    || document.getElementById('recentReceiptToDate')?.value
+    || '';
+
+  if (monthVal && /^\d{4}-\d{2}$/.test(monthVal)) {
+    const [y, m] = monthVal.split('-').map(Number);
+    return {
+      from: new Date(y, m - 1, 1, 0, 0, 0),
+      to: new Date(y, m, 0, 23, 59, 59),
+      label: monthVal
+    };
+  }
+
+  const from = fromVal ? parseReceiptDateValue(fromVal) : null;
+  const to = toVal ? parseReceiptDateValue(toVal) : null;
+  if (from) from.setHours(0, 0, 0, 0);
+  if (to) to.setHours(23, 59, 59, 999);
+  return { from, to, label: '' };
+}
+
+function receiptMatchesDateFilter(receipt, range) {
+  if (!range?.from && !range?.to) return true;
+  const d = parseReceiptDateValue(receipt.date);
+  if (!d) return false;
+  if (range.from && d < range.from) return false;
+  if (range.to && d > range.to) return false;
+  return true;
+}
+
+function getFilteredFeeReceipts() {
+  const query = (document.getElementById('receiptSearchInput')?.value
+    || document.getElementById('recentReceiptSearchInput')?.value
+    || '').toLowerCase().trim();
+  const targetMode = document.getElementById('receiptModeFilter')?.value || 'ALL';
+  const dateRange = getReceiptDateFilterRange();
+  const currentSession = SchoolData.activeSession;
+  const sessionFilter = document.getElementById('receiptSessionFilter')?.value || currentSession;
+
+  return getAllFeeReceipts().filter(r => {
+    const no = String(r.receiptNo || '').toLowerCase();
+    const name = String(r.studentName || '').toLowerCase();
+    const adm = String(r.admissionNo || '').toLowerCase();
+    const mode = String(r.mode || '');
+    const matchQuery = !query || no.includes(query) || name.includes(query) || adm.includes(query);
+    const matchMode = targetMode === 'ALL' || mode.toLowerCase().includes(targetMode.toLowerCase());
+    const matchSession = sessionFilter === 'ALL' || r.session === sessionFilter;
+    const matchDate = receiptMatchesDateFilter(r, dateRange);
+    return matchQuery && matchMode && matchSession && matchDate;
+  });
+}
+
+function buildReceiptRegisterCsvRows(receipts) {
+  const header = [
+    'Receipt No', 'Date', 'Time', 'Admission No', 'Student Name', 'Class', 'Section', 'Father Name',
+    'Tuition Fee Paid', 'Annual Fee Paid', 'Exam Fee Paid', 'Total Amount Paid',
+    'Tuition Fee Due', 'Annual Fee Due', 'Exam Fee Due', 'Previous Session Due', 'Total Pending Due',
+    'Fee Description', 'Payment Mode', 'Session'
+  ];
+  const csvRows = [header];
+  const totals = {
+    tuitionPaid: 0, annualPaid: 0, examPaid: 0, totalPaid: 0,
+    tuitionDue: 0, annualDue: 0, examDue: 0, prevDue: 0, totalDue: 0
+  };
+  const dueCache = new Map();
+
+  receipts.forEach(r => {
+    const paid = getPaymentPaidBreakdown(r);
+    if (!dueCache.has(r.admissionNo)) {
+      dueCache.set(r.admissionNo, getStudentFeeDueSnapshot(r.admissionNo));
+    }
+    const dues = dueCache.get(r.admissionNo);
+    csvRows.push([
+      r.receiptNo,
+      r.date,
+      r.time || '',
+      r.admissionNo,
+      r.studentName,
+      r.class || '',
+      r.section || '',
+      r.parentName || '',
+      paid.tuitionPaid,
+      paid.annualPaid,
+      paid.examPaid,
+      paid.totalPaid,
+      dues.tuitionDue,
+      dues.annualDue,
+      dues.examDue,
+      dues.prevDue,
+      dues.totalDue,
+      r.month || '',
+      r.mode || '',
+      r.session || ''
+    ]);
+    totals.tuitionPaid += paid.tuitionPaid;
+    totals.annualPaid += paid.annualPaid;
+    totals.examPaid += paid.examPaid;
+    totals.totalPaid += paid.totalPaid;
+    totals.tuitionDue += Number(dues.tuitionDue || 0);
+    totals.annualDue += Number(dues.annualDue || 0);
+    totals.examDue += Number(dues.examDue || 0);
+    totals.prevDue += Number(dues.prevDue || 0);
+    totals.totalDue += Number(dues.totalDue || 0);
+  });
+
+  if (receipts.length) {
+    csvRows.push([
+      'TOTAL',
+      `${receipts.length} receipts`,
+      '', '', '', '', '', '',
+      totals.tuitionPaid,
+      totals.annualPaid,
+      totals.examPaid,
+      totals.totalPaid,
+      totals.tuitionDue,
+      totals.annualDue,
+      totals.examDue,
+      totals.prevDue,
+      totals.totalDue,
+      '', '', ''
+    ]);
+  }
+  return csvRows;
+}
+
+/* ============================================================================
+   LEGACY FEE HISTORY IMPORT (from old ERP / Excel register)
+   ============================================================================ */
+let _parsedFeeHistoryRows = [];
+
+function parseLegacyFeeMonthList(raw) {
+  if (!raw) return [];
+  const monthMap = {
+    apr: 'April', aprl: 'April', april: 'April',
+    may: 'May',
+    jun: 'June', june: 'June',
+    jul: 'July', july: 'July',
+    aug: 'August', august: 'August',
+    sep: 'September', sept: 'September', september: 'September',
+    oct: 'October', october: 'October',
+    nov: 'November', november: 'November',
+    dec: 'December', december: 'December',
+    jan: 'January', january: 'January',
+    feb: 'February', february: 'February',
+    mar: 'March', march: 'March'
+  };
+  return [...new Set(String(raw).split(/[,|;+/]+/).map(part => {
+    const token = part.trim().toLowerCase().replace(/[^a-z]/g, '');
+    if (!token) return '';
+    if (monthMap[token]) return monthMap[token];
+    const hit = SCHOOL_SESSION_MONTHS.find(m => m.toLowerCase().startsWith(token.slice(0, 3)));
+    return hit || '';
+  }).filter(Boolean))];
+}
+
+function parseLegacyFeeAmount(raw) {
+  const n = Number(String(raw ?? '').replace(/[^\d.-]/g, ''));
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+}
+
+function downloadFeeHistoryImportTemplate() {
+  const sample = [
+    ['AdmissionNo', 'PaidMonths', 'PreviousSessionDue', 'ReceiptNo', 'PaymentDate', 'TotalPaid', 'TuitionPaid', 'AnnualPaid', 'ExamPaid', 'PaymentMode', 'Notes'],
+    ['1556', 'April, May, June', '0', 'OLD-1556-APR-JUN', '2026-06-15', '5400', '5400', '2200', '400', 'Cash', 'Imported from old ERP'],
+    ['1556', 'July, August', '0', 'OLD-1556-JUL-AUG', '2026-08-10', '3600', '3600', '', '', 'UPI', 'Second receipt from old ERP'],
+    ['2489', '', '0', 'OLD-2489-ANNUAL', '2026-07-01', '500', '0', '500', '0', 'UPI', 'Annual charges only — PaidMonths can be blank'],
+    ['2382', 'April, May, June, July, August', '500', 'OLD-2382-ALL', '2026-08-01', '7500', '7000', '2200', '400', 'Cash', 'Includes previous session due Rs 500']
+  ];
+  downloadCsvFile(`Fee_History_Import_Template_${SchoolData.activeSession}.csv`, sample);
+  showNotification('Downloaded fee history import template CSV.', 'success');
+}
+
+function openFeeHistoryImportModal() {
+  if (!hasUserAccessPermission(getCurrentActiveUser(), 'fee_collection', 'modify')) {
+    showNotification('Access Denied: fee history import needs Fee Collection modify permission.', 'warning');
+    return;
+  }
+  const existing = document.getElementById('feeHistoryImportModal');
+  if (existing) existing.remove();
+  _parsedFeeHistoryRows = [];
+  const currentSession = SchoolData.activeSession;
+
+  document.body.insertAdjacentHTML('beforeend', `
+    <div class="modal-overlay active" id="feeHistoryImportModal" style="z-index:99999;">
+      <div class="modal-box theme-panel-modal keyboard-scroll-panel" tabindex="0" style="max-width:760px; width:calc(100vw - 28px); max-height:calc(100vh - 28px); overflow-y:auto; padding:24px; border-radius:18px; border:2px solid #f59e0b; position:relative;">
+        <button onclick="document.getElementById('feeHistoryImportModal').remove()" style="position:absolute; top:14px; right:16px; background:var(--bg-card); color:var(--text-main); border:1px solid var(--border-color); width:32px; height:32px; border-radius:50%; cursor:pointer;">X</button>
+        <h3 style="margin:0 0 4px 0; color:#f59e0b; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+          <i class="fa-solid fa-file-import"></i> Import Fee History from Old ERP (CSV)
+        </h3>
+        <p class="theme-panel-muted" style="margin:0 0 14px 0; font-size:0.82rem;">Bring paid months, receipts and dues from your previous fee software into session <strong>${currentSession}</strong>. Students must already exist (import students first). <strong>PaidMonths</strong> can be blank for annual or exam-only receipts.</p>
+
+        <div style="background:var(--bg-card); padding:12px 16px; border-radius:10px; border:1px solid var(--border-color); margin-bottom:14px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+          <div style="font-size:0.78rem; color:var(--text-muted);">
+            Columns: <strong>AdmissionNo, PaidMonths, PreviousSessionDue, ReceiptNo, PaymentDate, TotalPaid, TuitionPaid, AnnualPaid, ExamPaid, PaymentMode</strong>
+          </div>
+          <button class="btn btn-secondary" onclick="downloadFeeHistoryImportTemplate()" style="background:#0284c7; color:#fff; border:none; font-weight:700;">
+            <i class="fa-solid fa-download"></i> Download Template
+          </button>
+        </div>
+
+        <div style="border:2px dashed #f59e0b; background:rgba(245,158,11,0.08); padding:18px; border-radius:12px; text-align:center; margin-bottom:14px;">
+          <input type="file" id="feeHistoryCsvInput" accept=".csv" style="display:none;" onchange="handleFeeHistoryCsvFileSelect(event)">
+          <button class="btn btn-primary" onclick="document.getElementById('feeHistoryCsvInput').click()" style="background:linear-gradient(135deg, #f59e0b 0%, #d97706 100%); border:none; font-weight:800;">
+            <i class="fa-solid fa-folder-open"></i> Browse Fee History CSV
+          </button>
+        </div>
+
+        <div id="feeHistoryPreviewBox" style="display:none; margin-bottom:14px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <strong style="color:var(--accent-primary);">Preview</strong>
+            <span class="badge badge-warning" id="feeHistoryCountBadge">0 rows</span>
+          </div>
+          <div class="keyboard-scroll-panel" tabindex="0" style="max-height:220px; overflow:auto; border:1px solid var(--border-color); border-radius:8px;">
+            <table class="data-table" style="font-size:0.75rem; min-width:900px;">
+              <thead><tr><th>Adm</th><th>Name</th><th>Paid Months</th><th>Prev Due</th><th>Receipt</th><th>Total</th><th>Annual</th><th>Exam</th></tr></thead>
+              <tbody id="feeHistoryPreviewBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <label style="display:flex; gap:8px; align-items:flex-start; margin-bottom:12px; font-size:0.78rem; color:var(--text-muted);">
+          <input type="checkbox" id="feeHistoryReplaceExisting">
+          <span><strong style="color:var(--text-main);">Replace existing fee receipts for this session</strong> before import. Leave unchecked to merge/add on top of current ERP receipts.</span>
+        </label>
+
+        <div style="display:flex; justify-content:flex-end; gap:10px;">
+          <button class="btn btn-secondary" onclick="document.getElementById('feeHistoryImportModal').remove()">Cancel</button>
+          <button class="btn btn-primary" id="feeHistoryImportBtn" onclick="importParsedFeeHistoryFromCsv()" disabled style="background:linear-gradient(135deg, #f59e0b 0%, #d97706 100%); border:none; font-weight:800;">
+            <i class="fa-solid fa-file-import"></i> Import Fee History
+          </button>
+        </div>
+      </div>
+    </div>
+  `);
+}
+
+function handleFeeHistoryCsvFileSelect(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const lines = String(e.target.result || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    if (lines.length < 2) {
+      showNotification('Fee history CSV needs a header row and at least one data row.', 'error');
+      return;
+    }
+
+    function parseCsvRow(text) {
+      const result = [];
+      let cur = '';
+      let inQuotes = false;
+      for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (c === '"') inQuotes = !inQuotes;
+        else if (c === ',' && !inQuotes) { result.push(cur.trim().replace(/^"|"$/g, '')); cur = ''; }
+        else cur += c;
+      }
+      result.push(cur.trim().replace(/^"|"$/g, ''));
+      return result;
+    }
+
+    const headers = parseCsvRow(lines[0]).map(h => h.toLowerCase());
+    const idx = (names) => headers.findIndex(h => names.some(n => h.replace(/[^a-z0-9]/g, '') === n.replace(/[^a-z0-9]/g, '')));
+    const admIdx = idx(['admissionno', 'admno', 'admissionnumber']);
+    const monthsIdx = idx(['paidmonths', 'months paid', 'monthspaid', 'paidmonth']);
+    const prevIdx = idx(['previoussessiondue', 'prevsessiondue', 'prevdue', 'olddue']);
+    const receiptIdx = idx(['receiptno', 'receiptnumber', 'legacyreceiptno']);
+    const dateIdx = idx(['paymentdate', 'date', 'receiptdate']);
+    const totalIdx = idx(['totalpaid', 'amountpaid', 'amount', 'total']);
+    const tuitionIdx = idx(['tuitionpaid', 'tuitionamount']);
+    const annualIdx = idx(['annualpaid', 'annualfeepaid', 'annualfee']);
+    const examIdx = idx(['exampaid', 'examfeepaid', 'examfee']);
+    const modeIdx = idx(['paymentmode', 'mode', 'paymode']);
+    const notesIdx = idx(['notes', 'remark', 'description']);
+
+    if (admIdx === -1 || monthsIdx === -1) {
+      showNotification('CSV must include AdmissionNo and PaidMonths columns. Download the template first.', 'error');
+      return;
+    }
+
+    _parsedFeeHistoryRows = [];
+    for (let i = 1; i < lines.length; i++) {
+      const vals = parseCsvRow(lines[i]);
+      const admNo = String(vals[admIdx] || '').trim();
+      const paidMonths = parseLegacyFeeMonthList(vals[monthsIdx]);
+      const totalPaid = parseLegacyFeeAmount(vals[totalIdx]);
+      const tuitionPaid = parseLegacyFeeAmount(vals[tuitionIdx]);
+      const annualPaid = parseLegacyFeeAmount(vals[annualIdx]);
+      const examPaid = parseLegacyFeeAmount(vals[examIdx]);
+      const receiptNo = String(vals[receiptIdx] || '').trim();
+      const hasFeeAmount = totalPaid > 0 || tuitionPaid > 0 || annualPaid > 0 || examPaid > 0;
+      if (!admNo || (!paidMonths.length && !hasFeeAmount)) continue;
+      _parsedFeeHistoryRows.push({
+        admNo,
+        paidMonths,
+        previousSessionDue: parseLegacyFeeAmount(vals[prevIdx]),
+        receiptNo,
+        paymentDate: String(vals[dateIdx] || '').trim(),
+        totalPaid,
+        tuitionPaid,
+        annualPaid,
+        examPaid,
+        paymentMode: String(vals[modeIdx] || 'Cash').trim() || 'Cash',
+        notes: String(vals[notesIdx] || '').trim()
+      });
+    }
+
+    if (!_parsedFeeHistoryRows.length) {
+      showNotification('No valid fee history rows found. Each row needs AdmissionNo plus PaidMonths or a fee amount.', 'warning');
+      return;
+    }
+
+    const previewBody = document.getElementById('feeHistoryPreviewBody');
+    previewBody.innerHTML = _parsedFeeHistoryRows.slice(0, 40).map(row => {
+      const student = findStudentByAdmissionNo(row.admNo);
+      return `<tr>
+        <td>${escapeHtml(row.admNo)}</td>
+        <td>${escapeHtml(student?.name || 'NOT FOUND')}</td>
+        <td>${escapeHtml(row.paidMonths.join(', '))}</td>
+        <td>${row.previousSessionDue || 0}</td>
+        <td>${escapeHtml(row.receiptNo || 'AUTO')}</td>
+        <td>${row.totalPaid || '-'}</td>
+        <td>${row.annualPaid || '-'}</td>
+        <td>${row.examPaid || '-'}</td>
+      </tr>`;
+    }).join('');
+    document.getElementById('feeHistoryPreviewBox').style.display = 'block';
+    document.getElementById('feeHistoryCountBadge').innerText = `${_parsedFeeHistoryRows.length} row(s)`;
+    document.getElementById('feeHistoryImportBtn').disabled = false;
+    showNotification(`Parsed ${_parsedFeeHistoryRows.length} fee history row(s). Review preview, then Import.`, 'success');
+  };
+  reader.readAsText(file);
+}
+
+function buildLegacyFeePayment(student, row, session) {
+  const monthlyRate = getStudentMonthlyTuitionRate(student, session);
+  const paidCurrentMonths = row.paidMonths.length
+    ? row.paidMonths.map((month, index, allMonths) => {
+        const perMonthAmount = row.tuitionPaid > 0
+          ? Math.round(row.tuitionPaid / allMonths.length)
+          : monthlyRate;
+        return { month, amount: perMonthAmount };
+      })
+    : [];
+  const selectedMonthsTotal = row.tuitionPaid || paidCurrentMonths.reduce((sum, item) => sum + Number(item.amount || 0), 0);
+  const paidExtraItems = [];
+  if (row.annualPaid > 0) paidExtraItems.push({ label: 'Annual Charges', amount: row.annualPaid });
+  if (row.examPaid > 0) paidExtraItems.push({ label: 'Exam Fee', amount: row.examPaid });
+  const amount = row.totalPaid || (selectedMonthsTotal + paidExtraItems.reduce((s, i) => s + i.amount, 0));
+  const receiptSeed = row.paidMonths.join('') || paidExtraItems.map(i => i.label).join('') || 'FEE';
+  const receiptNo = row.receiptNo || `IMP-${session}-${student.admissionNo}-${receiptSeed.slice(0, 8)}-${Date.now().toString().slice(-4)}`;
+  let date = row.paymentDate || new Date().toISOString().split('T')[0];
+  if (date.includes('/')) {
+    const parts = date.split('/');
+    if (parts.length === 3) date = `${parts[2].length === 2 ? '20' + parts[2] : parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+  }
+  const monthParts = [];
+  if (row.paidMonths.length) monthParts.push(row.paidMonths.join(', '));
+  if (paidExtraItems.length) monthParts.push(paidExtraItems.map(i => `${i.label} Rs${i.amount}`).join(', '));
+  if (row.notes) monthParts.push(row.notes);
+  return {
+    receiptNo,
+    date,
+    time: getNowReceiptTime(),
+    paidAt: new Date(`${date}T12:00:00`).toISOString(),
+    amount,
+    selectedMonthsTotal,
+    extraChargesTotal: paidExtraItems.reduce((s, i) => s + i.amount, 0),
+    paidCurrentMonths,
+    paidPrevMonths: [],
+    paidExtraItems,
+    walletApplied: 0,
+    excessSaved: 0,
+    partialDueCarried: 0,
+    month: `Imported (${session}): ${monthParts.join(' | ') || 'Legacy fee receipt'}`,
+    mode: row.paymentMode || 'Cash',
+    studentName: student.name,
+    admissionNo: student.admissionNo,
+    importedFromLegacy: true
+  };
+}
+
+function importParsedFeeHistoryFromCsv() {
+  if (!_parsedFeeHistoryRows.length) return;
+  const session = SchoolData.activeSession;
+  const replaceExisting = document.getElementById('feeHistoryReplaceExisting')?.checked === true;
+  const grouped = new Map();
+
+  _parsedFeeHistoryRows.forEach(row => {
+    const key = normalizeAdmissionLookup(row.admNo);
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(row);
+  });
+
+  let updatedStudents = 0;
+  let importedReceipts = 0;
+  let missingStudents = 0;
+  const missingList = [];
+
+  grouped.forEach((rows, admKey) => {
+    const student = findStudentByAdmissionNo(admKey);
+    if (!student) {
+      missingStudents += rows.length;
+      missingList.push(admKey);
+      return;
+    }
+    if (!student.feeRecords) student.feeRecords = {};
+    if (!student.feeRecords[session]) {
+      student.feeRecords[session] = {
+        monthlyTuition: getStudentMonthlyTuitionRate(student, session),
+        paidMonths: [],
+        dueMonths: [...SCHOOL_SESSION_MONTHS],
+        payments: []
+      };
+    }
+    if (replaceExisting) {
+      student.feeRecords[session].payments = [];
+    }
+    let maxPrevDue = Number(student.feeRecords[session].previousSessionDue || student.currentFeeInfo?.previousSessionDue || 0);
+    rows.forEach(row => {
+      const payment = buildLegacyFeePayment(student, row, session);
+      const exists = (student.feeRecords[session].payments || []).some(p => p.receiptNo === payment.receiptNo);
+      if (!exists) {
+        student.feeRecords[session].payments.push(payment);
+        importedReceipts++;
+      }
+      if (row.previousSessionDue > maxPrevDue) maxPrevDue = row.previousSessionDue;
+    });
+    student.feeRecords[session].previousSessionDue = maxPrevDue;
+    normalizeFeeRecordFromReceipts(student, session);
+    updatedStudents++;
+  });
+
+  saveSchoolDataToStorage();
+  if (typeof flushCloudPushNow === 'function') flushCloudPushNow();
+  else if (typeof pushSchoolDataToCloud === 'function') pushSchoolDataToCloud().catch(() => {});
+
+  document.getElementById('feeHistoryImportModal')?.remove();
+  _parsedFeeHistoryRows = [];
+  showNotification(
+    `Fee history import done: ${updatedStudents} student(s), ${importedReceipts} receipt(s) added.${missingStudents ? ` ${missingStudents} row(s) skipped — admission not found (${missingList.slice(0, 5).join(', ')}${missingList.length > 5 ? '...' : ''}).` : ''}`,
+    missingStudents ? 'warning' : 'success'
+  );
+  if (window.location.hash.includes('fees')) renderFeesPage(document.getElementById('contentBody'));
 }
 
 function openClassFeeMasterModal() {
@@ -12074,7 +13021,6 @@ function openClassFeeMasterModal() {
                 <th>Monthly Tuition (Rs)</th>
                 <th>Annual Charges</th>
                 <th>Exam Fee</th>
-                <th>Computer / Lab</th>
               </tr>
             </thead>
             <tbody>
@@ -12097,12 +13043,6 @@ function openClassFeeMasterModal() {
                         <input type="checkbox" class="fee-master-apply" data-class="${cls}" data-field="examEnabled" ${f.examEnabled ? 'checked' : ''}> Apply
                       </label>
                       <input type="number" class="fee-master-input session-dropdown" data-class="${cls}" data-field="examFee" value="${f.examFee}" style="width:90px; padding:4px 8px; background:#1e293b;">
-                    </td>
-                    <td>
-                      <label style="display:flex; align-items:center; gap:6px; margin-bottom:5px; color:#cbd5e1; font-size:0.75rem;">
-                        <input type="checkbox" class="fee-master-apply" data-class="${cls}" data-field="computerEnabled" ${f.computerEnabled ? 'checked' : ''}> Apply
-                      </label>
-                      <input type="number" class="fee-master-input session-dropdown" data-class="${cls}" data-field="computerFee" value="${f.computerFee}" style="width:90px; padding:4px 8px; background:#1e293b;">
                     </td>
                   </tr>
                 `;
@@ -12173,7 +13113,7 @@ function saveClassFeeMasterChanges() {
     const val = parseInt(input.value) || 0;
 
     if (!SchoolData.classFeeMaster[cls]) {
-      SchoolData.classFeeMaster[cls] = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, computerFee: 150, admissionFee: 1200 };
+      SchoolData.classFeeMaster[cls] = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, admissionFee: 1200 };
     }
     SchoolData.classFeeMaster[cls][field] = val;
   });
@@ -12181,7 +13121,7 @@ function saveClassFeeMasterChanges() {
     const cls = input.getAttribute('data-class');
     const field = input.getAttribute('data-field');
     if (!SchoolData.classFeeMaster[cls]) {
-      SchoolData.classFeeMaster[cls] = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, computerFee: 150 };
+      SchoolData.classFeeMaster[cls] = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500 };
     }
     SchoolData.classFeeMaster[cls][field] = input.checked;
   });
@@ -12263,10 +13203,13 @@ function getAllFeeReceipts() {
                   parentPhone: s.parentPhone || s.mobile || '',
                   receiptNo: p.receiptNo,
                   date: p.date || new Date().toISOString().split('T')[0],
+                  time: p.time || '',
                   amount: p.amount || 0,
                   mode: p.mode || 'Online UPI',
                   month: p.month || 'Tuition Fee Payment',
-                  selectedMonthsTotal: p.selectedMonthsTotal || p.amount,
+                  selectedMonthsTotal: p.selectedMonthsTotal || 0,
+                  paidPrevMonths: p.paidPrevMonths || [],
+                  paidExtraItems: p.paidExtraItems || [],
                   session: sessKey
                 });
               }
@@ -12290,10 +13233,13 @@ function getAllFeeReceipts() {
               parentPhone: s.parentPhone || s.mobile || '',
               receiptNo: p.receiptNo,
               date: p.date || new Date().toISOString().split('T')[0],
+              time: p.time || '',
               amount: p.amount || 0,
               mode: p.mode || 'Online UPI',
               month: p.month || 'Tuition Fee Payment',
-              selectedMonthsTotal: p.selectedMonthsTotal || p.amount,
+              selectedMonthsTotal: p.selectedMonthsTotal || 0,
+              paidPrevMonths: p.paidPrevMonths || [],
+              paidExtraItems: p.paidExtraItems || [],
               session: currentSession
             });
           }
@@ -12374,8 +13320,8 @@ function openQuickFeeSelectModal() {
                 <div style="display:flex; align-items:center; gap:12px;">
                   <img src="${s.photo || 'https://images.unsplash.com/photo-1544717305-2782549b5136?w=150&auto=format&fit=crop&q=80'}" style="width:40px; height:40px; border-radius:50%; object-fit:cover;">
                   <div>
-                    <strong style="color:#ffffff; font-size:0.95rem;">${s.name}</strong> 
-                    <span style="color:#38bdf8; font-size:0.8rem;">(${s.currentClass || 'Class 5'} - ${s.currentSection || 'A'})</span><br>
+                    <strong style="color:var(--text-main); font-size:0.95rem;">${s.name}</strong> 
+                    <span style="color:var(--accent-primary); font-size:0.8rem;">(${s.currentClass || 'Class 5'} - ${s.currentSection || 'A'})</span><br>
                     <small style="color:#94a3b8; font-size:0.75rem;">Adm: <code>${s.admissionNo}</code> | Father: ${s.parentName}</small>
                   </div>
                 </div>
@@ -12429,8 +13375,11 @@ function renderRecentReceiptsSection() {
           <p style="margin:4px 0 0 0; font-size:0.8rem; color:#cbd5e1;">View, search, and reprint official tuition fee payment receipts dispatches.</p>
         </div>
         
-        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
           <input type="text" id="recentReceiptSearchInput" placeholder="Search Receipt #, Name, Adm No, Mode..." class="session-dropdown" style="width:260px; padding:6px 12px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onkeyup="filterRecentReceiptsTable()">
+          <input type="month" id="recentReceiptMonthFilter" class="session-dropdown date-filter-input" title="Filter by month" style="width:150px; padding:6px 10px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onchange="filterRecentReceiptsTable()">
+          <input type="date" id="recentReceiptFromDate" class="session-dropdown date-filter-input" title="From date" style="width:150px; padding:6px 10px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onchange="filterRecentReceiptsTable()">
+          <input type="date" id="recentReceiptToDate" class="session-dropdown date-filter-input" title="To date" style="width:150px; padding:6px 10px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onchange="filterRecentReceiptsTable()">
           <button class="btn btn-secondary" onclick="exportReceiptsCSV()" style="background:#0284c7; color:#fff; border:none; font-weight:700; padding:6px 14px; font-size:0.82rem;">
             <i class="fa-solid fa-file-csv"></i> Export CSV
           </button>
@@ -12456,7 +13405,7 @@ function renderRecentReceiptsSection() {
             ${receipts.length === 0 ? `
               <tr><td colspan="9" style="text-align:center; padding:24px; color:#94a3b8; font-style:italic;">No fee payment receipts logged yet. Collect a fee payment above to generate the first receipt!</td></tr>
             ` : receipts.map(r => `
-              <tr class="recent-receipt-row" data-search="${r.receiptNo.toLowerCase()} ${r.studentName.toLowerCase()} ${r.admissionNo} ${r.mode.toLowerCase()} ${r.month.toLowerCase()}" style="border-bottom:1px solid #334155;">
+              <tr class="recent-receipt-row" data-search="${r.receiptNo.toLowerCase()} ${r.studentName.toLowerCase()} ${r.admissionNo} ${r.mode.toLowerCase()} ${r.month.toLowerCase()}" data-date="${r.date || ''}" style="border-bottom:1px solid #334155;">
                 <td><code style="color:#c084fc; font-weight:800; font-size:0.85rem;">#${r.receiptNo}</code></td>
                 <td><span style="color:#cbd5e1;">${r.date}</span></td>
                 <td><strong style="color:#ffffff;">${r.studentName}</strong></td>
@@ -12490,14 +13439,14 @@ function renderRecentReceiptsSection() {
 
 function filterRecentReceiptsTable() {
   const query = document.getElementById('recentReceiptSearchInput')?.value.toLowerCase().trim() || '';
+  const dateRange = getReceiptDateFilterRange();
   const rows = document.querySelectorAll('.recent-receipt-row');
   rows.forEach(row => {
     const searchData = row.getAttribute('data-search') || '';
-    if (!query || searchData.includes(query)) {
-      row.style.display = '';
-    } else {
-      row.style.display = 'none';
-    }
+    const receiptDate = row.getAttribute('data-date') || '';
+    const matchQuery = !query || searchData.includes(query);
+    const matchDate = receiptMatchesDateFilter({ date: receiptDate }, dateRange);
+    row.style.display = (matchQuery && matchDate) ? '' : 'none';
   });
 }
 
@@ -12536,6 +13485,9 @@ function renderFeesPage(container) {
         <button class="btn btn-primary" style="background:linear-gradient(135deg, #10b981 0%, #059669 100%); color:#ffffff; border:none; font-weight:800; padding:10px 18px; display:flex; align-items:center; gap:8px;" onclick="openQuickFeeSelectModal()"><i class="fa-solid fa-indian-rupee-sign"></i> Collect Fee Now</button>
         <button class="btn btn-secondary" style="background:#0284c7; color:#ffffff; border:none; font-weight:800; padding:10px 18px;" onclick="window.location.hash='receipts'"><i class="fa-solid fa-file-invoice-dollar"></i> Fee Receipts Ledger</button>
         <button class="btn btn-secondary" onclick="openClassFeeMasterModal()"><i class="fa-solid fa-sliders"></i> Master Fee Configurator</button>
+        <button class="btn btn-secondary" onclick="openFeeHistoryImportModal()" style="background:#d97706; color:#ffffff; border:none; font-weight:800; padding:10px 18px;" title="Import paid months and receipts from your old ERP Excel/CSV">
+          <i class="fa-solid fa-file-import"></i> Import Old ERP Fees
+        </button>
         <button class="btn btn-telegram" onclick="triggerBulkFeeReminder()"><i class="fa-solid fa-paper-plane"></i> Bulk Reminders</button>
         <button class="btn btn-secondary" style="background:#0f766e; color:#ffffff; border:none; font-weight:800; padding:10px 18px;" onclick="syncStudentFeesToGoogleSheet()" title="Push fee due columns to Google Sheet Students tab for /fees bot command"><i class="fa-solid fa-cloud-arrow-up"></i> Sync Fees → Sheet</button>
         <button class="btn btn-secondary" style="background:#475569; color:#ffffff; border:none; font-weight:800; padding:10px 14px;" onclick="syncStudentFeesToGoogleSheet({ dryRun: true })" title="Preview only — does not write to sheet"><i class="fa-solid fa-eye"></i> Preview</button>
@@ -12578,8 +13530,8 @@ function renderFeesPage(container) {
             <option value="ALL">All Classes</option>
             ${classOptions.map(cls => `<option value="${cls}">${cls}</option>`).join('')}
           </select>
-          <button class="btn btn-secondary" onclick="exportCurrentFeeLedgerCsv()" style="background:#16a34a; color:#ffffff; border:none; font-weight:800; white-space:nowrap; min-width:max-content; display:inline-flex; align-items:center; gap:8px; padding:10px 18px;">
-            <i class="fa-solid fa-file-csv"></i> Export Current View
+          <button class="btn btn-secondary" onclick="exportFeeBifurcationReport()" style="background:#16a34a; color:#ffffff; border:none; font-weight:800; white-space:nowrap; min-width:max-content; display:inline-flex; align-items:center; gap:8px; padding:10px 18px;">
+            <i class="fa-solid fa-file-csv"></i> Export Fee Report (Bifurcated)
           </button>
         </div>
 
@@ -12589,7 +13541,6 @@ function renderFeesPage(container) {
           <button class="btn btn-secondary fee-tab-btn" id="tabDefaulters" onclick="setFeeFilterTab('DEFAULTERS')" style="border-color:#ef4444; color:#f87171;">Defaulters Only</button>
           <button class="btn btn-secondary fee-tab-btn" id="tabTuition" onclick="setFeeFilterTab('TUITION')" style="border-color:#38bdf8; color:#38bdf8;">Tuition Due</button>
           <button class="btn btn-secondary fee-tab-btn" id="tabExam" onclick="setFeeFilterTab('EXAM')" style="border-color:#f59e0b; color:#f59e0b;">Exam Fee Due</button>
-          <button class="btn btn-secondary fee-tab-btn" id="tabComputer" onclick="setFeeFilterTab('COMPUTER')" style="border-color:#8b5cf6; color:#c084fc;">Computer Fee Due</button>
           <button class="btn btn-secondary fee-tab-btn" id="tabAnnual" onclick="setFeeFilterTab('ANNUAL')" style="border-color:#22c55e; color:#22c55e;">Annual Fee Due</button>
         </div>
       </div>
@@ -12617,7 +13568,7 @@ function renderFeesPage(container) {
               const paidAmount = (s.feeRecords?.[currentSession]?.payments || []).reduce((acc, p) => acc + (p.amount || 0), 0);
 
               return `
-                <tr class="fee-row" data-name="${s.name.toLowerCase()}" data-adm="${s.admissionNo}" data-class="${s.currentClass}" data-dues="${dueAmount}" data-paid="${paidAmount}" data-tuition="${status.tuitionDue}" data-exam="${status.examDue}" data-computer="${status.computerDue}" data-annual="${status.annualDue}">
+                <tr class="fee-row" data-name="${s.name.toLowerCase()}" data-adm="${s.admissionNo}" data-class="${s.currentClass}" data-dues="${dueAmount}" data-paid="${paidAmount}" data-tuition="${status.tuitionDue}" data-exam="${status.examDue}" data-annual="${status.annualDue}">
                   <td>
                     <strong>${s.name}</strong><br>
                     <small style="color:var(--text-muted);">Adm: ${s.admissionNo}</small>
@@ -12632,9 +13583,8 @@ function renderFeesPage(container) {
                   </td>
                   <td>
                     ${status.examDue ? `<span class="badge badge-warning">Exam Rs ${status.examDue}</span>` : ''}
-                    ${status.computerDue ? `<span class="badge badge-purple">Computer Rs ${status.computerDue}</span>` : ''}
                     ${status.annualDue ? `<span class="badge badge-info">Annual Rs ${status.annualDue}</span>` : ''}
-                    ${!status.examDue && !status.computerDue && !status.annualDue ? `<span style="color:var(--text-muted);">None</span>` : ''}
+                    ${!status.examDue && !status.annualDue ? `<span style="color:var(--text-muted);">None</span>` : ''}
                   </td>
                   <td><strong style="color:${dueAmount > 0 ? 'var(--accent-danger)' : 'var(--accent-success)'}; font-size:1rem;">Rs ${dueAmount.toLocaleString('en-IN')}</strong></td>
                   <td>
@@ -12667,7 +13617,7 @@ window._currentFeeTab = 'ALL';
 
 function setFeeFilterTab(tab) {
   window._currentFeeTab = tab;
-  ['All', 'Paid', 'Defaulters', 'Tuition', 'Exam', 'Computer', 'Annual'].forEach(name => {
+  ['All', 'Paid', 'Defaulters', 'Tuition', 'Exam', 'Annual'].forEach(name => {
     document.getElementById(`tab${name}`)?.classList.toggle('active', tab === name.toUpperCase() || (name === 'All' && tab === 'ALL'));
   });
   filterFeesTable();
@@ -12706,7 +13656,6 @@ function getCurrentFeeLedgerRows() {
       (tab === 'DEFAULTERS' && row.dueAmount > 0) ||
       (tab === 'TUITION' && row.status.tuitionDue > 0) ||
       (tab === 'EXAM' && row.status.examDue > 0) ||
-      (tab === 'COMPUTER' && row.status.computerDue > 0) ||
       (tab === 'ANNUAL' && row.status.annualDue > 0);
     return matchQuery && matchClass && matchTab;
   });
@@ -12726,7 +13675,6 @@ function filterFeesTable() {
     const paid = parseInt(r.getAttribute('data-paid') || '0');
     const tuition = parseInt(r.getAttribute('data-tuition') || '0');
     const exam = parseInt(r.getAttribute('data-exam') || '0');
-    const computer = parseInt(r.getAttribute('data-computer') || '0');
     const annual = parseInt(r.getAttribute('data-annual') || '0');
 
     const matchQuery = !query || name.includes(query) || adm.includes(query);
@@ -12736,7 +13684,6 @@ function filterFeesTable() {
       (tab === 'DEFAULTERS' && dues > 0) ||
       (tab === 'TUITION' && tuition > 0) ||
       (tab === 'EXAM' && exam > 0) ||
-      (tab === 'COMPUTER' && computer > 0) ||
       (tab === 'ANNUAL' && annual > 0);
 
     r.style.display = (matchQuery && matchClass && matchTab) ? '' : 'none';
@@ -12768,64 +13715,7 @@ function downloadCsvFile(fileName, rows) {
 }
 
 function exportCurrentFeeLedgerCsv() {
-  const rows = getCurrentFeeLedgerRows();
-  const currentSession = SchoolData.activeSession;
-  const tab = window._currentFeeTab || 'ALL';
-  const targetClass = document.getElementById('feeClassFilter')?.value || 'ALL';
-  const csvRows = [
-    [
-      'Admission No',
-      'Student Name',
-      'Class',
-      'Section',
-      'Father Name',
-      'Parent Phone',
-      'Paid Months',
-      'Pending Months Up To August',
-      'Paid Amount',
-      'Tuition Due',
-      'Exam Fee Due',
-      'Computer Fee Due',
-      'Annual Fee Due',
-      'Previous Session Due',
-      'Total Pending Due',
-      'Last Receipt No',
-      'Last Payment Date'
-    ].map(csvEscape).join(',')
-  ];
-
-  rows.forEach(row => {
-    const s = row.student;
-    const lastPayment = row.payments[row.payments.length - 1] || {};
-    csvRows.push([
-      s.admissionNo,
-      s.name,
-      s.currentClass || s.class || '',
-      s.currentSection || s.section || '',
-      s.parentName || '',
-      s.parentPhone || '',
-      (row.fee.paidMonths || []).join(', '),
-      row.overdueMonths.join(', '),
-      row.paidAmount,
-      row.status.tuitionDue,
-      row.status.examDue,
-      row.status.computerDue,
-      row.status.annualDue,
-      row.fee.previousSessionDue || 0,
-      row.dueAmount,
-      lastPayment.receiptNo || '',
-      lastPayment.date || ''
-    ].map(csvEscape).join(','));
-  });
-
-  const csvContent = "data:text/csv;charset=utf-8," + csvRows.join("\n");
-  const link = document.createElement("a");
-  link.setAttribute("href", encodeURI(csvContent));
-  link.setAttribute("download", `Fee_Ledger_${tab}_${targetClass.replace(/\s+/g, '_')}_${currentSession}.csv`);
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  showNotification(`Exported ${rows.length} fee ledger row(s).`, 'success');
+  exportFeeBifurcationReport();
 }
 
 function openCollectFeeModal(admissionNo) {
@@ -13018,7 +13908,6 @@ function openCollectFeeModal(admissionNo) {
               const master = getStudentFeeMaster(student);
               const annualPaid = !categoryStatus.annualDue;
               const examPaid = !categoryStatus.examDue;
-              const computerPaid = !categoryStatus.computerDue;
               return `
                 ${master.annualEnabled && master.annualCharges > 0 ? `
                   <label style="display:flex; align-items:center; gap:8px; background:${annualPaid ? 'rgba(16,185,129,0.1)' : '#1e293b'}; padding:6px 10px; border-radius:6px; border:1px solid ${annualPaid ? '#10b981' : '#475569'}; cursor:${annualPaid ? 'not-allowed' : 'pointer'}; font-size:0.78rem; opacity:${annualPaid ? '0.65' : '1'};">
@@ -13030,12 +13919,6 @@ function openCollectFeeModal(admissionNo) {
                   <label style="display:flex; align-items:center; gap:8px; background:${examPaid ? 'rgba(16,185,129,0.1)' : '#1e293b'}; padding:6px 10px; border-radius:6px; border:1px solid ${examPaid ? '#10b981' : '#475569'}; cursor:${examPaid ? 'not-allowed' : 'pointer'}; font-size:0.78rem; opacity:${examPaid ? '0.65' : '1'};">
                     <input type="checkbox" id="chk_examFee" class="fee-extra-checkbox" data-label="Exam Fee" data-amount="${master.examFee}" ${examPaid ? 'disabled data-paid="true"' : ''} onchange="this.setAttribute('data-user-edited','true'); recalculateSmartFeeTotal()">
                     <span>Exam Fee (Rs ${master.examFee}) ${examPaid ? '<small style="color:#34d399;">Paid</small>' : ''}</span>
-                  </label>
-                ` : ''}
-                ${master.computerEnabled && master.computerFee > 0 ? `
-                  <label style="display:flex; align-items:center; gap:8px; background:${computerPaid ? 'rgba(16,185,129,0.1)' : '#1e293b'}; padding:6px 10px; border-radius:6px; border:1px solid ${computerPaid ? '#10b981' : '#475569'}; cursor:${computerPaid ? 'not-allowed' : 'pointer'}; font-size:0.78rem; opacity:${computerPaid ? '0.65' : '1'};">
-                    <input type="checkbox" id="chk_computerFee" class="fee-extra-checkbox" data-label="Computer Lab Fee" data-amount="${master.computerFee}" ${computerPaid ? 'disabled data-paid="true"' : ''} onchange="recalculateSmartFeeTotal()">
-                    <span>Computer Lab Fee (Rs ${master.computerFee}) ${computerPaid ? '<small style="color:#34d399;">Paid</small>' : ''}</span>
                   </label>
                 ` : ''}
               `;
@@ -13242,9 +14125,6 @@ function confirmSmartFeePayment(admissionNo, receiptNo) {
   const missingRequiredExtras = [];
   if (categoryStatus.examDue > 0 && !Array.from(extraCheckboxes).some(cb => cb.checked && (cb.getAttribute('data-label') || '').toLowerCase().includes('exam'))) {
     missingRequiredExtras.push(`Exam Fee Rs ${categoryStatus.examDue}`);
-  }
-  if (categoryStatus.computerDue > 0 && !Array.from(extraCheckboxes).some(cb => cb.checked && (cb.getAttribute('data-label') || '').toLowerCase().includes('computer'))) {
-    missingRequiredExtras.push(`Computer Fee Rs ${categoryStatus.computerDue}`);
   }
   if (categoryStatus.annualDue > 0 && !Array.from(extraCheckboxes).some(cb => cb.checked && (cb.getAttribute('data-label') || '').toLowerCase().includes('annual'))) {
     missingRequiredExtras.push(`Annual Charges Rs ${categoryStatus.annualDue}`);
@@ -15027,6 +15907,7 @@ function renderReceiptsLedgerPage(container) {
   const allReceipts = getAllFeeReceipts();
   const totalCollected = allReceipts.reduce((acc, r) => acc + (r.amount || 0), 0);
   const canSeeRevenue = canUserViewSchoolTotalRevenue();
+  const canDeleteReceipts = canCurrentUserDeleteFeeReceipts();
 
   container.innerHTML = `
     <div class="page-header">
@@ -15063,13 +15944,19 @@ function renderReceiptsLedgerPage(container) {
     <!-- SEARCH & FILTER BAR -->
     <div class="glass-card">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:12px;">
-        <div style="display:flex; gap:10px; align-items:center;">
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
           <input type="text" id="receiptSearchInput" placeholder="Search receipt #, student, or adm no..." class="session-dropdown" style="width:300px;" onkeyup="filterReceiptsLedgerTable()">
+          <input type="month" id="receiptMonthFilter" class="session-dropdown date-filter-input" title="Filter by month" style="width:150px;" onchange="filterReceiptsLedgerTable()">
+          <input type="date" id="receiptFromDate" class="session-dropdown date-filter-input" title="From date" style="width:150px;" onchange="filterReceiptsLedgerTable()">
+          <input type="date" id="receiptToDate" class="session-dropdown date-filter-input" title="To date" style="width:150px;" onchange="filterReceiptsLedgerTable()">
           <select id="receiptModeFilter" class="session-dropdown" onchange="filterReceiptsLedgerTable()">
             <option value="ALL">All Payment Modes</option>
             <option value="UPI">Online UPI</option>
             <option value="Cash">Cash</option>
           </select>
+          <button class="btn btn-secondary" onclick="clearReceiptDateFilters()" style="background:#334155; color:#fff; border:none; font-weight:700; padding:6px 12px; font-size:0.82rem;">
+            Clear Dates
+          </button>
         </div>
       </div>
 
@@ -15089,7 +15976,7 @@ function renderReceiptsLedgerPage(container) {
           </thead>
           <tbody>
             ${allReceipts.length > 0 ? allReceipts.map(r => `
-              <tr class="receipt-row" data-no="${r.receiptNo.toLowerCase()}" data-name="${r.studentName.toLowerCase()}" data-adm="${r.admissionNo}" data-mode="${r.mode}">
+              <tr class="receipt-row" data-no="${r.receiptNo.toLowerCase()}" data-name="${r.studentName.toLowerCase()}" data-adm="${r.admissionNo}" data-mode="${r.mode}" data-date="${r.date || ''}">
                 <td><code style="color:var(--accent-primary); font-weight:700;">${r.receiptNo}</code></td>
                 <td>${r.date}</td>
                 <td>
@@ -15111,9 +15998,11 @@ function renderReceiptsLedgerPage(container) {
                     <button class="btn btn-telegram" style="padding:4px 10px; font-size:0.75rem; font-weight:800; background:#0088cc; color:#ffffff; border:none; border-radius:4px; cursor:pointer;" onclick="openTelegramReceiptDispatchModal('${r.admissionNo}', '${r.receiptNo}', '${r.studentIndex}')" title="Send A4 Voucher / Thermal PDF / Text Receipt to Parent via Telegram">
                       <i class="fa-brands fa-telegram"></i> Telegram PDF
                     </button>
+                    ${canDeleteReceipts ? `
                     <button class="btn btn-secondary" style="padding:4px 8px; font-size:0.75rem; background:#dc2626; color:#ffffff; border:none; font-weight:700;" onclick="deleteAndCancelFeeReceipt('${r.admissionNo}', '${r.receiptNo}', '${r.studentIndex}')" title="Delete Receipt & Reverse Revenue Collection">
                       <i class="fa-solid fa-trash"></i> Cancel / Delete
                     </button>
+                    ` : ''}
                   </div>
                 </td>
               </tr>
@@ -15131,9 +16020,19 @@ function renderReceiptsLedgerPage(container) {
   `;
 }
 
+function clearReceiptDateFilters() {
+  ['receiptMonthFilter', 'receiptFromDate', 'receiptToDate', 'recentReceiptMonthFilter', 'recentReceiptFromDate', 'recentReceiptToDate'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+  filterReceiptsLedgerTable();
+  filterRecentReceiptsTable();
+}
+
 function filterReceiptsLedgerTable() {
   const query = (document.getElementById('receiptSearchInput')?.value || '').toLowerCase();
   const targetMode = document.getElementById('receiptModeFilter')?.value || 'ALL';
+  const dateRange = getReceiptDateFilterRange();
 
   const rows = document.querySelectorAll('#receiptsLedgerTable .receipt-row');
   rows.forEach(r => {
@@ -15141,41 +16040,32 @@ function filterReceiptsLedgerTable() {
     const name = r.getAttribute('data-name') || '';
     const adm = r.getAttribute('data-adm') || '';
     const mode = r.getAttribute('data-mode') || '';
+    const receiptDate = r.getAttribute('data-date') || '';
 
     const matchQuery = !query || no.includes(query) || name.includes(query) || adm.includes(query);
     const matchMode = targetMode === 'ALL' || mode.toLowerCase().includes(targetMode.toLowerCase());
+    const matchDate = receiptMatchesDateFilter({ date: receiptDate }, dateRange);
 
-    r.style.display = (matchQuery && matchMode) ? '' : 'none';
+    r.style.display = (matchQuery && matchMode && matchDate) ? '' : 'none';
   });
 }
 
 function exportReceiptsCSV() {
-  const students = getStudentsByActiveSession();
   const currentSession = SchoolData.activeSession;
-
-  let csvRows = ["Receipt No,Date,Admission No,Student Name,Class,Father Name,Amount Paid (INR),Fee Description,Payment Mode"];
-  
-  students.forEach(s => {
-    const feeRec = s.feeRecords ? s.feeRecords[currentSession] : null;
-    if (feeRec && feeRec.payments) {
-      feeRec.payments.forEach(p => {
-        csvRows.push(`"${p.receiptNo}","${p.date}","${s.admissionNo}","${s.name}","${s.currentClass} - ${s.currentSection}","${s.parentName}","${p.amount}","${p.month || 'Tuition Fee'}","${p.mode || 'Cash/UPI'}"`);
-      });
-    }
-  });
-
-  const csvContent = "data:text/csv;charset=utf-8," + csvRows.join("\n");
-  const encodedUri = encodeURI(csvContent);
-  const link = document.createElement("a");
-  link.setAttribute("href", encodedUri);
-  link.setAttribute("download", `MMM_School_Fee_Receipts_Register_${currentSession}.csv`);
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  showNotification(`Exported Official Fee Receipts Register CSV!`, 'success');
+  const receipts = getFilteredFeeReceipts();
+  const dateRange = getReceiptDateFilterRange();
+  const periodLabel = dateRange.label
+    ? dateRange.label.replace('-', '_')
+    : (dateRange.from || dateRange.to ? 'Filtered' : 'All');
+  downloadCsvFile(`MMM_Fee_Receipts_${periodLabel}_${currentSession}.csv`, buildReceiptRegisterCsvRows(receipts));
+  showNotification(`Exported ${receipts.length} receipt row(s) with fee bifurcation totals.`, 'success');
 }
 
 async function deleteAndCancelFeeReceipt(admissionNo, receiptNo, studentIndex) {
+  if (!canCurrentUserDeleteFeeReceipts()) {
+    showNotification('Access denied: fee receipt deletion is restricted to admin / accountant.', 'warning');
+    return;
+  }
   const receiptContext = findReceiptContext(admissionNo, receiptNo, studentIndex);
   const student = receiptContext.student;
   if (!student) {
@@ -15380,11 +16270,19 @@ function exportTelegramLogCsv(category) {
 }
 
 function renderClassTeacherAssignmentsPage(container) {
+  const assignmentRows = (SchoolData.classes || []).flatMap((cls) =>
+    (cls.sections || ['A']).map((section) => {
+      const map = getClassSectionTeachers(cls);
+      const teacher = map[normalizeClassSectionKey(section)] || '';
+      return { cls, section, teacher };
+    })
+  );
+
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-chalkboard-user" style="color:#38bdf8"></i> Class Teacher Assignments</h2>
-        <p class="page-subtitle">Assign one unique class teacher per class. Teacher names come from Teachers Directory.</p>
+        <p class="page-subtitle">Assign one class teacher per <strong>class + section</strong>. Upload each teacher's signature in Teachers Directory — it prints on report cards automatically.</p>
       </div>
       <button class="btn btn-secondary" onclick="window.location.hash='teachers'"><i class="fa-solid fa-user-tie"></i> Teachers Directory</button>
     </div>
@@ -15395,25 +16293,30 @@ function renderClassTeacherAssignmentsPage(container) {
           <thead>
             <tr>
               <th>Class</th>
-              <th>Sections</th>
+              <th>Section</th>
               <th>Assigned Class Teacher</th>
+              <th>Signature on Report Card</th>
               <th>Room</th>
             </tr>
           </thead>
           <tbody>
-            ${(SchoolData.classes || []).map(c => `
+            ${assignmentRows.map(({ cls, section, teacher }) => {
+              const sig = getTeacherSignatureByName(teacher);
+              return `
               <tr>
-                <td><strong style="color:#38bdf8;">${c.name}</strong></td>
-                <td>${(c.sections || []).join(', ')}</td>
+                <td><strong style="color:#38bdf8;">${cls.name}</strong></td>
+                <td><span class="badge badge-purple">${section}</span></td>
                 <td>
-                  <select class="session-dropdown class-teacher-assign-select" data-class-id="${c.id}" style="max-width:320px;">
+                  <select class="session-dropdown class-teacher-assign-select" data-class-id="${cls.id}" data-section="${section}" style="max-width:320px;">
                     <option value="">Select class teacher</option>
-                    ${getClassTeacherOptionsHtml(c.teacher || '', c.id)}
+                    ${getClassTeacherOptionsHtml(teacher, cls.id, section)}
                   </select>
                 </td>
-                <td>${c.room || 'Room 101'}</td>
+                <td>${teacher ? (sig ? '<span style="color:#34d399; font-weight:700;">Uploaded</span>' : '<span style="color:#fbbf24;">Add in Teachers Directory</span>') : '—'}</td>
+                <td>${cls.room || 'Room 101'}</td>
               </tr>
-            `).join('')}
+            `;
+            }).join('')}
           </tbody>
         </table>
       </div>
@@ -15426,23 +16329,27 @@ function renderClassTeacherAssignmentsPage(container) {
 
 function saveClassTeacherAssignments() {
   const selects = Array.from(document.querySelectorAll('.class-teacher-assign-select'));
-  const seen = new Map();
+  const slotMap = new Map();
+
   for (const sel of selects) {
     const teacher = sel.value.trim();
+    const classId = sel.getAttribute('data-class-id');
+    const section = normalizeClassSectionKey(sel.getAttribute('data-section'));
     if (!teacher) continue;
-    if (seen.has(teacher.toLowerCase())) {
-      showNotification(`${teacher} is selected for more than one class. Please choose one class only.`, 'error');
-      return;
-    }
-    seen.set(teacher.toLowerCase(), sel.getAttribute('data-class-id'));
+    const slotKey = `${classId}|${section}`;
+    if (slotMap.has(slotKey)) continue;
+    slotMap.set(slotKey, teacher.toLowerCase());
   }
 
-  selects.forEach(sel => {
+  selects.forEach((sel) => {
     const cls = SchoolData.classes.find(c => c.id === sel.getAttribute('data-class-id'));
-    if (cls) cls.teacher = sel.value.trim();
+    if (!cls) return;
+    const section = normalizeClassSectionKey(sel.getAttribute('data-section'));
+    setClassSectionTeacher(cls, section, sel.value.trim());
   });
+
   saveSchoolDataToStorage();
-  showNotification('Class teacher assignments saved.', 'success');
+  showNotification('Class teacher assignments saved per class and section.', 'success');
   renderClassTeacherAssignmentsPage(document.getElementById('contentBody'));
 }
 
@@ -16586,7 +17493,6 @@ function buildSchoolBotFeesMessage(student) {
   if (status.tuitionDue > 0) lines.push(`Tuition Fee: Rs ${status.tuitionDue}${months.length ? ` (${months.join(', ')})` : ''}`);
   if (status.annualDue > 0) lines.push(`Annual Charges: Rs ${status.annualDue}`);
   if (status.examDue > 0) lines.push(`Exam Fee: Rs ${status.examDue}`);
-  if (status.computerDue > 0) lines.push(`Computer/Lab Fee: Rs ${status.computerDue}`);
 
   const dueText = status.totalDue > 0
     ? `${lines.join('\n')}\n\nTotal Pending: *Rs ${status.totalDue}*`
@@ -16854,9 +17760,8 @@ function buildFeeDueSheetPayload(student, chatId, statusText = 'Sent') {
     SchoolBotChatId: chatId || getStudentSchoolChatId(student),
     DueMonths: (feeInfo?.overdueMonths || []).join(', '),
     TuitionDue: feeInfo?.tuitionDue || '',
-    ExamFeeDue: feeInfo?.examFeeDue || '',
-    ComputerFeeDue: feeInfo?.computerFeeDue || '',
-    AnnualFeeDue: feeInfo?.annualFeeDue || '',
+    ExamFeeDue: feeInfo?.examDue || '',
+    AnnualFeeDue: feeInfo?.annualDue || '',
     PreviousSessionDue: student.currentFeeInfo?.previousSessionDue || '',
     TotalDue: feeInfo?.totalDue || '',
     SentBy: getErpLogUserName(),
@@ -16875,7 +17780,6 @@ function buildStudentFeeSheetSyncPayload(student) {
     DueMonths: (status.overdueMonths || []).join(', '),
     TuitionDue: fmt(monthlyTuition),
     ExamFeeDue: fmt(status.examDue),
-    ComputerFeeDue: fmt(status.computerDue),
     AnnualFeeDue: fmt(status.annualDue),
     PreviousSessionDue: fmt(fee.previousSessionDue),
     TotalDue: fmt(status.totalDue)
@@ -17046,7 +17950,6 @@ async function triggerSingleFeeReminder(admissionNo, customMsg) {
         DueMonths: 'Sent',
         TuitionDue: '',
         ExamFeeDue: '',
-        ComputerFeeDue: '',
         AnnualFeeDue: '',
         PreviousSessionDue: '',
         TotalDue: '',
@@ -18311,20 +19214,28 @@ function toggleSessionStatus(sessId) {
 
 function renderReportsPage(container) {
   const canDuesReport = canUserViewSchoolTotalDues();
+  const canRevenueReport = canUserViewSchoolTotalRevenue();
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-chart-column" style="color:var(--accent-warning)"></i> Reports & Analytics</h2>
-        <p class="page-subtitle">Generate Admission, Fee & Attendance Reports</p>
+        <p class="page-subtitle">Generate Admission, Fee & Attendance Reports for ${SchoolData.activeSession}</p>
       </div>
     </div>
     <div class="grid-2">
       <div class="glass-card">
-        <h3><i class="fa-solid fa-download"></i> Export Dues Report</h3>
-        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Download Excel breakdown of all pending student fee dues for ${SchoolData.activeSession}.</p>
+        <h3><i class="fa-solid fa-download"></i> Fee Dues Report (Bifurcated)</h3>
+        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Download CSV with tuition, annual, and exam fee paid/due columns plus a TOTAL row for every student in the active session.</p>
         ${canDuesReport
-          ? `<button class="btn btn-primary" onclick="showNotification('Exporting Dues Report to Excel...', 'success')">Export Excel</button>`
+          ? `<button class="btn btn-primary" onclick="exportAllStudentsFeeReport()"><i class="fa-solid fa-file-csv"></i> Export Fee Dues Report</button>`
           : `<button class="btn btn-secondary" disabled style="opacity:0.55;">Hidden — need View Total Dues right</button>`}
+      </div>
+      <div class="glass-card">
+        <h3><i class="fa-solid fa-receipt"></i> Fee Receipts Register</h3>
+        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Open the receipts ledger to filter by month or date range, then export with tuition/annual/exam bifurcation and totals.</p>
+        ${canRevenueReport
+          ? `<button class="btn btn-secondary" onclick="window.location.hash='receipts'" style="background:#0284c7; color:#fff; border:none; font-weight:700;"><i class="fa-solid fa-file-invoice-dollar"></i> Open Receipts Ledger</button>`
+          : `<button class="btn btn-secondary" disabled style="opacity:0.55;">Hidden — need View Total Revenue right</button>`}
       </div>
       <div class="glass-card">
         <h3><i class="fa-solid fa-file-pdf"></i> Export Attendance Summary</h3>
