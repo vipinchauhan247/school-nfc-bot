@@ -9123,7 +9123,7 @@ function openBulkStudentCsvModal() {
         <div style="background:rgba(14,165,233,0.12); border:1px solid rgba(14,165,233,0.45); border-radius:10px; padding:12px; margin-bottom:14px; color:#bae6fd; font-size:0.78rem; font-weight:700;">
           <div style="display:flex; gap:10px; align-items:flex-start; margin-bottom:10px;">
             <i class="fa-solid fa-shield-halved" style="margin-top:2px; color:#38bdf8;"></i>
-            <span>Safe import: existing students are matched by Admission No. Blank CSV cells never erase saved ERP details.</span>
+            <span>Safe import: existing students are matched by <strong>Admission No</strong>. Class, Section, Gender and Date of Admission from CSV always replace ERP values when the CSV cell is filled.</span>
           </div>
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
             <label style="display:flex; gap:8px; align-items:flex-start; background:#0f172a; border:1px solid #334155; border-radius:8px; padding:9px;">
