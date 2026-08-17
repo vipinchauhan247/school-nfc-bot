@@ -2918,7 +2918,7 @@ function renderExamsPage(container, mode = 'entry') {
     <!-- ACTIVE USER PERMISSION STATUS BANNER -->
     <div style="padding:12px 18px; background:rgba(56, 189, 248, 0.12); border:1px solid #38bdf8; border-radius:12px; color:#38bdf8; font-weight:700; font-size:0.88rem; margin-bottom:16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
       <div>
-        <i class="fa-solid fa-user-shield"></i> Active Logged-In Account: <strong>${getCurrentActiveUser().name}</strong> [<span style="color:#ffffff;">${getCurrentActiveUser().role}</span>] 
+        <i class="fa-solid fa-user-shield"></i> Active Logged-In Account: <strong>${getCurrentActiveUser().name}</strong> [<span class="erp-role-chip">${getCurrentActiveUser().role}</span>] 
         ${(() => {
           const user = getCurrentActiveUser();
           const teacher = SchoolData.teachers.find(t => t.id === user.assignedTeacherId || t.name === user.name) || user;
@@ -3133,7 +3133,7 @@ function renderExamsPage(container, mode = 'entry') {
             <!-- TOP GROUP HEADER ROW -->
             <tr style="background:#0f172a; color:#ffffff;">
               <th rowspan="2" class="sticky-col-1" style="width:50px; border-bottom:2px solid #334155; padding:12px;">S.No</th>
-              <th rowspan="2" class="sticky-col-2" style="min-width:180px; text-align:left; border-bottom:2px solid #334155; padding:12px; color:#38bdf8;">Student's Name</th>
+              <th rowspan="2" class="sticky-col-2" style="min-width:180px; text-align:left; border-bottom:2px solid #334155; padding:12px; color:#38bdf8;">Student &amp; Adm No</th>
               <th rowspan="2" class="sticky-col-3" style="min-width:165px; text-align:left; border-bottom:2px solid #334155; padding:12px; color:#cbd5e1;">Father's Name</th>
 
               ${allSubjects.map(sub => `
@@ -3284,7 +3284,10 @@ function renderExamsPage(container, mode = 'entry') {
               return `
                 <tr class="marks-entry-row" data-admission="${s.admissionNo}" style="border-bottom:1px solid #334155;">
                   <td class="sticky-col-1" style="border-bottom:1px solid #334155; padding:10px;"><code>${idx + 1}</code></td>
-                  <td class="sticky-col-2" style="text-align:left; font-weight:800; border-bottom:1px solid #334155; color:#38bdf8; font-size:1.05rem; padding:10px;">${s.name}</td>
+                  <td class="sticky-col-2" style="text-align:left; border-bottom:1px solid #334155; padding:10px;">
+                    <div class="exam-student-name">${s.name}</div>
+                    <span class="adm-no-chip">Adm ${s.admissionNo}</span>
+                  </td>
                   <td class="sticky-col-3" style="text-align:left; border-bottom:1px solid #334155; color:#cbd5e1; font-size:0.95rem; padding:10px;">${s.parentName}</td>
 
                   ${subCells}
@@ -3781,10 +3784,13 @@ function renderExamsReportCardsSubdirectoryPage(container) {
                   <td>
                     <div style="display:flex; align-items:center; gap:10px;">
                       <img src="${s.photo}" style="width:36px; height:36px; border-radius:50%; object-fit:cover; border:1px solid #6366f1;">
-                      <strong style="color:var(--text-main);">${s.name}</strong>
+                      <div>
+                        <strong style="color:var(--text-main);">${s.name}</strong>
+                        <span class="adm-no-chip">Adm ${s.admissionNo}</span>
+                      </div>
                     </div>
                   </td>
-                  <td><code>${s.admissionNo}</code></td>
+                  <td><span class="adm-no-chip">${s.admissionNo}</span></td>
                   <td><span class="badge badge-purple">${s.currentClass || selectedClass} - ${s.currentSection || 'A'}</span></td>
                   <td><strong style="color:#34d399;">${s.totalObtained} / ${s.totalMax}</strong></td>
                   <td><strong style="color:#38bdf8;">${s.perc}%</strong></td>
@@ -3893,7 +3899,7 @@ function renderUsersPage(container) {
               return `
                 <tr style="border-bottom:1px solid #334155;">
                   <td class="users-sticky-name" style="text-align:left; font-weight:800; color:#38bdf8; padding:12px;">${u.name}</td>
-                  <td class="users-sticky-role" style="text-align:left; padding:12px; color:#cbd5e1; font-weight:700;">${u.role}</td>
+                  <td class="users-sticky-role" style="text-align:left; padding:12px;"><span class="erp-role-chip">${u.role}</span></td>
                   <td style="text-align:left; padding:12px;"><code style="color:#fbbf24; font-weight:800;">${u.uniqueId || u.id}</code></td>
 
                   <!-- USERNAME & PASSWORD -->
@@ -4415,7 +4421,7 @@ function renderAdmitCardPage(container) {
         <div class="data-table-container" style="max-height:420px; overflow-y:auto;">
           <table class="data-table">
             <thead>
-              <tr><th style="width:60px;">Print</th><th style="width:64px;">Photo</th><th>Student</th><th>Father's Name</th><th>Admission No</th><th style="width:110px;">Roll No</th><th>Class & Sec</th><th>Action</th></tr>
+              <tr><th style="width:60px;">Print</th><th style="width:64px;">Photo</th><th>Student</th><th>Admission No</th><th style="width:110px;">Roll No</th><th>Class & Sec</th><th>Father's Name</th><th>Action</th></tr>
             </thead>
             <tbody>
               ${students.map(s => {
@@ -4430,8 +4436,7 @@ function renderAdmitCardPage(container) {
                       : `<span title="No photo uploaded" style="display:inline-flex; align-items:center; justify-content:center; width:38px; height:44px; border:1px dashed #f59e0b; border-radius:4px; color:#f59e0b; font-size:0.65rem;">none</span>`}
                   </td>
                   <td><strong style="color:#38bdf8;">${escapeHtml(s.name || '')}</strong></td>
-                  <td>${escapeHtml(s.parentName || '')}</td>
-                  <td><code>${adm}</code></td>
+                  <td><span class="adm-no-chip">${adm}</span></td>
                   <td>
                     <input type="text" class="session-dropdown admit-roll-input" data-adm="${adm}"
                       value="${escapeHtml(String(s.currentRollNo || s.rollNo || ''))}" placeholder="Roll"
@@ -4439,6 +4444,7 @@ function renderAdmitCardPage(container) {
                       onchange="saveAdmitCardRollNo('${adm}', this.value)">
                   </td>
                   <td><span class="badge badge-purple">${escapeHtml(s.currentClass || '')} - ${escapeHtml(s.currentSection || '')}</span></td>
+                  <td>${escapeHtml(s.parentName || '')}</td>
                   <td><button class="btn btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="printSingleAdmitCard('${adm}')"><i class="fa-solid fa-print"></i> Print</button></td>
                 </tr>
               `;
@@ -8795,7 +8801,7 @@ function renderStudentsPage(container) {
                       <small style="color:var(--text-muted);">${s.gender} | <strong style="color:var(--accent-primary);">DOB: ${formatDobToDDMMYYYY(s.dob)}</strong></small>
                     </div>
                   </td>
-                  <td><code>${s.admissionNo}</code></td>
+                  <td><span class="adm-no-chip">${s.admissionNo}</span></td>
                   <td><span class="badge badge-purple">${s.currentClass} - ${s.currentSection}</span></td>
                   <td>
                     <div style="font-size:0.8rem;">
@@ -10450,7 +10456,7 @@ function openClassStudentsModal(className, targetSection = null) {
                       <strong class="theme-panel-name" style="font-size:0.95rem;">${s.name}</strong>
                     </div>
                   </td>
-                  <td><code>${s.admissionNo}</code></td>
+                  <td><span class="adm-no-chip">${s.admissionNo}</span></td>
                   <td><span class="badge badge-purple">${s.currentClass || className} - ${s.currentSection || s.section || 'A'}</span></td>
                   <td><strong style="color:var(--accent-primary);">DOB: ${formatDobToDDMMYYYY(s.dob)}</strong></td>
                   <td style="color:var(--text-main);">${s.parentName}</td>
@@ -13321,7 +13327,8 @@ function openQuickFeeSelectModal() {
                   <div>
                     <strong style="color:var(--text-main); font-size:0.95rem;">${s.name}</strong> 
                     <span style="color:var(--accent-primary); font-size:0.8rem;">(${s.currentClass || 'Class 5'} - ${s.currentSection || 'A'})</span><br>
-                    <small style="color:#94a3b8; font-size:0.75rem;">Adm: <code>${s.admissionNo}</code> | Father: ${s.parentName}</small>
+                    <span class="adm-no-chip" style="margin-top:2px;">Adm ${s.admissionNo}</span>
+                    <small style="color:#94a3b8; font-size:0.75rem; display:block; margin-top:4px;">Father: ${s.parentName}</small>
                   </div>
                 </div>
 
@@ -13408,7 +13415,7 @@ function renderRecentReceiptsSection() {
                 <td><code style="color:#c084fc; font-weight:800; font-size:0.85rem;">#${r.receiptNo}</code></td>
                 <td><span style="color:#cbd5e1;">${r.date}</span></td>
                 <td><strong style="color:#ffffff;">${r.studentName}</strong></td>
-                <td><code>${r.admissionNo}</code></td>
+                <td><span class="adm-no-chip">${r.admissionNo}</span></td>
                 <td><span class="badge badge-purple">${r.class} - ${r.section}</span></td>
                 <td><strong style="color:#34d399; font-size:0.95rem;">Rs${(r.amount || 0).toLocaleString('en-IN')}</strong></td>
                 <td>
@@ -13549,6 +13556,7 @@ function renderFeesPage(container) {
           <thead>
             <tr>
               <th>Student</th>
+              <th>Adm No</th>
               <th>Class</th>
               <th>Paid Months</th>
               <th>Pending Months (Up to August)</th>
@@ -13568,10 +13576,8 @@ function renderFeesPage(container) {
 
               return `
                 <tr class="fee-row" data-name="${s.name.toLowerCase()}" data-adm="${s.admissionNo}" data-class="${s.currentClass}" data-dues="${dueAmount}" data-paid="${paidAmount}" data-tuition="${status.tuitionDue}" data-exam="${status.examDue}" data-annual="${status.annualDue}">
-                  <td>
-                    <strong>${s.name}</strong><br>
-                    <small style="color:var(--text-muted);">Adm: ${s.admissionNo}</small>
-                  </td>
+                  <td><strong>${s.name}</strong></td>
+                  <td><span class="adm-no-chip">${s.admissionNo}</span></td>
                   <td><span class="badge badge-purple">${s.currentClass} - ${s.currentSection}</span></td>
                   <td><span class="badge badge-success">${fee.paidMonths?.join(', ') || 'None'}</span></td>
                   <td><span class="badge badge-danger">${overdueMonths.join(', ') || 'Zero Dues'}</span></td>
@@ -13807,9 +13813,9 @@ function openCollectFeeModal(admissionNo) {
         <div style="background:#0f172a; padding:12px 16px; border-radius:10px; border:1px solid #334155; margin-bottom:16px; display:flex; justify-content:space-between; align-items:center;">
           <div>
             <div style="font-size:1.45rem; font-weight:900; color:#047857;">${student.name}</div>
-            <div style="font-size:1rem; color:#334155; margin-top:4px; font-weight:800;">
-              Admission No: <code style="color:#6366f1; font-weight:bold;">${student.admissionNo}</code> | 
-              Current Class: <strong style="color:#38bdf8;">${currentClass} - ${student.currentSection || 'A'}</strong>
+            <div style="font-size:1rem; margin-top:6px; font-weight:800; display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+              <span class="adm-no-chip" style="margin-top:0;">Adm ${student.admissionNo}</span>
+              <span style="color:#334155;">Class: <strong style="color:#38bdf8;">${currentClass} - ${student.currentSection || 'A'}</strong></span>
             </div>
             <div style="font-size:0.95rem; color:#475569; margin-top:4px; font-weight:700;">Parent: ${student.parentName} (${student.parentPhone})</div>
           </div>
@@ -19629,7 +19635,7 @@ function openStudentProfile(admissionNo) {
             <div>
               <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
                 <h2 style="margin:0; color:#ffffff; font-size:1.5rem; font-weight:800; font-family:var(--font-heading, sans-serif);">${student.name}</h2>
-                <span style="background:#4f46e5; color:#ffffff; padding:3px 10px; border-radius:12px; font-size:0.75rem; font-weight:700;">Adm: ${student.admissionNo}</span>
+                <span class="adm-no-chip profile-header-adm">Adm ${student.admissionNo}</span>
                 <span style="background:#059669; color:#ffffff; padding:3px 10px; border-radius:12px; font-size:0.75rem; font-weight:700;">Roll No: ${rollNo}</span>
               </div>
               
