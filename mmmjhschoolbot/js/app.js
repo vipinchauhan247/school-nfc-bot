@@ -10307,15 +10307,30 @@ function checkAdmissionNumberConflict(admNo, currentStudentId = null, currentAdm
 
 function deleteAllStudentsForFreshCsvImport() {
   if (blockStudentBulkDeleteIfDenied()) return;
-  const total = SchoolData.students?.length || 0;
-  if (!confirm(`Delete ALL ${total} student records from this browser database?\n\nUse this only before importing your real CSV. This will not delete staff, classes, settings, or sessions.`)) return;
-  if (!confirm("Final confirmation: student profiles, fee ledgers, attendance logs, and marks linked to these students will be removed locally.")) return;
+  const all = Array.isArray(SchoolData.students) ? SchoolData.students : [];
+  const total = all.length;
 
-  SchoolData.students = [];
+  // Left / inactive students are the school's leaving record and back the issued
+  // TCs, so a "clear roster before CSV import" must never take them with it.
+  const historical = all.filter(s => !isStudentActiveForRoster(s));
+  const active = all.filter(isStudentActiveForRoster);
+
+  const historyNote = historical.length
+    ? `\n\n${historical.length} left / inactive student record(s) will be KEPT so issued transfer certificates stay traceable.`
+    : '';
+  if (!confirm(`Delete ${active.length} active student record(s) of ${total} from this browser database?\n\nUse this only before importing your real CSV. Staff, classes, settings and sessions are not touched.${historyNote}`)) return;
+  if (!confirm("Final confirmation: fee ledgers, attendance logs and marks for the ACTIVE students listed above will be removed locally.")) return;
+
+  SchoolData.students = historical;
   SchoolData.telegramLogs = [];
   saveSchoolDataToStorage();
 
-  showNotification("All students deleted. You can now import the real student CSV.", "warning");
+  showNotification(
+    historical.length
+      ? `${active.length} active students deleted. ${historical.length} left / inactive record(s) kept. You can now import the real student CSV.`
+      : "All students deleted. You can now import the real student CSV.",
+    "warning"
+  );
   if (document.getElementById('contentBody')) {
     renderStudentsPage(document.getElementById('contentBody'));
   }
