@@ -9161,6 +9161,38 @@ function applyCsvValue(student, field, csvValue, mode) {
   if (shouldApplyCsvValue(student[field], csvValue, mode)) student[field] = csvValue;
 }
 
+function normalizeCsvGender(raw) {
+  const g = String(raw || '').trim().toLowerCase();
+  if (!g) return '';
+  if (g === 'm' || g === 'male' || g === 'boy') return 'Male';
+  if (g === 'f' || g === 'female' || g === 'girl') return 'Female';
+  return String(raw).trim();
+}
+
+function normalizeCsvPhone(raw) {
+  let s = String(raw ?? '').trim();
+  if (!s) return '';
+  if (/e\+/i.test(s)) {
+    const n = Number(s);
+    if (Number.isFinite(n)) s = String(Math.round(n));
+  }
+  s = s.replace(/\D/g, '');
+  if (s.length === 10) return s;
+  if (s.length === 12 && s.startsWith('91')) return s.slice(2);
+  return s || String(raw).trim();
+}
+
+function normalizeCsvSection(raw) {
+  const sec = String(raw || '').trim().toUpperCase();
+  if (!sec) return '';
+  return sec.length === 1 ? sec : sec.replace(/[^A-Z0-9]/g, '').slice(0, 2);
+}
+
+function applyCsvRegisterField(student, field, csvValue) {
+  if (!hasCsvValue(csvValue)) return;
+  student[field] = csvValue;
+}
+
 function applyCsvImportItemToStudent(student, item, currentSession, mode = 'fillBlanks') {
   applyCsvValue(student, 'name', item.name, mode);
   applyCsvValue(student, 'parentName', item.father, mode);
@@ -9185,6 +9217,21 @@ function applyCsvImportItemToStudent(student, item, currentSession, mode = 'fill
   }
   if (shouldApplyCsvValue(student.currentClass, item.cls, mode)) student.currentClass = item.cls;
   if (shouldApplyCsvValue(student.currentSection, item.sec, mode)) student.currentSection = item.sec;
+
+  // Register fields from CSV always win (class, gender, admission date) — fixes wrong UKG-B when CSV says Class 6.
+  applyCsvRegisterField(student, 'name', item.name);
+  applyCsvRegisterField(student, 'gender', item.gender);
+  applyCsvRegisterField(student, 'dateOfAdmission', item.dateOfAdmission);
+  applyCsvRegisterField(student, 'pen', item.pen);
+  applyCsvRegisterField(student, 'caste', item.caste);
+  if (hasCsvValue(item.cls)) {
+    student.sessionDetails[currentSession].class = item.cls;
+    student.currentClass = item.cls;
+  }
+  if (hasCsvValue(item.sec)) {
+    student.sessionDetails[currentSession].section = item.sec;
+    student.currentSection = item.sec;
+  }
 }
 
 function normalizeClassName(rawClass) {
@@ -9327,12 +9374,12 @@ function handleStudentCsvFileSelect(event) {
         admNo: cleanAdmNo,
         name: fullName,
         cls: normCls,
-        sec: (secIdx !== -1 && cleanVals[secIdx]) ? cleanVals[secIdx] : '',
+        sec: (secIdx !== -1 && cleanVals[secIdx]) ? normalizeCsvSection(cleanVals[secIdx]) : '',
         father: cleanVals[fatherIdx] || 'Parent',
         mother: (motherIdx !== -1 && cleanVals[motherIdx]) ? cleanVals[motherIdx] : '',
         dob: (dobIdx !== -1 && cleanVals[dobIdx]) ? cleanVals[dobIdx] : '',
-        gender: (genderIdx !== -1 && cleanVals[genderIdx]) ? cleanVals[genderIdx] : 'Male',
-        phone: (phoneIdx !== -1 && cleanVals[phoneIdx]) ? cleanVals[phoneIdx] : '',
+        gender: (genderIdx !== -1 && cleanVals[genderIdx]) ? normalizeCsvGender(cleanVals[genderIdx]) : '',
+        phone: (phoneIdx !== -1 && cleanVals[phoneIdx]) ? normalizeCsvPhone(cleanVals[phoneIdx]) : '',
         address: (addressIdx !== -1 && cleanVals[addressIdx]) ? cleanVals[addressIdx] : '',
         aadhaar: (aadhaarIdx !== -1 && cleanVals[aadhaarIdx]) ? cleanVals[aadhaarIdx] : 'N/A',
         dateOfAdmission: (doaIdx !== -1 && cleanVals[doaIdx]) ? formatAdmissionDateDisplay(cleanVals[doaIdx]) : '',
@@ -9439,7 +9486,7 @@ function importParsedStudentsFromCsv() {
 
     const admNo = item.admNo;
     if (!admNo) return;
-    const existingStudent = SchoolData.students.find(s => String(s.admissionNo).trim() === String(admNo).trim());
+    const existingStudent = findStudentByAdmissionNo(admNo);
     if (existingStudent) {
       applyCsvImportItemToStudent(existingStudent, item, currentSession, importMode);
       updatedExistingContactFields++;
@@ -9473,6 +9520,8 @@ function importParsedStudentsFromCsv() {
       sessionDetails: {
         [currentSession]: { class: item.cls || "Class 5", section: item.sec || "A", rollNo: "01", teacher: "Class Teacher", status: "Active" }
       },
+      currentClass: item.cls || "Class 5",
+      currentSection: item.sec || "A",
       currentFeeInfo: {
         session: currentSession,
         monthlyTuition: item.tuition,
@@ -11985,19 +12034,19 @@ function saveTeacherPeriodMatrix(teacherName) {
    ============================================================================ */
 if (!SchoolData.classFeeMaster) {
   SchoolData.classFeeMaster = {
-    "Nursery": { monthlyTuition: 1200, annualCharges: 2000, examFee: 400, computerFee: 0, admissionFee: 1000 },
-    "LKG":     { monthlyTuition: 1300, annualCharges: 2000, examFee: 400, computerFee: 0, admissionFee: 1000 },
-    "UKG":     { monthlyTuition: 1400, annualCharges: 2200, examFee: 400, computerFee: 0, admissionFee: 1000 },
-    "Class 1": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, computerFee: 100, admissionFee: 1200 },
-    "Class 2": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, computerFee: 100, admissionFee: 1200 },
-    "Class 3": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, computerFee: 150, admissionFee: 1200 },
-    "Class 4": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, computerFee: 150, admissionFee: 1200 },
-    "Class 5": { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, computerFee: 200, admissionFee: 1200 },
-    "Class 6": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, computerFee: 200, admissionFee: 1500 },
-    "Class 7": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, computerFee: 200, admissionFee: 1500 },
-    "Class 8": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, computerFee: 200, admissionFee: 1500 },
-    "Class 9": { monthlyTuition: 2200, annualCharges: 3500, examFee: 800, computerFee: 300, admissionFee: 2000 },
-    "Class 10":{ monthlyTuition: 2500, annualCharges: 4000, examFee: 1000,computerFee: 300, admissionFee: 2000 }
+    "Nursery": { monthlyTuition: 1200, annualCharges: 2000, examFee: 400, admissionFee: 1000 },
+    "LKG":     { monthlyTuition: 1300, annualCharges: 2000, examFee: 400, admissionFee: 1000 },
+    "UKG":     { monthlyTuition: 1400, annualCharges: 2200, examFee: 400, admissionFee: 1000 },
+    "Class 1": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, admissionFee: 1200 },
+    "Class 2": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, admissionFee: 1200 },
+    "Class 3": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, admissionFee: 1200 },
+    "Class 4": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, admissionFee: 1200 },
+    "Class 5": { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, admissionFee: 1200 },
+    "Class 6": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, admissionFee: 1500 },
+    "Class 7": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, admissionFee: 1500 },
+    "Class 8": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, admissionFee: 1500 },
+    "Class 9": { monthlyTuition: 2200, annualCharges: 3500, examFee: 800, admissionFee: 2000 },
+    "Class 10":{ monthlyTuition: 2500, annualCharges: 4000, examFee: 1000, admissionFee: 2000 }
   };
 }
 
@@ -12008,16 +12057,20 @@ if (!SchoolData.feeScheduleRules) {
   };
 }
 
+Object.keys(SchoolData.classFeeMaster || {}).forEach(cls => {
+  delete SchoolData.classFeeMaster[cls].computerFee;
+  delete SchoolData.classFeeMaster[cls].computerEnabled;
+});
+
 function getStudentFeeMaster(student) {
   const cls = normalizeClassName(student.currentClass || student.class || 'Class 5');
-  const fallback = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, computerFee: 150, annualEnabled: true, examEnabled: true, computerEnabled: true };
+  const fallback = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, annualEnabled: true, examEnabled: true };
   const saved = (SchoolData.classFeeMaster && SchoolData.classFeeMaster[cls]) || fallback;
   return {
     ...fallback,
     ...saved,
     annualEnabled: saved.annualEnabled !== false,
-    examEnabled: saved.examEnabled !== false,
-    computerEnabled: saved.computerEnabled !== false
+    examEnabled: saved.examEnabled !== false
   };
 }
 
@@ -12043,8 +12096,278 @@ function getStudentFeeCategoryStatus(student) {
   const tuitionDue = (overdueMonths.length * getStudentMonthlyTuitionRate(student)) + (fee.previousSessionDue || 0);
   const annualDue = master.annualEnabled && master.annualCharges > 0 && !hasPaidExtraFee(student, 'Annual Charges') ? master.annualCharges : 0;
   const examDue = master.examEnabled && master.examFee > 0 && !hasPaidExtraFee(student, 'Exam Fee') ? master.examFee : 0;
-  const computerDue = master.computerEnabled && master.computerFee > 0 && !hasPaidExtraFee(student, 'Computer') ? master.computerFee : 0;
-  return { tuitionDue, annualDue, examDue, computerDue, totalDue: tuitionDue + annualDue + examDue + computerDue, overdueMonths };
+  return { tuitionDue, annualDue, examDue, totalDue: tuitionDue + annualDue + examDue, overdueMonths };
+}
+
+function getStudentFeePaidBreakdown(student, session = SchoolData.activeSession) {
+  const payments = student.feeRecords?.[session]?.payments || [];
+  let tuitionPaid = 0;
+  let annualPaid = 0;
+  let examPaid = 0;
+  payments.forEach(payment => {
+    tuitionPaid += Number(payment.selectedMonthsTotal || 0);
+    (payment.paidPrevMonths || []).forEach(item => {
+      tuitionPaid += Number(item.amount || 0);
+    });
+    (payment.paidExtraItems || []).forEach(item => {
+      const label = String(item.label || '').toLowerCase();
+      const amt = Number(item.amount || 0);
+      if (label.includes('annual')) annualPaid += amt;
+      else if (label.includes('exam')) examPaid += amt;
+    });
+  });
+  const totalPaid = payments.reduce((sum, p) => sum + Number(p.amount || 0), 0);
+  return { tuitionPaid, annualPaid, examPaid, totalPaid };
+}
+
+function buildFeeBifurcationCsvRows(rows, options = {}) {
+  const includeTotals = options.includeTotals !== false;
+  const header = [
+    'Admission No', 'Student Name', 'Class', 'Section', 'Gender', 'Date Of Admission',
+    'Father Name', 'Parent Phone',
+    'Paid Months', 'Pending Months Up To August',
+    'Tuition Fee Paid', 'Tuition Fee Due',
+    'Annual Fee Paid', 'Annual Fee Due',
+    'Exam Fee Paid', 'Exam Fee Due',
+    'Previous Session Due', 'Total Pending Due',
+    'Last Receipt No', 'Last Payment Date',
+    'Total Fee Paid'
+  ];
+  const csvRows = [header];
+  const totals = {
+    tuitionPaid: 0, tuitionDue: 0, annualPaid: 0, annualDue: 0,
+    examPaid: 0, examDue: 0, prevDue: 0, totalDue: 0, totalPaid: 0
+  };
+
+  rows.forEach(row => {
+    const s = row.student;
+    const paid = getStudentFeePaidBreakdown(s);
+    const lastPayment = row.payments[row.payments.length - 1] || {};
+    const prevDue = Number(row.fee.previousSessionDue || 0);
+    const tuitionDueOnly = Math.max(0, Number(row.status.tuitionDue || 0) - prevDue);
+    const line = [
+      s.admissionNo,
+      s.name,
+      s.currentClass || s.class || '',
+      s.currentSection || s.section || '',
+      s.gender || '',
+      s.dateOfAdmission || '',
+      s.parentName || '',
+      s.parentPhone || '',
+      (row.fee.paidMonths || []).join(', '),
+      row.overdueMonths.join(', '),
+      paid.tuitionPaid,
+      tuitionDueOnly,
+      paid.annualPaid,
+      row.status.annualDue,
+      paid.examPaid,
+      row.status.examDue,
+      prevDue,
+      row.dueAmount,
+      lastPayment.receiptNo || '',
+      lastPayment.date || '',
+      paid.totalPaid
+    ];
+    totals.tuitionPaid += paid.tuitionPaid;
+    totals.tuitionDue += tuitionDueOnly;
+    totals.annualPaid += paid.annualPaid;
+    totals.annualDue += row.status.annualDue;
+    totals.examPaid += paid.examPaid;
+    totals.examDue += row.status.examDue;
+    totals.prevDue += prevDue;
+    totals.totalDue += row.dueAmount;
+    totals.totalPaid += paid.totalPaid;
+    csvRows.push(line);
+  });
+
+  if (includeTotals && rows.length) {
+    csvRows.push([
+      'TOTAL', `${rows.length} students`, '', '', '', '', '', '', '', '',
+      totals.tuitionPaid, totals.tuitionDue,
+      totals.annualPaid, totals.annualDue,
+      totals.examPaid, totals.examDue,
+      totals.prevDue, totals.totalDue,
+      '', '',
+      totals.totalPaid
+    ]);
+  }
+  return csvRows;
+}
+
+function exportFeeBifurcationReport(sourceRows, fileLabel) {
+  const rows = sourceRows || getCurrentFeeLedgerRows();
+  const currentSession = SchoolData.activeSession;
+  const tab = window._currentFeeTab || 'ALL';
+  const targetClass = document.getElementById('feeClassFilter')?.value || 'ALL';
+  downloadCsvFile(`Fee_Report_${fileLabel || tab}_${targetClass.replace(/\s+/g, '_')}_${currentSession}.csv`, buildFeeBifurcationCsvRows(rows));
+  showNotification(`Exported ${rows.length} student fee row(s) with bifurcation totals.`, 'success');
+}
+
+function exportAllStudentsFeeReport() {
+  const currentSession = SchoolData.activeSession;
+  const rows = getStudentsByActiveSession().map(s => {
+    const fee = s.currentFeeInfo || {};
+    const status = getStudentFeeCategoryStatus(s);
+    const payments = s.feeRecords?.[currentSession]?.payments || [];
+    return {
+      student: s,
+      fee,
+      status,
+      payments,
+      paidAmount: payments.reduce((acc, p) => acc + (p.amount || 0), 0),
+      overdueMonths: status.overdueMonths,
+      dueAmount: status.totalDue
+    };
+  });
+  exportFeeBifurcationReport(rows, 'All_Students');
+}
+
+function getPaymentPaidBreakdown(payment) {
+  let tuitionPaid = Number(payment?.selectedMonthsTotal || 0);
+  (payment?.paidPrevMonths || []).forEach(item => {
+    tuitionPaid += Number(item.amount || 0);
+  });
+  let annualPaid = 0;
+  let examPaid = 0;
+  (payment?.paidExtraItems || []).forEach(item => {
+    const label = String(item.label || '').toLowerCase();
+    const amt = Number(item.amount || 0);
+    if (label.includes('annual')) annualPaid += amt;
+    else if (label.includes('exam')) examPaid += amt;
+  });
+  return {
+    tuitionPaid,
+    annualPaid,
+    examPaid,
+    totalPaid: Number(payment?.amount || 0)
+  };
+}
+
+function parseReceiptDateValue(dateStr) {
+  const raw = String(dateStr || '').trim();
+  if (!raw) return null;
+  if (/^\d{4}-\d{2}-\d{2}/.test(raw)) {
+    const d = new Date(`${raw.slice(0, 10)}T12:00:00`);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  const dmy = raw.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  if (dmy) {
+    const day = parseInt(dmy[1], 10);
+    const month = parseInt(dmy[2], 10) - 1;
+    let year = parseInt(dmy[3], 10);
+    if (year < 100) year += 2000;
+    const d = new Date(year, month, day, 12, 0, 0);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function getReceiptDateFilterRange() {
+  const monthVal = document.getElementById('receiptMonthFilter')?.value
+    || document.getElementById('recentReceiptMonthFilter')?.value
+    || '';
+  const fromVal = document.getElementById('receiptFromDate')?.value
+    || document.getElementById('recentReceiptFromDate')?.value
+    || '';
+  const toVal = document.getElementById('receiptToDate')?.value
+    || document.getElementById('recentReceiptToDate')?.value
+    || '';
+
+  if (monthVal && /^\d{4}-\d{2}$/.test(monthVal)) {
+    const [y, m] = monthVal.split('-').map(Number);
+    return {
+      from: new Date(y, m - 1, 1, 0, 0, 0),
+      to: new Date(y, m, 0, 23, 59, 59),
+      label: monthVal
+    };
+  }
+
+  const from = fromVal ? parseReceiptDateValue(fromVal) : null;
+  const to = toVal ? parseReceiptDateValue(toVal) : null;
+  if (from) from.setHours(0, 0, 0, 0);
+  if (to) to.setHours(23, 59, 59, 999);
+  return { from, to, label: '' };
+}
+
+function receiptMatchesDateFilter(receipt, range) {
+  if (!range?.from && !range?.to) return true;
+  const d = parseReceiptDateValue(receipt.date);
+  if (!d) return false;
+  if (range.from && d < range.from) return false;
+  if (range.to && d > range.to) return false;
+  return true;
+}
+
+function getFilteredFeeReceipts() {
+  const query = (document.getElementById('receiptSearchInput')?.value
+    || document.getElementById('recentReceiptSearchInput')?.value
+    || '').toLowerCase().trim();
+  const targetMode = document.getElementById('receiptModeFilter')?.value || 'ALL';
+  const dateRange = getReceiptDateFilterRange();
+  const currentSession = SchoolData.activeSession;
+  const sessionFilter = document.getElementById('receiptSessionFilter')?.value || currentSession;
+
+  return getAllFeeReceipts().filter(r => {
+    const no = String(r.receiptNo || '').toLowerCase();
+    const name = String(r.studentName || '').toLowerCase();
+    const adm = String(r.admissionNo || '').toLowerCase();
+    const mode = String(r.mode || '');
+    const matchQuery = !query || no.includes(query) || name.includes(query) || adm.includes(query);
+    const matchMode = targetMode === 'ALL' || mode.toLowerCase().includes(targetMode.toLowerCase());
+    const matchSession = sessionFilter === 'ALL' || r.session === sessionFilter;
+    const matchDate = receiptMatchesDateFilter(r, dateRange);
+    return matchQuery && matchMode && matchSession && matchDate;
+  });
+}
+
+function buildReceiptRegisterCsvRows(receipts) {
+  const header = [
+    'Receipt No', 'Date', 'Time', 'Admission No', 'Student Name', 'Class', 'Section', 'Father Name',
+    'Tuition Fee Paid', 'Annual Fee Paid', 'Exam Fee Paid', 'Total Amount Paid',
+    'Fee Description', 'Payment Mode', 'Session'
+  ];
+  const csvRows = [header];
+  const totals = { tuition: 0, annual: 0, exam: 0, total: 0 };
+
+  receipts.forEach(r => {
+    const paid = getPaymentPaidBreakdown(r);
+    csvRows.push([
+      r.receiptNo,
+      r.date,
+      r.time || '',
+      r.admissionNo,
+      r.studentName,
+      r.class || '',
+      r.section || '',
+      r.parentName || '',
+      paid.tuitionPaid,
+      paid.annualPaid,
+      paid.examPaid,
+      paid.totalPaid,
+      r.month || '',
+      r.mode || '',
+      r.session || ''
+    ]);
+    totals.tuition += paid.tuitionPaid;
+    totals.annual += paid.annualPaid;
+    totals.exam += paid.examPaid;
+    totals.total += paid.totalPaid;
+  });
+
+  if (receipts.length) {
+    csvRows.push([
+      'TOTAL',
+      `${receipts.length} receipts`,
+      '', '', '', '', '', '',
+      totals.tuition,
+      totals.annual,
+      totals.exam,
+      totals.total,
+      '', '', ''
+    ]);
+  }
+  return csvRows;
 }
 
 function openClassFeeMasterModal() {
@@ -12074,7 +12397,6 @@ function openClassFeeMasterModal() {
                 <th>Monthly Tuition (Rs)</th>
                 <th>Annual Charges</th>
                 <th>Exam Fee</th>
-                <th>Computer / Lab</th>
               </tr>
             </thead>
             <tbody>
@@ -12097,12 +12419,6 @@ function openClassFeeMasterModal() {
                         <input type="checkbox" class="fee-master-apply" data-class="${cls}" data-field="examEnabled" ${f.examEnabled ? 'checked' : ''}> Apply
                       </label>
                       <input type="number" class="fee-master-input session-dropdown" data-class="${cls}" data-field="examFee" value="${f.examFee}" style="width:90px; padding:4px 8px; background:#1e293b;">
-                    </td>
-                    <td>
-                      <label style="display:flex; align-items:center; gap:6px; margin-bottom:5px; color:#cbd5e1; font-size:0.75rem;">
-                        <input type="checkbox" class="fee-master-apply" data-class="${cls}" data-field="computerEnabled" ${f.computerEnabled ? 'checked' : ''}> Apply
-                      </label>
-                      <input type="number" class="fee-master-input session-dropdown" data-class="${cls}" data-field="computerFee" value="${f.computerFee}" style="width:90px; padding:4px 8px; background:#1e293b;">
                     </td>
                   </tr>
                 `;
@@ -12173,7 +12489,7 @@ function saveClassFeeMasterChanges() {
     const val = parseInt(input.value) || 0;
 
     if (!SchoolData.classFeeMaster[cls]) {
-      SchoolData.classFeeMaster[cls] = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, computerFee: 150, admissionFee: 1200 };
+      SchoolData.classFeeMaster[cls] = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, admissionFee: 1200 };
     }
     SchoolData.classFeeMaster[cls][field] = val;
   });
@@ -12181,7 +12497,7 @@ function saveClassFeeMasterChanges() {
     const cls = input.getAttribute('data-class');
     const field = input.getAttribute('data-field');
     if (!SchoolData.classFeeMaster[cls]) {
-      SchoolData.classFeeMaster[cls] = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, computerFee: 150 };
+      SchoolData.classFeeMaster[cls] = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500 };
     }
     SchoolData.classFeeMaster[cls][field] = input.checked;
   });
@@ -12263,10 +12579,13 @@ function getAllFeeReceipts() {
                   parentPhone: s.parentPhone || s.mobile || '',
                   receiptNo: p.receiptNo,
                   date: p.date || new Date().toISOString().split('T')[0],
+                  time: p.time || '',
                   amount: p.amount || 0,
                   mode: p.mode || 'Online UPI',
                   month: p.month || 'Tuition Fee Payment',
-                  selectedMonthsTotal: p.selectedMonthsTotal || p.amount,
+                  selectedMonthsTotal: p.selectedMonthsTotal || 0,
+                  paidPrevMonths: p.paidPrevMonths || [],
+                  paidExtraItems: p.paidExtraItems || [],
                   session: sessKey
                 });
               }
@@ -12290,10 +12609,13 @@ function getAllFeeReceipts() {
               parentPhone: s.parentPhone || s.mobile || '',
               receiptNo: p.receiptNo,
               date: p.date || new Date().toISOString().split('T')[0],
+              time: p.time || '',
               amount: p.amount || 0,
               mode: p.mode || 'Online UPI',
               month: p.month || 'Tuition Fee Payment',
-              selectedMonthsTotal: p.selectedMonthsTotal || p.amount,
+              selectedMonthsTotal: p.selectedMonthsTotal || 0,
+              paidPrevMonths: p.paidPrevMonths || [],
+              paidExtraItems: p.paidExtraItems || [],
               session: currentSession
             });
           }
@@ -12429,8 +12751,11 @@ function renderRecentReceiptsSection() {
           <p style="margin:4px 0 0 0; font-size:0.8rem; color:#cbd5e1;">View, search, and reprint official tuition fee payment receipts dispatches.</p>
         </div>
         
-        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
           <input type="text" id="recentReceiptSearchInput" placeholder="Search Receipt #, Name, Adm No, Mode..." class="session-dropdown" style="width:260px; padding:6px 12px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onkeyup="filterRecentReceiptsTable()">
+          <input type="month" id="recentReceiptMonthFilter" class="session-dropdown" title="Filter by month" style="width:150px; padding:6px 10px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onchange="filterRecentReceiptsTable()">
+          <input type="date" id="recentReceiptFromDate" class="session-dropdown" title="From date" style="width:150px; padding:6px 10px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onchange="filterRecentReceiptsTable()">
+          <input type="date" id="recentReceiptToDate" class="session-dropdown" title="To date" style="width:150px; padding:6px 10px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onchange="filterRecentReceiptsTable()">
           <button class="btn btn-secondary" onclick="exportReceiptsCSV()" style="background:#0284c7; color:#fff; border:none; font-weight:700; padding:6px 14px; font-size:0.82rem;">
             <i class="fa-solid fa-file-csv"></i> Export CSV
           </button>
@@ -12456,7 +12781,7 @@ function renderRecentReceiptsSection() {
             ${receipts.length === 0 ? `
               <tr><td colspan="9" style="text-align:center; padding:24px; color:#94a3b8; font-style:italic;">No fee payment receipts logged yet. Collect a fee payment above to generate the first receipt!</td></tr>
             ` : receipts.map(r => `
-              <tr class="recent-receipt-row" data-search="${r.receiptNo.toLowerCase()} ${r.studentName.toLowerCase()} ${r.admissionNo} ${r.mode.toLowerCase()} ${r.month.toLowerCase()}" style="border-bottom:1px solid #334155;">
+              <tr class="recent-receipt-row" data-search="${r.receiptNo.toLowerCase()} ${r.studentName.toLowerCase()} ${r.admissionNo} ${r.mode.toLowerCase()} ${r.month.toLowerCase()}" data-date="${r.date || ''}" style="border-bottom:1px solid #334155;">
                 <td><code style="color:#c084fc; font-weight:800; font-size:0.85rem;">#${r.receiptNo}</code></td>
                 <td><span style="color:#cbd5e1;">${r.date}</span></td>
                 <td><strong style="color:#ffffff;">${r.studentName}</strong></td>
@@ -12490,14 +12815,14 @@ function renderRecentReceiptsSection() {
 
 function filterRecentReceiptsTable() {
   const query = document.getElementById('recentReceiptSearchInput')?.value.toLowerCase().trim() || '';
+  const dateRange = getReceiptDateFilterRange();
   const rows = document.querySelectorAll('.recent-receipt-row');
   rows.forEach(row => {
     const searchData = row.getAttribute('data-search') || '';
-    if (!query || searchData.includes(query)) {
-      row.style.display = '';
-    } else {
-      row.style.display = 'none';
-    }
+    const receiptDate = row.getAttribute('data-date') || '';
+    const matchQuery = !query || searchData.includes(query);
+    const matchDate = receiptMatchesDateFilter({ date: receiptDate }, dateRange);
+    row.style.display = (matchQuery && matchDate) ? '' : 'none';
   });
 }
 
@@ -12578,8 +12903,8 @@ function renderFeesPage(container) {
             <option value="ALL">All Classes</option>
             ${classOptions.map(cls => `<option value="${cls}">${cls}</option>`).join('')}
           </select>
-          <button class="btn btn-secondary" onclick="exportCurrentFeeLedgerCsv()" style="background:#16a34a; color:#ffffff; border:none; font-weight:800; white-space:nowrap; min-width:max-content; display:inline-flex; align-items:center; gap:8px; padding:10px 18px;">
-            <i class="fa-solid fa-file-csv"></i> Export Current View
+          <button class="btn btn-secondary" onclick="exportFeeBifurcationReport()" style="background:#16a34a; color:#ffffff; border:none; font-weight:800; white-space:nowrap; min-width:max-content; display:inline-flex; align-items:center; gap:8px; padding:10px 18px;">
+            <i class="fa-solid fa-file-csv"></i> Export Fee Report (Bifurcated)
           </button>
         </div>
 
@@ -12589,7 +12914,6 @@ function renderFeesPage(container) {
           <button class="btn btn-secondary fee-tab-btn" id="tabDefaulters" onclick="setFeeFilterTab('DEFAULTERS')" style="border-color:#ef4444; color:#f87171;">Defaulters Only</button>
           <button class="btn btn-secondary fee-tab-btn" id="tabTuition" onclick="setFeeFilterTab('TUITION')" style="border-color:#38bdf8; color:#38bdf8;">Tuition Due</button>
           <button class="btn btn-secondary fee-tab-btn" id="tabExam" onclick="setFeeFilterTab('EXAM')" style="border-color:#f59e0b; color:#f59e0b;">Exam Fee Due</button>
-          <button class="btn btn-secondary fee-tab-btn" id="tabComputer" onclick="setFeeFilterTab('COMPUTER')" style="border-color:#8b5cf6; color:#c084fc;">Computer Fee Due</button>
           <button class="btn btn-secondary fee-tab-btn" id="tabAnnual" onclick="setFeeFilterTab('ANNUAL')" style="border-color:#22c55e; color:#22c55e;">Annual Fee Due</button>
         </div>
       </div>
@@ -12617,7 +12941,7 @@ function renderFeesPage(container) {
               const paidAmount = (s.feeRecords?.[currentSession]?.payments || []).reduce((acc, p) => acc + (p.amount || 0), 0);
 
               return `
-                <tr class="fee-row" data-name="${s.name.toLowerCase()}" data-adm="${s.admissionNo}" data-class="${s.currentClass}" data-dues="${dueAmount}" data-paid="${paidAmount}" data-tuition="${status.tuitionDue}" data-exam="${status.examDue}" data-computer="${status.computerDue}" data-annual="${status.annualDue}">
+                <tr class="fee-row" data-name="${s.name.toLowerCase()}" data-adm="${s.admissionNo}" data-class="${s.currentClass}" data-dues="${dueAmount}" data-paid="${paidAmount}" data-tuition="${status.tuitionDue}" data-exam="${status.examDue}" data-annual="${status.annualDue}">
                   <td>
                     <strong>${s.name}</strong><br>
                     <small style="color:var(--text-muted);">Adm: ${s.admissionNo}</small>
@@ -12632,9 +12956,8 @@ function renderFeesPage(container) {
                   </td>
                   <td>
                     ${status.examDue ? `<span class="badge badge-warning">Exam Rs ${status.examDue}</span>` : ''}
-                    ${status.computerDue ? `<span class="badge badge-purple">Computer Rs ${status.computerDue}</span>` : ''}
                     ${status.annualDue ? `<span class="badge badge-info">Annual Rs ${status.annualDue}</span>` : ''}
-                    ${!status.examDue && !status.computerDue && !status.annualDue ? `<span style="color:var(--text-muted);">None</span>` : ''}
+                    ${!status.examDue && !status.annualDue ? `<span style="color:var(--text-muted);">None</span>` : ''}
                   </td>
                   <td><strong style="color:${dueAmount > 0 ? 'var(--accent-danger)' : 'var(--accent-success)'}; font-size:1rem;">Rs ${dueAmount.toLocaleString('en-IN')}</strong></td>
                   <td>
@@ -12667,7 +12990,7 @@ window._currentFeeTab = 'ALL';
 
 function setFeeFilterTab(tab) {
   window._currentFeeTab = tab;
-  ['All', 'Paid', 'Defaulters', 'Tuition', 'Exam', 'Computer', 'Annual'].forEach(name => {
+  ['All', 'Paid', 'Defaulters', 'Tuition', 'Exam', 'Annual'].forEach(name => {
     document.getElementById(`tab${name}`)?.classList.toggle('active', tab === name.toUpperCase() || (name === 'All' && tab === 'ALL'));
   });
   filterFeesTable();
@@ -12706,7 +13029,6 @@ function getCurrentFeeLedgerRows() {
       (tab === 'DEFAULTERS' && row.dueAmount > 0) ||
       (tab === 'TUITION' && row.status.tuitionDue > 0) ||
       (tab === 'EXAM' && row.status.examDue > 0) ||
-      (tab === 'COMPUTER' && row.status.computerDue > 0) ||
       (tab === 'ANNUAL' && row.status.annualDue > 0);
     return matchQuery && matchClass && matchTab;
   });
@@ -12726,7 +13048,6 @@ function filterFeesTable() {
     const paid = parseInt(r.getAttribute('data-paid') || '0');
     const tuition = parseInt(r.getAttribute('data-tuition') || '0');
     const exam = parseInt(r.getAttribute('data-exam') || '0');
-    const computer = parseInt(r.getAttribute('data-computer') || '0');
     const annual = parseInt(r.getAttribute('data-annual') || '0');
 
     const matchQuery = !query || name.includes(query) || adm.includes(query);
@@ -12736,7 +13057,6 @@ function filterFeesTable() {
       (tab === 'DEFAULTERS' && dues > 0) ||
       (tab === 'TUITION' && tuition > 0) ||
       (tab === 'EXAM' && exam > 0) ||
-      (tab === 'COMPUTER' && computer > 0) ||
       (tab === 'ANNUAL' && annual > 0);
 
     r.style.display = (matchQuery && matchClass && matchTab) ? '' : 'none';
@@ -12768,64 +13088,7 @@ function downloadCsvFile(fileName, rows) {
 }
 
 function exportCurrentFeeLedgerCsv() {
-  const rows = getCurrentFeeLedgerRows();
-  const currentSession = SchoolData.activeSession;
-  const tab = window._currentFeeTab || 'ALL';
-  const targetClass = document.getElementById('feeClassFilter')?.value || 'ALL';
-  const csvRows = [
-    [
-      'Admission No',
-      'Student Name',
-      'Class',
-      'Section',
-      'Father Name',
-      'Parent Phone',
-      'Paid Months',
-      'Pending Months Up To August',
-      'Paid Amount',
-      'Tuition Due',
-      'Exam Fee Due',
-      'Computer Fee Due',
-      'Annual Fee Due',
-      'Previous Session Due',
-      'Total Pending Due',
-      'Last Receipt No',
-      'Last Payment Date'
-    ].map(csvEscape).join(',')
-  ];
-
-  rows.forEach(row => {
-    const s = row.student;
-    const lastPayment = row.payments[row.payments.length - 1] || {};
-    csvRows.push([
-      s.admissionNo,
-      s.name,
-      s.currentClass || s.class || '',
-      s.currentSection || s.section || '',
-      s.parentName || '',
-      s.parentPhone || '',
-      (row.fee.paidMonths || []).join(', '),
-      row.overdueMonths.join(', '),
-      row.paidAmount,
-      row.status.tuitionDue,
-      row.status.examDue,
-      row.status.computerDue,
-      row.status.annualDue,
-      row.fee.previousSessionDue || 0,
-      row.dueAmount,
-      lastPayment.receiptNo || '',
-      lastPayment.date || ''
-    ].map(csvEscape).join(','));
-  });
-
-  const csvContent = "data:text/csv;charset=utf-8," + csvRows.join("\n");
-  const link = document.createElement("a");
-  link.setAttribute("href", encodeURI(csvContent));
-  link.setAttribute("download", `Fee_Ledger_${tab}_${targetClass.replace(/\s+/g, '_')}_${currentSession}.csv`);
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  showNotification(`Exported ${rows.length} fee ledger row(s).`, 'success');
+  exportFeeBifurcationReport();
 }
 
 function openCollectFeeModal(admissionNo) {
@@ -13018,7 +13281,6 @@ function openCollectFeeModal(admissionNo) {
               const master = getStudentFeeMaster(student);
               const annualPaid = !categoryStatus.annualDue;
               const examPaid = !categoryStatus.examDue;
-              const computerPaid = !categoryStatus.computerDue;
               return `
                 ${master.annualEnabled && master.annualCharges > 0 ? `
                   <label style="display:flex; align-items:center; gap:8px; background:${annualPaid ? 'rgba(16,185,129,0.1)' : '#1e293b'}; padding:6px 10px; border-radius:6px; border:1px solid ${annualPaid ? '#10b981' : '#475569'}; cursor:${annualPaid ? 'not-allowed' : 'pointer'}; font-size:0.78rem; opacity:${annualPaid ? '0.65' : '1'};">
@@ -13030,12 +13292,6 @@ function openCollectFeeModal(admissionNo) {
                   <label style="display:flex; align-items:center; gap:8px; background:${examPaid ? 'rgba(16,185,129,0.1)' : '#1e293b'}; padding:6px 10px; border-radius:6px; border:1px solid ${examPaid ? '#10b981' : '#475569'}; cursor:${examPaid ? 'not-allowed' : 'pointer'}; font-size:0.78rem; opacity:${examPaid ? '0.65' : '1'};">
                     <input type="checkbox" id="chk_examFee" class="fee-extra-checkbox" data-label="Exam Fee" data-amount="${master.examFee}" ${examPaid ? 'disabled data-paid="true"' : ''} onchange="this.setAttribute('data-user-edited','true'); recalculateSmartFeeTotal()">
                     <span>Exam Fee (Rs ${master.examFee}) ${examPaid ? '<small style="color:#34d399;">Paid</small>' : ''}</span>
-                  </label>
-                ` : ''}
-                ${master.computerEnabled && master.computerFee > 0 ? `
-                  <label style="display:flex; align-items:center; gap:8px; background:${computerPaid ? 'rgba(16,185,129,0.1)' : '#1e293b'}; padding:6px 10px; border-radius:6px; border:1px solid ${computerPaid ? '#10b981' : '#475569'}; cursor:${computerPaid ? 'not-allowed' : 'pointer'}; font-size:0.78rem; opacity:${computerPaid ? '0.65' : '1'};">
-                    <input type="checkbox" id="chk_computerFee" class="fee-extra-checkbox" data-label="Computer Lab Fee" data-amount="${master.computerFee}" ${computerPaid ? 'disabled data-paid="true"' : ''} onchange="recalculateSmartFeeTotal()">
-                    <span>Computer Lab Fee (Rs ${master.computerFee}) ${computerPaid ? '<small style="color:#34d399;">Paid</small>' : ''}</span>
                   </label>
                 ` : ''}
               `;
@@ -13242,9 +13498,6 @@ function confirmSmartFeePayment(admissionNo, receiptNo) {
   const missingRequiredExtras = [];
   if (categoryStatus.examDue > 0 && !Array.from(extraCheckboxes).some(cb => cb.checked && (cb.getAttribute('data-label') || '').toLowerCase().includes('exam'))) {
     missingRequiredExtras.push(`Exam Fee Rs ${categoryStatus.examDue}`);
-  }
-  if (categoryStatus.computerDue > 0 && !Array.from(extraCheckboxes).some(cb => cb.checked && (cb.getAttribute('data-label') || '').toLowerCase().includes('computer'))) {
-    missingRequiredExtras.push(`Computer Fee Rs ${categoryStatus.computerDue}`);
   }
   if (categoryStatus.annualDue > 0 && !Array.from(extraCheckboxes).some(cb => cb.checked && (cb.getAttribute('data-label') || '').toLowerCase().includes('annual'))) {
     missingRequiredExtras.push(`Annual Charges Rs ${categoryStatus.annualDue}`);
@@ -15063,13 +15316,19 @@ function renderReceiptsLedgerPage(container) {
     <!-- SEARCH & FILTER BAR -->
     <div class="glass-card">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:12px;">
-        <div style="display:flex; gap:10px; align-items:center;">
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
           <input type="text" id="receiptSearchInput" placeholder="Search receipt #, student, or adm no..." class="session-dropdown" style="width:300px;" onkeyup="filterReceiptsLedgerTable()">
+          <input type="month" id="receiptMonthFilter" class="session-dropdown" title="Filter by month" style="width:150px;" onchange="filterReceiptsLedgerTable()">
+          <input type="date" id="receiptFromDate" class="session-dropdown" title="From date" style="width:150px;" onchange="filterReceiptsLedgerTable()">
+          <input type="date" id="receiptToDate" class="session-dropdown" title="To date" style="width:150px;" onchange="filterReceiptsLedgerTable()">
           <select id="receiptModeFilter" class="session-dropdown" onchange="filterReceiptsLedgerTable()">
             <option value="ALL">All Payment Modes</option>
             <option value="UPI">Online UPI</option>
             <option value="Cash">Cash</option>
           </select>
+          <button class="btn btn-secondary" onclick="clearReceiptDateFilters()" style="background:#334155; color:#fff; border:none; font-weight:700; padding:6px 12px; font-size:0.82rem;">
+            Clear Dates
+          </button>
         </div>
       </div>
 
@@ -15089,7 +15348,7 @@ function renderReceiptsLedgerPage(container) {
           </thead>
           <tbody>
             ${allReceipts.length > 0 ? allReceipts.map(r => `
-              <tr class="receipt-row" data-no="${r.receiptNo.toLowerCase()}" data-name="${r.studentName.toLowerCase()}" data-adm="${r.admissionNo}" data-mode="${r.mode}">
+              <tr class="receipt-row" data-no="${r.receiptNo.toLowerCase()}" data-name="${r.studentName.toLowerCase()}" data-adm="${r.admissionNo}" data-mode="${r.mode}" data-date="${r.date || ''}">
                 <td><code style="color:var(--accent-primary); font-weight:700;">${r.receiptNo}</code></td>
                 <td>${r.date}</td>
                 <td>
@@ -15131,9 +15390,19 @@ function renderReceiptsLedgerPage(container) {
   `;
 }
 
+function clearReceiptDateFilters() {
+  ['receiptMonthFilter', 'receiptFromDate', 'receiptToDate', 'recentReceiptMonthFilter', 'recentReceiptFromDate', 'recentReceiptToDate'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+  filterReceiptsLedgerTable();
+  filterRecentReceiptsTable();
+}
+
 function filterReceiptsLedgerTable() {
   const query = (document.getElementById('receiptSearchInput')?.value || '').toLowerCase();
   const targetMode = document.getElementById('receiptModeFilter')?.value || 'ALL';
+  const dateRange = getReceiptDateFilterRange();
 
   const rows = document.querySelectorAll('#receiptsLedgerTable .receipt-row');
   rows.forEach(r => {
@@ -15141,38 +15410,25 @@ function filterReceiptsLedgerTable() {
     const name = r.getAttribute('data-name') || '';
     const adm = r.getAttribute('data-adm') || '';
     const mode = r.getAttribute('data-mode') || '';
+    const receiptDate = r.getAttribute('data-date') || '';
 
     const matchQuery = !query || no.includes(query) || name.includes(query) || adm.includes(query);
     const matchMode = targetMode === 'ALL' || mode.toLowerCase().includes(targetMode.toLowerCase());
+    const matchDate = receiptMatchesDateFilter({ date: receiptDate }, dateRange);
 
-    r.style.display = (matchQuery && matchMode) ? '' : 'none';
+    r.style.display = (matchQuery && matchMode && matchDate) ? '' : 'none';
   });
 }
 
 function exportReceiptsCSV() {
-  const students = getStudentsByActiveSession();
   const currentSession = SchoolData.activeSession;
-
-  let csvRows = ["Receipt No,Date,Admission No,Student Name,Class,Father Name,Amount Paid (INR),Fee Description,Payment Mode"];
-  
-  students.forEach(s => {
-    const feeRec = s.feeRecords ? s.feeRecords[currentSession] : null;
-    if (feeRec && feeRec.payments) {
-      feeRec.payments.forEach(p => {
-        csvRows.push(`"${p.receiptNo}","${p.date}","${s.admissionNo}","${s.name}","${s.currentClass} - ${s.currentSection}","${s.parentName}","${p.amount}","${p.month || 'Tuition Fee'}","${p.mode || 'Cash/UPI'}"`);
-      });
-    }
-  });
-
-  const csvContent = "data:text/csv;charset=utf-8," + csvRows.join("\n");
-  const encodedUri = encodeURI(csvContent);
-  const link = document.createElement("a");
-  link.setAttribute("href", encodedUri);
-  link.setAttribute("download", `MMM_School_Fee_Receipts_Register_${currentSession}.csv`);
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  showNotification(`Exported Official Fee Receipts Register CSV!`, 'success');
+  const receipts = getFilteredFeeReceipts();
+  const dateRange = getReceiptDateFilterRange();
+  const periodLabel = dateRange.label
+    ? dateRange.label.replace('-', '_')
+    : (dateRange.from || dateRange.to ? 'Filtered' : 'All');
+  downloadCsvFile(`MMM_Fee_Receipts_${periodLabel}_${currentSession}.csv`, buildReceiptRegisterCsvRows(receipts));
+  showNotification(`Exported ${receipts.length} receipt row(s) with fee bifurcation totals.`, 'success');
 }
 
 async function deleteAndCancelFeeReceipt(admissionNo, receiptNo, studentIndex) {
@@ -16586,7 +16842,6 @@ function buildSchoolBotFeesMessage(student) {
   if (status.tuitionDue > 0) lines.push(`Tuition Fee: Rs ${status.tuitionDue}${months.length ? ` (${months.join(', ')})` : ''}`);
   if (status.annualDue > 0) lines.push(`Annual Charges: Rs ${status.annualDue}`);
   if (status.examDue > 0) lines.push(`Exam Fee: Rs ${status.examDue}`);
-  if (status.computerDue > 0) lines.push(`Computer/Lab Fee: Rs ${status.computerDue}`);
 
   const dueText = status.totalDue > 0
     ? `${lines.join('\n')}\n\nTotal Pending: *Rs ${status.totalDue}*`
@@ -16854,9 +17109,8 @@ function buildFeeDueSheetPayload(student, chatId, statusText = 'Sent') {
     SchoolBotChatId: chatId || getStudentSchoolChatId(student),
     DueMonths: (feeInfo?.overdueMonths || []).join(', '),
     TuitionDue: feeInfo?.tuitionDue || '',
-    ExamFeeDue: feeInfo?.examFeeDue || '',
-    ComputerFeeDue: feeInfo?.computerFeeDue || '',
-    AnnualFeeDue: feeInfo?.annualFeeDue || '',
+    ExamFeeDue: feeInfo?.examDue || '',
+    AnnualFeeDue: feeInfo?.annualDue || '',
     PreviousSessionDue: student.currentFeeInfo?.previousSessionDue || '',
     TotalDue: feeInfo?.totalDue || '',
     SentBy: getErpLogUserName(),
@@ -16875,7 +17129,6 @@ function buildStudentFeeSheetSyncPayload(student) {
     DueMonths: (status.overdueMonths || []).join(', '),
     TuitionDue: fmt(monthlyTuition),
     ExamFeeDue: fmt(status.examDue),
-    ComputerFeeDue: fmt(status.computerDue),
     AnnualFeeDue: fmt(status.annualDue),
     PreviousSessionDue: fmt(fee.previousSessionDue),
     TotalDue: fmt(status.totalDue)
@@ -17046,7 +17299,6 @@ async function triggerSingleFeeReminder(admissionNo, customMsg) {
         DueMonths: 'Sent',
         TuitionDue: '',
         ExamFeeDue: '',
-        ComputerFeeDue: '',
         AnnualFeeDue: '',
         PreviousSessionDue: '',
         TotalDue: '',
@@ -18311,20 +18563,28 @@ function toggleSessionStatus(sessId) {
 
 function renderReportsPage(container) {
   const canDuesReport = canUserViewSchoolTotalDues();
+  const canRevenueReport = canUserViewSchoolTotalRevenue();
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-chart-column" style="color:var(--accent-warning)"></i> Reports & Analytics</h2>
-        <p class="page-subtitle">Generate Admission, Fee & Attendance Reports</p>
+        <p class="page-subtitle">Generate Admission, Fee & Attendance Reports for ${SchoolData.activeSession}</p>
       </div>
     </div>
     <div class="grid-2">
       <div class="glass-card">
-        <h3><i class="fa-solid fa-download"></i> Export Dues Report</h3>
-        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Download Excel breakdown of all pending student fee dues for ${SchoolData.activeSession}.</p>
+        <h3><i class="fa-solid fa-download"></i> Fee Dues Report (Bifurcated)</h3>
+        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Download CSV with tuition, annual, and exam fee paid/due columns plus a TOTAL row for every student in the active session.</p>
         ${canDuesReport
-          ? `<button class="btn btn-primary" onclick="showNotification('Exporting Dues Report to Excel...', 'success')">Export Excel</button>`
+          ? `<button class="btn btn-primary" onclick="exportAllStudentsFeeReport()"><i class="fa-solid fa-file-csv"></i> Export Fee Dues Report</button>`
           : `<button class="btn btn-secondary" disabled style="opacity:0.55;">Hidden — need View Total Dues right</button>`}
+      </div>
+      <div class="glass-card">
+        <h3><i class="fa-solid fa-receipt"></i> Fee Receipts Register</h3>
+        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Open the receipts ledger to filter by month or date range, then export with tuition/annual/exam bifurcation and totals.</p>
+        ${canRevenueReport
+          ? `<button class="btn btn-secondary" onclick="window.location.hash='receipts'" style="background:#0284c7; color:#fff; border:none; font-weight:700;"><i class="fa-solid fa-file-invoice-dollar"></i> Open Receipts Ledger</button>`
+          : `<button class="btn btn-secondary" disabled style="opacity:0.55;">Hidden — need View Total Revenue right</button>`}
       </div>
       <div class="glass-card">
         <h3><i class="fa-solid fa-file-pdf"></i> Export Attendance Summary</h3>

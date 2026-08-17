@@ -15,7 +15,7 @@ const SHEET_HEADERS = {
   Students: [
     'AdmissionNo', 'StudentName', 'Class', 'Section', 'ParentName', 'ParentPhone',
     'NfcUid', 'SchoolBotChatId', 'TelegramUserName', 'Status', 'DueMonths',
-    'TuitionDue', 'ExamFeeDue', 'ComputerFeeDue', 'AnnualFeeDue', 'PreviousSessionDue', 'TotalDue'
+    'TuitionDue', 'ExamFeeDue', 'AnnualFeeDue', 'PreviousSessionDue', 'TotalDue'
   ],
   Registrations: [
     'DateTime', 'AdmissionNo', 'StudentName', 'Class', 'Section', 'ParentName',
@@ -23,7 +23,7 @@ const SHEET_HEADERS = {
   ],
   Fee_Due_Messages: [
     'DateTime', 'AdmissionNo', 'StudentName', 'Class', 'Section', 'SchoolBotChatId',
-    'DueMonths', 'TuitionDue', 'ExamFeeDue', 'ComputerFeeDue', 'AnnualFeeDue',
+    'DueMonths', 'TuitionDue', 'ExamFeeDue', 'AnnualFeeDue',
     'PreviousSessionDue', 'TotalDue', 'SentBy', 'Status', 'TelegramMessageId'
   ],
   Fee_Receipt_Messages: [
@@ -628,7 +628,6 @@ async function handleFees(chatId, admissionNo) {
   if (s.DueMonths) lines.push(`Due Months: ${s.DueMonths}`);
   if (s.TuitionDue) lines.push(`Tuition Due: Rs ${s.TuitionDue}`);
   if (s.ExamFeeDue) lines.push(`Exam Fee Due: Rs ${s.ExamFeeDue}`);
-  if (s.ComputerFeeDue) lines.push(`Computer Fee Due: Rs ${s.ComputerFeeDue}`);
   if (s.AnnualFeeDue) lines.push(`Annual Fee Due: Rs ${s.AnnualFeeDue}`);
   if (s.PreviousSessionDue) lines.push(`Previous Session Due: Rs ${s.PreviousSessionDue}`);
   if (s.TotalDue) lines.push(`Total Due: Rs ${s.TotalDue}`);
@@ -907,7 +906,7 @@ async function getLinkedStudents() {
     }));
 }
 
-const FEE_SHEET_KEYS = ['DueMonths', 'TuitionDue', 'ExamFeeDue', 'ComputerFeeDue', 'AnnualFeeDue', 'PreviousSessionDue', 'TotalDue'];
+const FEE_SHEET_KEYS = ['DueMonths', 'TuitionDue', 'ExamFeeDue', 'AnnualFeeDue', 'PreviousSessionDue', 'TotalDue'];
 
 async function syncStudentFeesOnSheet(students, dryRun = false) {
   const items = Array.isArray(students) ? students : [];
@@ -1001,7 +1000,6 @@ async function logErpMessage(req, res) {
       payload.DueMonths || '',
       payload.TuitionDue || '',
       payload.ExamFeeDue || '',
-      payload.ComputerFeeDue || '',
       payload.AnnualFeeDue || '',
       payload.PreviousSessionDue || '',
       payload.TotalDue || '',
