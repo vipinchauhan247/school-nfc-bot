@@ -185,7 +185,42 @@ html, body {
   gap: 6px;
   font-size: 0.72rem;
   margin-top: 8px;
-  color: var(--text-muted);
+  color: #94a3b8;
+}
+
+.sidebar .sidebar-session-widget label {
+  color: #c7d2fe;
+}
+
+.sidebar .role-label,
+.sidebar .sidebar-footer,
+.sidebar .sidebar-footer small,
+.sidebar .sidebar-footer strong {
+  color: #e2e8f0;
+}
+
+input[type="date"],
+input[type="month"],
+input[type="datetime-local"] {
+  color-scheme: dark;
+  accent-color: var(--accent-primary);
+}
+
+input[type="date"].session-dropdown,
+input[type="month"].session-dropdown,
+input[type="datetime-local"].session-dropdown {
+  background: #111827;
+  color: #ffffff;
+  border: 1px solid #475569;
+}
+
+[data-theme="light"] input[type="date"]:not(.sidebar input),
+[data-theme="light"] input[type="month"]:not(.sidebar input),
+[data-theme="light"] input[type="datetime-local"]:not(.sidebar input) {
+  color-scheme: light;
+  background: #ffffff;
+  color: #0f172a;
+  border-color: rgba(0, 0, 0, 0.12);
 }
 
 .status-dot {
@@ -206,9 +241,13 @@ html, body {
 .nav-section-title {
   font-size: 0.68rem;
   font-weight: 700;
-  color: var(--text-dim);
+  color: #94a3b8;
   padding: 12px 12px 6px 12px;
   letter-spacing: 1px;
+}
+
+.sidebar .nav-item {
+  color: #e2e8f0;
 }
 
 .nav-item {
@@ -216,7 +255,7 @@ html, body {
   align-items: center;
   gap: 12px;
   padding: 10px 14px;
-  color: var(--text-muted);
+  color: #e2e8f0;
   text-decoration: none;
   border-radius: var(--radius-sm);
   font-size: 0.9rem;

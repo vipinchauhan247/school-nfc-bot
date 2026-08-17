@@ -254,7 +254,7 @@ if (!SchoolData.userPermissions) {
     "Super Admin": { weightage: true, teachers: true, students: true, fees: true, reportCards: true, timetable: true, attendance: true },
     "Principal": { weightage: true, teachers: true, students: true, fees: true, reportCards: true, timetable: true, attendance: true },
     "Accountant": { weightage: false, teachers: false, students: true, fees: true, reportCards: false, timetable: false, attendance: true },
-    "Class Teacher": { weightage: true, teachers: false, students: true, fees: false, reportCards: true, timetable: true, attendance: true },
+    "Class Teacher": { weightage: false, teachers: false, students: true, fees: false, reportCards: true, timetable: true, attendance: true },
     "Exam Incharge": { weightage: true, teachers: false, students: true, fees: false, reportCards: true, timetable: false, attendance: true }
   };
 }
@@ -1811,10 +1811,22 @@ function handleRouting() {
       case 'exams-entry': renderExamsPage(container, 'entry'); break;
       case 'exams-structure':
         window.location.hash = 'exams-weightage';
+        if (!canUserConfigureExamWeightage()) {
+          showNotification('Access Denied: Subject Marks & Weightage config is restricted for your account.', 'warning');
+          renderExamsPage(container, 'entry');
+          break;
+        }
         renderExamsWeightageSubdirectoryPage(container);
         break;
       case 'exams-report-cards': renderExamsReportCardsSubdirectoryPage(container); break;
-      case 'exams-weightage': renderExamsWeightageSubdirectoryPage(container); break;
+      case 'exams-weightage':
+        if (!canUserConfigureExamWeightage()) {
+          showNotification('Access Denied: Subject Marks & Weightage config is restricted for your account.', 'warning');
+          renderExamsPage(container, 'entry');
+          break;
+        }
+        renderExamsWeightageSubdirectoryPage(container);
+        break;
       case 'exams-schedule': renderExamSchedulePage(container); break;
       case 'exams-admit-card': renderAdmitCardPage(container); break;
       case 'users': renderUsersPage(container); break;
@@ -2795,6 +2807,8 @@ function renderExamsPage(container, mode = 'entry') {
     allSubjects = allSubjectsList.filter(sub => sub.code === selectedSubjectFilter);
   }
   const canExportExamSheets = canCurrentUserExportExamSheets();
+  const canConfigureWeightage = canUserConfigureExamWeightage();
+  const showWeightageInHeaders = canUserViewExamWeightage();
 
   container.innerHTML = `
     <div class="page-header">
@@ -2803,9 +2817,11 @@ function renderExamsPage(container, mode = 'entry') {
         <p class="page-subtitle">Enter All Subject Exam Scores Side-By-Side Per Student & Manage Class Weightage Rules</p>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        ${canConfigureWeightage ? `
         <button class="btn btn-primary" style="background:#f59e0b; border:none;" onclick="window.location.hash='exams-weightage'">
           <i class="fa-solid fa-sliders"></i> Subject Exam Marks & Weightage
         </button>
+        ` : ''}
         ${canExportExamSheets ? `
           <button class="btn btn-primary" style="background:linear-gradient(135deg, #10b981 0%, #059669 100%); border:none;" onclick="exportClassHalfYearlyExcel('${activeClass}')">
             <i class="fa-solid fa-file-excel"></i> Half-Yearly Excel
@@ -2889,7 +2905,7 @@ function renderExamsPage(container, mode = 'entry') {
           <div style="padding:8px 14px; background:rgba(16, 185, 129, 0.15); border:1px solid #10b981; border-radius:8px; color:#10b981; font-weight:700; font-size:0.82rem;">
             Subject-wise exam max marks and weightage are active for ${activeClass}.
           </div>
-          ${(getCurrentActiveUser().role === 'Super Admin' || getCurrentActiveUser().role === 'Principal') ? `
+          ${canConfigureWeightage ? `
             <button class="btn btn-secondary" onclick="window.location.hash='exams-weightage'"><i class="fa-solid fa-gear"></i> Edit Weightage</button>
           ` : ''}
         </div>
@@ -3068,16 +3084,16 @@ function renderExamsPage(container, mode = 'entry') {
                 const finWeight = getSubjectExamComponentWeightage(activeClass, sub.code || sub.name, 'fin');
                 if (examTerm === 'half_yearly') {
                   return `
-                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${sub.code} UT1 (${ut1Max} -> ${ut1Weight})</th>
-                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${sub.code} UT2 (${ut2Max} -> ${ut2Weight})</th>
-                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${sub.code} HY (${hyMax} -> ${hyWeight})</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'UT1', ut1Max, ut1Weight, showWeightageInHeaders)}</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'UT2', ut2Max, ut2Weight, showWeightageInHeaders)}</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'HY', hyMax, hyWeight, showWeightageInHeaders)}</th>
                     <th style="position:sticky; top:46px; z-index:20; background:#0f172a; color:#fbbf24; border:1px solid #475569; padding:8px; font-size:0.95rem;">${sub.code} TOT (100)</th>
                   `;
                 } else if (examTerm === 'final_annual') {
                   return `
-                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${sub.code} T2 UT1 (${ut3Max} -> ${ut3Weight})</th>
-                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${sub.code} T2 UT2 (${ut4Max} -> ${ut4Weight})</th>
-                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${sub.code} FINAL (${finMax} -> ${finWeight})</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'T2 UT1', ut3Max, ut3Weight, showWeightageInHeaders)}</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'T2 UT2', ut4Max, ut4Weight, showWeightageInHeaders)}</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'FINAL', finMax, finWeight, showWeightageInHeaders)}</th>
                     <th style="position:sticky; top:46px; z-index:20; background:#064e3b; color:#a7f3d0; border:1px solid #065f46; padding:8px; font-size:0.95rem;">${sub.code} TOT (100)</th>
                   `;
                 } else {
@@ -3904,11 +3920,11 @@ function renderUsersPage(container) {
 function getExamsSubNavHtml(active) {
   const tabs = [
     { hash: 'exams-entry', icon: 'fa-table-cells', label: 'Marks Entry' },
-    { hash: 'exams-weightage', icon: 'fa-sliders', label: 'Subject Marks & Weightage' },
+    { hash: 'exams-weightage', icon: 'fa-sliders', label: 'Subject Marks & Weightage', requiresWeightageConfig: true },
     { hash: 'exams-report-cards', icon: 'fa-award', label: 'Report Cards' },
     { hash: 'exams-schedule', icon: 'fa-calendar-days', label: 'Exam Schedule' },
     { hash: 'exams-admit-card', icon: 'fa-id-card', label: 'Admit Card' }
-  ];
+  ].filter(t => !t.requiresWeightageConfig || canUserConfigureExamWeightage());
   return `
     <div style="display:flex; gap:12px; margin-bottom:20px; border-bottom:2px solid var(--border-color); padding-bottom:12px; flex-wrap:wrap;">
       ${tabs.map(t => `
@@ -4690,6 +4706,7 @@ const ERP_MODULES_LIST = {
   ],
   exams: [
     { key: "exam_marks_entry", name: "Exam Marks Entry Broadsheet (#exams-entry)" },
+    { key: "exam_weightage_view", name: "View Weightage Values in Marks Entry Headers", viewOnly: true },
     { key: "class_weightage_config", name: "Class Weightage Rules & Raw Test Config (#exams-weightage)" },
     { key: "class_subject_setup", name: "Class Exam Subject & Max Marks Setup (#exams-structure)" },
     { key: "report_cards_print", name: "Report Cards Printing & Class Ranks (#exams-report-cards)" },
@@ -5139,6 +5156,54 @@ function canCurrentUserExportExamSheets() {
   return hasUserAccessPermission(user, 'exam_exports', 'view') === true;
 }
 
+function canUserViewExamWeightage(user = getCurrentActiveUser()) {
+  return hasUserAccessPermission(user, 'exam_weightage_view', 'view') === true;
+}
+
+function canUserConfigureExamWeightage(user = getCurrentActiveUser()) {
+  return hasUserAccessPermission(user, 'class_weightage_config', 'view') === true;
+}
+
+function formatExamComponentHeaderLabel(subjectCode, componentLabel, maxMarks, weightageMarks, showWeightage) {
+  const code = subjectCode || '';
+  if (showWeightage) {
+    return `${code} ${componentLabel} (${maxMarks} -> ${weightageMarks})`;
+  }
+  return `${code} ${componentLabel} (${maxMarks})`;
+}
+
+function getStudentClassSectionLabel(student) {
+  if (!student) return '';
+  const cls = student.currentClass || student.class || '';
+  const sec = student.currentSection || student.section || '';
+  return sec ? `${cls} - ${sec}` : cls;
+}
+
+function getStudentFeeDueSnapshot(admissionNo) {
+  const student = findStudentByAdmissionNo(admissionNo);
+  if (!student) {
+    return {
+      classSection: '',
+      tuitionDue: '',
+      annualDue: '',
+      examDue: '',
+      prevDue: '',
+      totalDue: ''
+    };
+  }
+  const status = getStudentFeeCategoryStatus(student);
+  const prevDue = Number(student.currentFeeInfo?.previousSessionDue || 0);
+  const tuitionDueOnly = Math.max(0, Number(status.tuitionDue || 0) - prevDue);
+  return {
+    classSection: getStudentClassSectionLabel(student),
+    tuitionDue: tuitionDueOnly,
+    annualDue: status.annualDue,
+    examDue: status.examDue,
+    prevDue,
+    totalDue: status.totalDue
+  };
+}
+
 function canCurrentUserExportStudents() {
   const user = getCurrentActiveUser();
   return hasUserAccessPermission(user, 'student_exports', 'view') === true;
@@ -5244,6 +5309,12 @@ function getDefaultAccessRightsForRole(role) {
         base[mod.key] = { view: true, add: true, modify: true, delete: false };
       } else if (['teacher_subject_mappings', 'timetable_management', 'exam_schedule_manage', 'admit_card_print'].includes(mod.key)) {
         base[mod.key] = { view: true, add: false, modify: false, delete: false };
+      } else {
+        base[mod.key] = { view: false, add: false, modify: false, delete: false };
+      }
+    } else if (role === 'Exam Incharge') {
+      if (['exam_marks_entry', 'report_cards_print', 'exam_exports', 'exam_weightage_view', 'class_weightage_config', 'class_subject_setup', 'exam_schedule_manage', 'admit_card_print', 'student_directory', 'attendance_register'].includes(mod.key)) {
+        base[mod.key] = { view: true, add: true, modify: true, delete: false };
       } else {
         base[mod.key] = { view: false, add: false, modify: false, delete: false };
       }
@@ -12123,7 +12194,7 @@ function getStudentFeePaidBreakdown(student, session = SchoolData.activeSession)
 function buildFeeBifurcationCsvRows(rows, options = {}) {
   const includeTotals = options.includeTotals !== false;
   const header = [
-    'Admission No', 'Student Name', 'Class', 'Section', 'Gender', 'Date Of Admission',
+    'Admission No', 'Student Name', 'Class', 'Section', 'Class & Section', 'Gender', 'Date Of Admission',
     'Father Name', 'Parent Phone',
     'Paid Months', 'Pending Months Up To August',
     'Tuition Fee Paid', 'Tuition Fee Due',
@@ -12150,6 +12221,7 @@ function buildFeeBifurcationCsvRows(rows, options = {}) {
       s.name,
       s.currentClass || s.class || '',
       s.currentSection || s.section || '',
+      getStudentClassSectionLabel(s),
       s.gender || '',
       s.dateOfAdmission || '',
       s.parentName || '',
@@ -12182,7 +12254,7 @@ function buildFeeBifurcationCsvRows(rows, options = {}) {
 
   if (includeTotals && rows.length) {
     csvRows.push([
-      'TOTAL', `${rows.length} students`, '', '', '', '', '', '', '', '',
+      'TOTAL', `${rows.length} students`, '', '', '', '', '', '', '', '', '',
       totals.tuitionPaid, totals.tuitionDue,
       totals.annualPaid, totals.annualDue,
       totals.examPaid, totals.examDue,
@@ -12323,15 +12395,25 @@ function getFilteredFeeReceipts() {
 
 function buildReceiptRegisterCsvRows(receipts) {
   const header = [
-    'Receipt No', 'Date', 'Time', 'Admission No', 'Student Name', 'Class', 'Section', 'Father Name',
+    'Receipt No', 'Date', 'Time', 'Admission No', 'Student Name', 'Class', 'Section', 'Class & Section', 'Father Name',
     'Tuition Fee Paid', 'Annual Fee Paid', 'Exam Fee Paid', 'Total Amount Paid',
+    'Tuition Fee Due', 'Annual Fee Due', 'Exam Fee Due', 'Previous Session Due', 'Total Pending Due',
     'Fee Description', 'Payment Mode', 'Session'
   ];
   const csvRows = [header];
-  const totals = { tuition: 0, annual: 0, exam: 0, total: 0 };
+  const totals = {
+    tuitionPaid: 0, annualPaid: 0, examPaid: 0, totalPaid: 0,
+    tuitionDue: 0, annualDue: 0, examDue: 0, prevDue: 0, totalDue: 0
+  };
+  const dueCache = new Map();
 
   receipts.forEach(r => {
     const paid = getPaymentPaidBreakdown(r);
+    if (!dueCache.has(r.admissionNo)) {
+      dueCache.set(r.admissionNo, getStudentFeeDueSnapshot(r.admissionNo));
+    }
+    const dues = dueCache.get(r.admissionNo);
+    const classSection = dues.classSection || `${r.class || ''}${r.section ? ` - ${r.section}` : ''}`;
     csvRows.push([
       r.receiptNo,
       r.date,
@@ -12340,30 +12422,46 @@ function buildReceiptRegisterCsvRows(receipts) {
       r.studentName,
       r.class || '',
       r.section || '',
+      classSection,
       r.parentName || '',
       paid.tuitionPaid,
       paid.annualPaid,
       paid.examPaid,
       paid.totalPaid,
+      dues.tuitionDue,
+      dues.annualDue,
+      dues.examDue,
+      dues.prevDue,
+      dues.totalDue,
       r.month || '',
       r.mode || '',
       r.session || ''
     ]);
-    totals.tuition += paid.tuitionPaid;
-    totals.annual += paid.annualPaid;
-    totals.exam += paid.examPaid;
-    totals.total += paid.totalPaid;
+    totals.tuitionPaid += paid.tuitionPaid;
+    totals.annualPaid += paid.annualPaid;
+    totals.examPaid += paid.examPaid;
+    totals.totalPaid += paid.totalPaid;
+    totals.tuitionDue += Number(dues.tuitionDue || 0);
+    totals.annualDue += Number(dues.annualDue || 0);
+    totals.examDue += Number(dues.examDue || 0);
+    totals.prevDue += Number(dues.prevDue || 0);
+    totals.totalDue += Number(dues.totalDue || 0);
   });
 
   if (receipts.length) {
     csvRows.push([
       'TOTAL',
       `${receipts.length} receipts`,
-      '', '', '', '', '', '',
-      totals.tuition,
-      totals.annual,
-      totals.exam,
-      totals.total,
+      '', '', '', '', '', '', '',
+      totals.tuitionPaid,
+      totals.annualPaid,
+      totals.examPaid,
+      totals.totalPaid,
+      totals.tuitionDue,
+      totals.annualDue,
+      totals.examDue,
+      totals.prevDue,
+      totals.totalDue,
       '', '', ''
     ]);
   }
@@ -12753,9 +12851,9 @@ function renderRecentReceiptsSection() {
         
         <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
           <input type="text" id="recentReceiptSearchInput" placeholder="Search Receipt #, Name, Adm No, Mode..." class="session-dropdown" style="width:260px; padding:6px 12px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onkeyup="filterRecentReceiptsTable()">
-          <input type="month" id="recentReceiptMonthFilter" class="session-dropdown" title="Filter by month" style="width:150px; padding:6px 10px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onchange="filterRecentReceiptsTable()">
-          <input type="date" id="recentReceiptFromDate" class="session-dropdown" title="From date" style="width:150px; padding:6px 10px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onchange="filterRecentReceiptsTable()">
-          <input type="date" id="recentReceiptToDate" class="session-dropdown" title="To date" style="width:150px; padding:6px 10px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onchange="filterRecentReceiptsTable()">
+          <input type="month" id="recentReceiptMonthFilter" class="session-dropdown date-filter-input" title="Filter by month" style="width:150px; padding:6px 10px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onchange="filterRecentReceiptsTable()">
+          <input type="date" id="recentReceiptFromDate" class="session-dropdown date-filter-input" title="From date" style="width:150px; padding:6px 10px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onchange="filterRecentReceiptsTable()">
+          <input type="date" id="recentReceiptToDate" class="session-dropdown date-filter-input" title="To date" style="width:150px; padding:6px 10px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onchange="filterRecentReceiptsTable()">
           <button class="btn btn-secondary" onclick="exportReceiptsCSV()" style="background:#0284c7; color:#fff; border:none; font-weight:700; padding:6px 14px; font-size:0.82rem;">
             <i class="fa-solid fa-file-csv"></i> Export CSV
           </button>
@@ -15318,9 +15416,9 @@ function renderReceiptsLedgerPage(container) {
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:12px;">
         <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
           <input type="text" id="receiptSearchInput" placeholder="Search receipt #, student, or adm no..." class="session-dropdown" style="width:300px;" onkeyup="filterReceiptsLedgerTable()">
-          <input type="month" id="receiptMonthFilter" class="session-dropdown" title="Filter by month" style="width:150px;" onchange="filterReceiptsLedgerTable()">
-          <input type="date" id="receiptFromDate" class="session-dropdown" title="From date" style="width:150px;" onchange="filterReceiptsLedgerTable()">
-          <input type="date" id="receiptToDate" class="session-dropdown" title="To date" style="width:150px;" onchange="filterReceiptsLedgerTable()">
+          <input type="month" id="receiptMonthFilter" class="session-dropdown date-filter-input" title="Filter by month" style="width:150px;" onchange="filterReceiptsLedgerTable()">
+          <input type="date" id="receiptFromDate" class="session-dropdown date-filter-input" title="From date" style="width:150px;" onchange="filterReceiptsLedgerTable()">
+          <input type="date" id="receiptToDate" class="session-dropdown date-filter-input" title="To date" style="width:150px;" onchange="filterReceiptsLedgerTable()">
           <select id="receiptModeFilter" class="session-dropdown" onchange="filterReceiptsLedgerTable()">
             <option value="ALL">All Payment Modes</option>
             <option value="UPI">Online UPI</option>
