@@ -303,6 +303,7 @@
 
   function isRealStudentPhoto(value) {
     const photo = String(value || '').trim();
+    if (photo.startsWith('assets/students/') && /\.(jpe?g|png|webp)$/i.test(photo)) return true;
     if (!photo.startsWith('data:image')) return false;
     if (/unsplash|placeholder|dicebear|gravatar/i.test(photo)) return false;
     return photo.length > 120;
@@ -910,6 +911,9 @@
     });
     const data = await parseCloudResponse(res);
     if (!data.ok) throw new Error(data.error || 'Photo cloud save failed.');
+    if (!Number(data.patched) || !String(data.savedAt || '').trim()) {
+      throw new Error('Photo API is not deployed on the server yet (got a fake OK). Use assets folder upload or redeploy api/erp-cloud.js.');
+    }
     return data;
   }
 

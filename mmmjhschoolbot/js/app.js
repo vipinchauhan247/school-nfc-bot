@@ -4494,10 +4494,11 @@ function toggleAllAdmitCardStudents(checked) {
 
 /** Only a real uploaded photo — mock/stock URLs would print a stranger's face on a card. */
 function getStudentPhotoForAdmitCard(student) {
-  const photo = String(student?.photo || student?.photoDataUrl || '').trim();
+  const photo = resolveStudentPhotoSrc(student);
   if (!photo) return '';
   if (photo.startsWith('data:image')) return photo;
-  if (/unsplash|placeholder|dicebear|gravatar/i.test(photo)) return '';
+  if (isStudentPhotoAssetPath(photo)) return photo;
+  if (/^https?:\/\//i.test(photo)) return photo;
   return photo;
 }
 
@@ -8889,6 +8890,64 @@ function filterStudentsDirectoryTable() {
 const BULK_PHOTO_MAX_WIDTH = 240;
 const BULK_PHOTO_MAX_HEIGHT = 320;
 const BULK_PHOTO_JPEG_QUALITY = 0.72;
+const STUDENT_PHOTO_ASSET_DIR = 'assets/students/';
+
+function studentPhotoAssetPath(admissionNo) {
+  const adm = String(admissionNo || '').replace(/\.0$/, '').trim();
+  return `${STUDENT_PHOTO_ASSET_DIR}${adm}.jpg`;
+}
+
+function isStudentPhotoAssetPath(value) {
+  const photo = String(value || '').trim();
+  return photo.startsWith(STUDENT_PHOTO_ASSET_DIR) && /\.(jpe?g|png|webp)$/i.test(photo);
+}
+
+function resolveStudentPhotoSrc(student) {
+  const photo = String(student?.photo || student?.photoDataUrl || '').trim();
+  if (!photo) return '';
+  if (photo.startsWith('data:image')) return photo;
+  if (/unsplash|placeholder|dicebear|gravatar/i.test(photo)) return '';
+  return photo;
+}
+
+function loadJsZipLibrary() {
+  if (window.JSZip) return Promise.resolve(window.JSZip);
+  return new Promise((resolve, reject) => {
+    const existing = document.getElementById('erpJsZipScript');
+    if (existing) {
+      existing.addEventListener('load', () => resolve(window.JSZip));
+      existing.addEventListener('error', () => reject(new Error('Could not load ZIP helper.')));
+      return;
+    }
+    const script = document.createElement('script');
+    script.id = 'erpJsZipScript';
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+    script.onload = () => resolve(window.JSZip);
+    script.onerror = () => reject(new Error('Could not load ZIP helper.'));
+    document.head.appendChild(script);
+  });
+}
+
+async function downloadStudentPhotosAssetZip(queue) {
+  const JSZip = await loadJsZipLibrary();
+  const zip = new JSZip();
+  const folder = zip.folder('students');
+  queue.forEach((row) => {
+    const adm = String(row.student?.admissionNo || '').trim();
+    const base64 = String(row.dataUrl || '').split(',')[1] || '';
+    if (!adm || !base64) return;
+    folder.file(`${adm}.jpg`, base64, { base64: true });
+  });
+  const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `student-photos-${new Date().toISOString().slice(0, 10)}.zip`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
 
 /** Photos travel inside the cloud roster payload, so shrink each one to passport size before storing. */
 function resizeImageFileToDataUrl(file, maxWidth = BULK_PHOTO_MAX_WIDTH, maxHeight = BULK_PHOTO_MAX_HEIGHT) {
@@ -8955,7 +9014,7 @@ function openBulkStudentPhotoModal() {
         <div style="background:rgba(139,92,246,0.10); border:1px solid rgba(139,92,246,0.45); border-radius:12px; padding:14px 16px; margin-bottom:18px; font-size:0.86rem; line-height:1.7;">
           <strong style="color:#c084fc;">Name each photo file after the student's admission number.</strong><br>
           Accepted: <code>1813.jpg</code>, <code>1813 Abhimanyu.jpg</code>, <code>adm-1813.png</code>, <code>IMG_1813.jpeg</code>.<br>
-          Every photo is automatically cropped to passport size (${BULK_PHOTO_MAX_WIDTH}&times;${BULK_PHOTO_MAX_HEIGHT}) so the cloud roster stays small.
+          Photos are saved as website files under <code>assets/students/</code> (low bandwidth). After Save, download the ZIP and copy the <code>students</code> folder into your Vercel Drop <code>assets/students/</code> folder, then upload again.<br>
           Select a whole class at a time rather than all ${(SchoolData.students || []).length} students at once.
         </div>
 
@@ -9057,10 +9116,13 @@ function applyStagedBulkStudentPhotos() {
 async function applyStagedBulkStudentPhotosAsync(queue) {
   const applyBtn = document.getElementById('bulkPhotoApplyBtn');
   const statusEl = document.getElementById('bulkPhotoStatus');
+  const knownCloudAt = String(localStorage.getItem('MMM_ERP_CLOUD_LAST_CLOUD_AT') || '');
 
   queue.forEach(row => {
-    row.student.photo = row.dataUrl;
-    row.student.photoDataUrl = row.dataUrl;
+    const assetPath = studentPhotoAssetPath(row.student.admissionNo);
+    row.assetPath = assetPath;
+    row.student.photo = assetPath;
+    row.student.photoDataUrl = assetPath;
   });
 
   saveSchoolDataToStorage({ skipCloudPush: true });
@@ -9071,22 +9133,37 @@ async function applyStagedBulkStudentPhotosAsync(queue) {
     applyBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving to cloud…';
   }
   if (statusEl) {
-    statusEl.innerHTML = `<div style="color:#c084fc;"><i class="fa-solid fa-cloud-arrow-up fa-beat"></i> Uploading ${queue.length} photo(s) to cloud — please wait, do not refresh…</div>`;
+    statusEl.innerHTML = `<div style="color:#c084fc;"><i class="fa-solid fa-cloud-arrow-up fa-beat"></i> Saving ${queue.length} photo link(s) to cloud — please wait…</div>`;
   }
 
   try {
-    if (typeof pushBulkStudentPhotosToCloud === 'function') {
-      await pushBulkStudentPhotosToCloud(queue);
-    } else if (typeof pushStaffAuthorityToCloud === 'function') {
-      await pushStaffAuthorityToCloud();
+    let pushResult = null;
+    if (typeof pushStaffAuthorityToCloud === 'function') {
+      pushResult = await pushStaffAuthorityToCloud();
     } else if (typeof pushSchoolDataToCloud === 'function') {
-      await pushSchoolDataToCloud({ skipMergePull: true });
+      pushResult = await pushSchoolDataToCloud({ skipMergePull: true });
     } else {
       throw new Error('Cloud sync is not available on this page.');
     }
 
+    const savedAt = String(pushResult?.savedAt || window._erpCloudLastPushAt || '').trim();
+    if (!pushResult?.ok || !savedAt) {
+      throw new Error('Cloud did not confirm the save. Your server API may need an update.');
+    }
+    if (knownCloudAt && savedAt === knownCloudAt) {
+      throw new Error('Cloud timestamp did not change — photos were not saved. Try again or contact admin.');
+    }
+
+    if (statusEl) {
+      statusEl.innerHTML = `<div style="color:#34d399;"><i class="fa-solid fa-file-zipper"></i> Cloud saved. Preparing ZIP download…</div>`;
+    }
+    await downloadStudentPhotosAssetZip(queue);
+
     document.getElementById('bulkPhotoModal')?.remove();
-    showNotification(`Saved ${queue.length} student photo(s) to the cloud. Refresh is safe now.`, 'success');
+    showNotification(
+      `Saved ${queue.length} photo link(s) to cloud. ZIP downloaded — copy the students folder to assets/students/ on your PC and upload to Vercel.`,
+      'success'
+    );
     window._bulkPhotoQueue = [];
 
     if (String(window.location.hash || '').includes('students')) {
@@ -9099,9 +9176,9 @@ async function applyStagedBulkStudentPhotosAsync(queue) {
       applyBtn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> Save Matched Photos';
     }
     if (statusEl) {
-      statusEl.innerHTML = `<div style="color:#f87171; line-height:1.6;"><strong>Cloud save failed.</strong> Photos are visible on this screen only.<br>${String(err.message || err)}<br>Try again with fewer photos (one class at a time), then refresh.</div>`;
+      statusEl.innerHTML = `<div style="color:#f87171; line-height:1.6;"><strong>Save failed.</strong><br>${escapeHtml(String(err.message || err))}<br>Try one class at a time, then Save again.</div>`;
     }
-    showNotification(`Photo cloud save failed: ${err.message || err}. Do not refresh yet — try Save again.`, 'error');
+    showNotification(`Photo save failed: ${err.message || err}`, 'error');
   }
 }
 
@@ -19332,7 +19409,7 @@ function getTransferCertificateDetailsHtml(student, issuedCertificate = null) {
 }
 
 function getCertificatePhotoHtml(student) {
-  const photo = student.photo || student.photoDataUrl || '';
+  const photo = resolveStudentPhotoSrc(student);
   if (photo) return `<img src="${photo}" alt="Student Photo" style="width:92px; height:112px; object-fit:cover; border:3px solid #d4af37; border-radius:8px;">`;
   return `<div style="width:92px; height:112px; border:3px solid #d4af37; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#64748b; font-size:0.75rem; text-align:center; background:#f8fafc;">Student<br>Photo</div>`;
 }

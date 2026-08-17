@@ -1369,7 +1369,8 @@ async function handlePhotoPatch(req, res, schoolId) {
     const student = byAdmission.get(key);
     if (!student) return;
     const photo = String(row.photo || row.photoDataUrl || '').trim();
-    if (!photo.startsWith('data:image')) return;
+    const isAssetPhoto = photo.startsWith('assets/students/') && /\.(jpe?g|png|webp)$/i.test(photo);
+    if (!photo.startsWith('data:image') && !isAssetPhoto) return;
     student.photo = photo;
     student.photoDataUrl = photo;
     touchedStudents.push(student);
