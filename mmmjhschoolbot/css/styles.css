@@ -201,6 +201,7 @@ html, body {
 
 input[type="date"],
 input[type="month"],
+input[type="time"],
 input[type="datetime-local"] {
   color-scheme: dark;
   accent-color: var(--accent-primary);
@@ -208,6 +209,7 @@ input[type="datetime-local"] {
 
 input[type="date"].session-dropdown,
 input[type="month"].session-dropdown,
+input[type="time"].session-dropdown,
 input[type="datetime-local"].session-dropdown {
   background: #111827;
   color: #ffffff;
@@ -216,11 +218,55 @@ input[type="datetime-local"].session-dropdown {
 
 [data-theme="light"] input[type="date"]:not(.sidebar input),
 [data-theme="light"] input[type="month"]:not(.sidebar input),
+[data-theme="light"] input[type="time"]:not(.sidebar input),
 [data-theme="light"] input[type="datetime-local"]:not(.sidebar input) {
   color-scheme: light;
   background: #ffffff;
   color: #0f172a;
   border-color: rgba(0, 0, 0, 0.12);
+}
+
+.exam-schedule-time-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.exam-schedule-clock-icon {
+  color: #fbbf24;
+  font-size: 0.95rem;
+  flex-shrink: 0;
+}
+
+[data-theme="light"] .exam-schedule-clock-icon {
+  color: #d97706;
+}
+
+.theme-panel-modal {
+  background: var(--bg-secondary) !important;
+  color: var(--text-main) !important;
+}
+
+.theme-panel-modal .theme-panel-muted {
+  color: var(--text-muted) !important;
+}
+
+.theme-panel-modal .theme-panel-table-wrap {
+  background: var(--bg-primary) !important;
+  border-color: var(--border-color) !important;
+}
+
+.theme-panel-modal .theme-panel-table-head {
+  background: var(--bg-card) !important;
+  color: var(--accent-primary) !important;
+}
+
+.theme-panel-modal .theme-panel-row {
+  border-bottom-color: var(--border-color) !important;
+}
+
+.theme-panel-modal .theme-panel-name {
+  color: var(--text-main) !important;
 }
 
 .status-dot {

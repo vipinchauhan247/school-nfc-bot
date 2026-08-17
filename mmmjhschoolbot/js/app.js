@@ -4073,9 +4073,19 @@ function renderExamSchedulePage(container) {
                 <td>
                   <input list="examSubjectPresets" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="subject" value="${escapeHtml(row.subject || '')}" placeholder="Subject" style="min-width:170px;">
                 </td>
-                <td><input type="date" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="date" value="${escapeHtml(row.date || '')}"></td>
-                <td><input type="time" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="startTime" value="${escapeHtml(row.startTime || '')}"></td>
-                <td><input type="time" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="endTime" value="${escapeHtml(row.endTime || '')}"></td>
+                <td><input type="date" class="session-dropdown date-filter-input exam-schedule-input" data-index="${idx}" data-field="date" value="${escapeHtml(row.date || '')}"></td>
+                <td>
+                  <div class="exam-schedule-time-wrap">
+                    <i class="fa-solid fa-clock exam-schedule-clock-icon" aria-hidden="true"></i>
+                    <input type="time" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="startTime" value="${escapeHtml(row.startTime || '')}">
+                  </div>
+                </td>
+                <td>
+                  <div class="exam-schedule-time-wrap">
+                    <i class="fa-solid fa-clock exam-schedule-clock-icon" aria-hidden="true"></i>
+                    <input type="time" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="endTime" value="${escapeHtml(row.endTime || '')}">
+                  </div>
+                </td>
                 <td><input type="number" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="maxMarks" value="${escapeHtml(row.maxMarks || '')}" placeholder="30" style="min-width:80px;"></td>
                 <td><button class="btn btn-danger" style="padding:6px 10px; font-size:0.78rem;" onclick="deleteExamScheduleRow(${idx})"><i class="fa-solid fa-trash"></i> Delete</button></td>
               </tr>
@@ -8574,7 +8584,7 @@ function renderStudentsPage(container) {
 
     <div class="glass-card">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:12px;">
-        <input type="text" id="studentSearchInput" placeholder="Search student name, adm no, or NFC UID..." class="session-dropdown" style="width:300px;" onkeyup="filterStudentsDirectoryTable()">
+        <input type="text" id="studentSearchInput" placeholder="Search student name or admission no..." class="session-dropdown" style="width:300px;" onkeyup="filterStudentsDirectoryTable()">
         <select id="studentClassFilter" class="session-dropdown" onchange="filterStudentsDirectoryTable()">
           ${getClassSelectOptionsHtml('ALL', { includeAll: true })}
         </select>
@@ -8587,7 +8597,6 @@ function renderStudentsPage(container) {
               <th>Student Name</th>
               <th>Admission No</th>
               <th>Class & Sec</th>
-              <th>NFC UID</th>
               <th>Parent Info</th>
               <th>Fee Status</th>
               <th>Actions</th>
@@ -8599,21 +8608,16 @@ function renderStudentsPage(container) {
               const dueAmount = (fee.dueMonths.length * getStudentMonthlyTuitionRate(s)) + (fee.previousSessionDue || 0);
 
               return `
-                <tr class="student-dir-row" data-name="${s.name.toLowerCase()}" data-adm="${s.admissionNo}" data-uid="${s.nfcUid.toLowerCase()}" data-class="${s.currentClass}">
+                <tr class="student-dir-row" data-name="${s.name.toLowerCase()}" data-adm="${s.admissionNo}" data-class="${s.currentClass}">
                   <td style="display:flex; align-items:center; gap:10px;">
                     <img src="${s.photo}" style="width:36px; height:36px; border-radius:50%; object-fit:cover;">
                     <div>
                       <strong style="color:var(--text-main);">${s.name}</strong><br>
-                      <small style="color:var(--text-muted);">${s.gender} | <strong style="color:#38bdf8;">DOB: ${formatDobToDDMMYYYY(s.dob)}</strong></small>
+                      <small style="color:var(--text-muted);">${s.gender} | <strong style="color:var(--accent-primary);">DOB: ${formatDobToDDMMYYYY(s.dob)}</strong></small>
                     </div>
                   </td>
                   <td><code>${s.admissionNo}</code></td>
                   <td><span class="badge badge-purple">${s.currentClass} - ${s.currentSection}</span></td>
-                  <td>
-                    ${s.nfcUid && s.nfcUid.trim().length > 0 
-                      ? `<code style="color:#38bdf8; font-weight:800; background:rgba(56,189,248,0.1); padding:3px 7px; border-radius:6px; border:1px solid rgba(56,189,248,0.3);"><i class="fa-solid fa-microchip"></i> ${s.nfcUid}</code>` 
-                      : `<span style="color:#64748b; font-weight:600; font-size:0.85rem;">--</span>`}
-                  </td>
                   <td>
                     <div style="font-size:0.8rem;">
                       <strong>${s.parentName}</strong><br>
@@ -8656,10 +8660,9 @@ function filterStudentsDirectoryTable() {
   rows.forEach(r => {
     const name = r.getAttribute('data-name') || '';
     const adm = r.getAttribute('data-adm') || '';
-    const uid = r.getAttribute('data-uid') || '';
     const cls = r.getAttribute('data-class') || '';
 
-    const matchQuery = !query || name.includes(query) || adm.includes(query) || uid.includes(query);
+    const matchQuery = !query || name.includes(query) || adm.includes(query);
     const matchClass = targetClass === 'ALL' || cls === targetClass;
 
     r.style.display = (matchQuery && matchClass) ? '' : 'none';
@@ -10191,17 +10194,17 @@ function openClassStudentsModal(className, targetSection = null) {
   });
 
   const modalHtml = `
-    <div class="modal-overlay active" id="classStudentsModal" style="z-index:99999; backdrop-filter:blur(8px);">
-      <div class="modal-box" style="max-width:96vw; width:96vw; max-height:94vh; background:#0f172a; color:#ffffff; padding:28px; border-radius:20px; border:2px solid #38bdf8; box-shadow:0 25px 50px -12px rgba(0,0,0,0.85); position:relative; display:flex; flex-direction:column;">
-        <button onclick="document.getElementById('classStudentsModal').remove()" style="position:absolute; top:16px; right:20px; background:#334155; color:#ffffff; border:none; width:36px; height:36px; border-radius:50%; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">X</button>
+    <div class="modal-overlay active class-students-modal" id="classStudentsModal" style="z-index:99999; backdrop-filter:blur(8px);">
+      <div class="modal-box theme-panel-modal" style="max-width:96vw; width:96vw; max-height:94vh; padding:28px; border-radius:20px; border:2px solid var(--accent-primary); box-shadow:0 25px 50px -12px rgba(0,0,0,0.35); position:relative; display:flex; flex-direction:column;">
+        <button onclick="document.getElementById('classStudentsModal').remove()" style="position:absolute; top:16px; right:20px; background:var(--bg-card); color:var(--text-main); border:1px solid var(--border-color); width:36px; height:36px; border-radius:50%; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">X</button>
 
         <!-- TOP HEADER BAR -->
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:18px; border-bottom:1px solid #334155; padding-bottom:14px; flex-wrap:wrap; gap:12px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:18px; border-bottom:1px solid var(--border-color); padding-bottom:14px; flex-wrap:wrap; gap:12px;">
           <div>
-            <h3 style="margin:0; color:#38bdf8; font-size:1.4rem; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+            <h3 style="margin:0; color:var(--accent-primary); font-size:1.4rem; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
               <i class="fa-solid fa-users"></i> Class Student Directory: ${className}
             </h3>
-            <p style="margin:4px 0 0 0; font-size:0.88rem; color:#cbd5e1;">Session ${currentSession} - Total ${allClassStudents.length} Enrolled Students</p>
+            <p class="theme-panel-muted" style="margin:4px 0 0 0; font-size:0.88rem;">Session ${currentSession} - Total ${allClassStudents.length} Enrolled Students</p>
           </div>
           
           <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
@@ -10229,10 +10232,10 @@ function openClassStudentsModal(className, targetSection = null) {
         </div>
 
         <!-- FULL WIDTH EXPANDED DATA TABLE -->
-        <div class="data-table-container" style="flex:1; max-height:65vh; overflow-y:auto; border:1px solid #334155; border-radius:12px; background:#0f172a;">
+        <div class="data-table-container theme-panel-table-wrap" style="flex:1; max-height:65vh; overflow-y:auto; border:1px solid var(--border-color); border-radius:12px;">
           <table class="data-table" style="font-size:0.88rem; width:100%;">
             <thead>
-              <tr style="background:#1e293b; color:#38bdf8;">
+              <tr class="theme-panel-table-head">
                 <th style="padding:12px;">Roll</th>
                 <th style="padding:12px;">Student Name</th>
                 <th style="padding:12px;">Admission No</th>
@@ -10240,28 +10243,26 @@ function openClassStudentsModal(className, targetSection = null) {
                 <th style="padding:12px;">Date of Birth (DOB)</th>
                 <th style="padding:12px;">Father's Name</th>
                 <th style="padding:12px;">Parent Phone</th>
-                <th style="padding:12px;">NFC Card UID</th>
                 <th style="padding:12px;">Actions</th>
               </tr>
             </thead>
             <tbody>
               ${displayStudents.length === 0 ? `
-                <tr><td colspan="9" style="text-align:center; padding:40px; color:#cbd5e1; font-size:1rem; font-weight:700;">No students enrolled in ${className} (Section ${currentSectionFilter}) yet.</td></tr>
+                <tr><td colspan="8" style="text-align:center; padding:40px; color:var(--text-muted); font-size:1rem; font-weight:700;">No students enrolled in ${className} (Section ${currentSectionFilter}) yet.</td></tr>
               ` : displayStudents.map((s, idx) => `
-                <tr style="border-bottom:1px solid #334155;">
+                <tr class="theme-panel-row" style="border-bottom:1px solid var(--border-color);">
                   <td><code>${String(idx + 1).padStart(2, '0')}</code></td>
                   <td>
                     <div style="display:flex; align-items:center; gap:10px;">
                       <img src="${s.photo || 'https://images.unsplash.com/photo-1544717305-2782549b5136?w=150'}" style="width:34px; height:34px; border-radius:50%; object-fit:cover;">
-                      <strong style="color:#ffffff; font-size:0.95rem;">${s.name}</strong>
+                      <strong class="theme-panel-name" style="font-size:0.95rem;">${s.name}</strong>
                     </div>
                   </td>
                   <td><code>${s.admissionNo}</code></td>
                   <td><span class="badge badge-purple">${s.currentClass || className} - ${s.currentSection || s.section || 'A'}</span></td>
-                  <td><strong style="color:#38bdf8;">DOB: ${formatDobToDDMMYYYY(s.dob)}</strong></td>
-                  <td>${s.parentName}</td>
-                  <td>${s.parentPhone}</td>
-                  <td><code style="color:#22d3ee; font-weight:bold;">${s.nfcUid}</code></td>
+                  <td><strong style="color:var(--accent-primary);">DOB: ${formatDobToDDMMYYYY(s.dob)}</strong></td>
+                  <td style="color:var(--text-main);">${s.parentName}</td>
+                  <td style="color:var(--text-main);">${s.parentPhone}</td>
                   <td>
                     <div style="display:flex; gap:6px;">
                       <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.78rem;" onclick="document.getElementById('classStudentsModal').remove(); openStudentProfile('${s.admissionNo}');">
@@ -12194,7 +12195,7 @@ function getStudentFeePaidBreakdown(student, session = SchoolData.activeSession)
 function buildFeeBifurcationCsvRows(rows, options = {}) {
   const includeTotals = options.includeTotals !== false;
   const header = [
-    'Admission No', 'Student Name', 'Class', 'Section', 'Class & Section', 'Gender', 'Date Of Admission',
+    'Admission No', 'Student Name', 'Class', 'Section', 'Gender', 'Date Of Admission',
     'Father Name', 'Parent Phone',
     'Paid Months', 'Pending Months Up To August',
     'Tuition Fee Paid', 'Tuition Fee Due',
@@ -12221,7 +12222,6 @@ function buildFeeBifurcationCsvRows(rows, options = {}) {
       s.name,
       s.currentClass || s.class || '',
       s.currentSection || s.section || '',
-      getStudentClassSectionLabel(s),
       s.gender || '',
       s.dateOfAdmission || '',
       s.parentName || '',
@@ -12254,7 +12254,7 @@ function buildFeeBifurcationCsvRows(rows, options = {}) {
 
   if (includeTotals && rows.length) {
     csvRows.push([
-      'TOTAL', `${rows.length} students`, '', '', '', '', '', '', '', '', '',
+      'TOTAL', `${rows.length} students`, '', '', '', '', '', '', '', '',
       totals.tuitionPaid, totals.tuitionDue,
       totals.annualPaid, totals.annualDue,
       totals.examPaid, totals.examDue,
@@ -12395,7 +12395,7 @@ function getFilteredFeeReceipts() {
 
 function buildReceiptRegisterCsvRows(receipts) {
   const header = [
-    'Receipt No', 'Date', 'Time', 'Admission No', 'Student Name', 'Class', 'Section', 'Class & Section', 'Father Name',
+    'Receipt No', 'Date', 'Time', 'Admission No', 'Student Name', 'Class', 'Section', 'Father Name',
     'Tuition Fee Paid', 'Annual Fee Paid', 'Exam Fee Paid', 'Total Amount Paid',
     'Tuition Fee Due', 'Annual Fee Due', 'Exam Fee Due', 'Previous Session Due', 'Total Pending Due',
     'Fee Description', 'Payment Mode', 'Session'
@@ -12413,7 +12413,6 @@ function buildReceiptRegisterCsvRows(receipts) {
       dueCache.set(r.admissionNo, getStudentFeeDueSnapshot(r.admissionNo));
     }
     const dues = dueCache.get(r.admissionNo);
-    const classSection = dues.classSection || `${r.class || ''}${r.section ? ` - ${r.section}` : ''}`;
     csvRows.push([
       r.receiptNo,
       r.date,
@@ -12422,7 +12421,6 @@ function buildReceiptRegisterCsvRows(receipts) {
       r.studentName,
       r.class || '',
       r.section || '',
-      classSection,
       r.parentName || '',
       paid.tuitionPaid,
       paid.annualPaid,
@@ -12452,7 +12450,7 @@ function buildReceiptRegisterCsvRows(receipts) {
     csvRows.push([
       'TOTAL',
       `${receipts.length} receipts`,
-      '', '', '', '', '', '', '',
+      '', '', '', '', '', '',
       totals.tuitionPaid,
       totals.annualPaid,
       totals.examPaid,
@@ -12794,8 +12792,8 @@ function openQuickFeeSelectModal() {
                 <div style="display:flex; align-items:center; gap:12px;">
                   <img src="${s.photo || 'https://images.unsplash.com/photo-1544717305-2782549b5136?w=150&auto=format&fit=crop&q=80'}" style="width:40px; height:40px; border-radius:50%; object-fit:cover;">
                   <div>
-                    <strong style="color:#ffffff; font-size:0.95rem;">${s.name}</strong> 
-                    <span style="color:#38bdf8; font-size:0.8rem;">(${s.currentClass || 'Class 5'} - ${s.currentSection || 'A'})</span><br>
+                    <strong style="color:var(--text-main); font-size:0.95rem;">${s.name}</strong> 
+                    <span style="color:var(--accent-primary); font-size:0.8rem;">(${s.currentClass || 'Class 5'} - ${s.currentSection || 'A'})</span><br>
                     <small style="color:#94a3b8; font-size:0.75rem;">Adm: <code>${s.admissionNo}</code> | Father: ${s.parentName}</small>
                   </div>
                 </div>
