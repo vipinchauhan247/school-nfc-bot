@@ -12506,6 +12506,7 @@ function downloadFeeHistoryImportTemplate() {
     ['AdmissionNo', 'PaidMonths', 'PreviousSessionDue', 'ReceiptNo', 'PaymentDate', 'TotalPaid', 'TuitionPaid', 'AnnualPaid', 'ExamPaid', 'PaymentMode', 'Notes'],
     ['1556', 'April, May, June', '0', 'OLD-1556-APR-JUN', '2026-06-15', '5400', '5400', '2200', '400', 'Cash', 'Imported from old ERP'],
     ['1556', 'July, August', '0', 'OLD-1556-JUL-AUG', '2026-08-10', '3600', '3600', '', '', 'UPI', 'Second receipt from old ERP'],
+    ['2489', '', '0', 'OLD-2489-ANNUAL', '2026-07-01', '500', '0', '500', '0', 'UPI', 'Annual charges only — PaidMonths can be blank'],
     ['2382', 'April, May, June, July, August', '500', 'OLD-2382-ALL', '2026-08-01', '7500', '7000', '2200', '400', 'Cash', 'Includes previous session due Rs 500']
   ];
   downloadCsvFile(`Fee_History_Import_Template_${SchoolData.activeSession}.csv`, sample);
@@ -12529,7 +12530,7 @@ function openFeeHistoryImportModal() {
         <h3 style="margin:0 0 4px 0; color:#f59e0b; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
           <i class="fa-solid fa-file-import"></i> Import Fee History from Old ERP (CSV)
         </h3>
-        <p class="theme-panel-muted" style="margin:0 0 14px 0; font-size:0.82rem;">Bring paid months, receipts and dues from your previous fee software into session <strong>${currentSession}</strong>. Students must already exist (import students first).</p>
+        <p class="theme-panel-muted" style="margin:0 0 14px 0; font-size:0.82rem;">Bring paid months, receipts and dues from your previous fee software into session <strong>${currentSession}</strong>. Students must already exist (import students first). <strong>PaidMonths</strong> can be blank for annual or exam-only receipts.</p>
 
         <div style="background:var(--bg-card); padding:12px 16px; border-radius:10px; border:1px solid var(--border-color); margin-bottom:14px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
           <div style="font-size:0.78rem; color:var(--text-muted);">
@@ -12625,24 +12626,30 @@ function handleFeeHistoryCsvFileSelect(event) {
       const vals = parseCsvRow(lines[i]);
       const admNo = String(vals[admIdx] || '').trim();
       const paidMonths = parseLegacyFeeMonthList(vals[monthsIdx]);
-      if (!admNo || !paidMonths.length) continue;
+      const totalPaid = parseLegacyFeeAmount(vals[totalIdx]);
+      const tuitionPaid = parseLegacyFeeAmount(vals[tuitionIdx]);
+      const annualPaid = parseLegacyFeeAmount(vals[annualIdx]);
+      const examPaid = parseLegacyFeeAmount(vals[examIdx]);
+      const receiptNo = String(vals[receiptIdx] || '').trim();
+      const hasFeeAmount = totalPaid > 0 || tuitionPaid > 0 || annualPaid > 0 || examPaid > 0;
+      if (!admNo || (!paidMonths.length && !hasFeeAmount)) continue;
       _parsedFeeHistoryRows.push({
         admNo,
         paidMonths,
         previousSessionDue: parseLegacyFeeAmount(vals[prevIdx]),
-        receiptNo: String(vals[receiptIdx] || '').trim(),
+        receiptNo,
         paymentDate: String(vals[dateIdx] || '').trim(),
-        totalPaid: parseLegacyFeeAmount(vals[totalIdx]),
-        tuitionPaid: parseLegacyFeeAmount(vals[tuitionIdx]),
-        annualPaid: parseLegacyFeeAmount(vals[annualIdx]),
-        examPaid: parseLegacyFeeAmount(vals[examIdx]),
+        totalPaid,
+        tuitionPaid,
+        annualPaid,
+        examPaid,
         paymentMode: String(vals[modeIdx] || 'Cash').trim() || 'Cash',
         notes: String(vals[notesIdx] || '').trim()
       });
     }
 
     if (!_parsedFeeHistoryRows.length) {
-      showNotification('No valid fee history rows found. Check AdmissionNo and PaidMonths.', 'warning');
+      showNotification('No valid fee history rows found. Each row needs AdmissionNo plus PaidMonths or a fee amount.', 'warning');
       return;
     }
 
@@ -12670,18 +12677,30 @@ function handleFeeHistoryCsvFileSelect(event) {
 
 function buildLegacyFeePayment(student, row, session) {
   const monthlyRate = getStudentMonthlyTuitionRate(student, session);
-  const paidCurrentMonths = row.paidMonths.map(month => ({ month, amount: monthlyRate }));
+  const paidCurrentMonths = row.paidMonths.length
+    ? row.paidMonths.map((month, index, allMonths) => {
+        const perMonthAmount = row.tuitionPaid > 0
+          ? Math.round(row.tuitionPaid / allMonths.length)
+          : monthlyRate;
+        return { month, amount: perMonthAmount };
+      })
+    : [];
   const selectedMonthsTotal = row.tuitionPaid || paidCurrentMonths.reduce((sum, item) => sum + Number(item.amount || 0), 0);
   const paidExtraItems = [];
   if (row.annualPaid > 0) paidExtraItems.push({ label: 'Annual Charges', amount: row.annualPaid });
   if (row.examPaid > 0) paidExtraItems.push({ label: 'Exam Fee', amount: row.examPaid });
   const amount = row.totalPaid || (selectedMonthsTotal + paidExtraItems.reduce((s, i) => s + i.amount, 0));
-  const receiptNo = row.receiptNo || `IMP-${session}-${student.admissionNo}-${row.paidMonths.join('').slice(0, 8)}-${Date.now().toString().slice(-4)}`;
+  const receiptSeed = row.paidMonths.join('') || paidExtraItems.map(i => i.label).join('') || 'FEE';
+  const receiptNo = row.receiptNo || `IMP-${session}-${student.admissionNo}-${receiptSeed.slice(0, 8)}-${Date.now().toString().slice(-4)}`;
   let date = row.paymentDate || new Date().toISOString().split('T')[0];
   if (date.includes('/')) {
     const parts = date.split('/');
     if (parts.length === 3) date = `${parts[2].length === 2 ? '20' + parts[2] : parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
   }
+  const monthParts = [];
+  if (row.paidMonths.length) monthParts.push(row.paidMonths.join(', '));
+  if (paidExtraItems.length) monthParts.push(paidExtraItems.map(i => `${i.label} Rs${i.amount}`).join(', '));
+  if (row.notes) monthParts.push(row.notes);
   return {
     receiptNo,
     date,
@@ -12696,7 +12715,7 @@ function buildLegacyFeePayment(student, row, session) {
     walletApplied: 0,
     excessSaved: 0,
     partialDueCarried: 0,
-    month: `Imported (${session}): ${row.paidMonths.join(', ')}${paidExtraItems.length ? ' | ' + paidExtraItems.map(i => `${i.label} Rs${i.amount}`).join(', ') : ''}${row.notes ? ' | ' + row.notes : ''}`,
+    month: `Imported (${session}): ${monthParts.join(' | ') || 'Legacy fee receipt'}`,
     mode: row.paymentMode || 'Cash',
     studentName: student.name,
     admissionNo: student.admissionNo,
