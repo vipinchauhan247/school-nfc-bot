@@ -1338,6 +1338,66 @@ async function handleCloudConfig(req, res) {
   return json(res, 200, cloudConfigBody(req));
 }
 
+/** Patch student passport photos in small batches (avoids Vercel 4.5MB body limit on full roster push). */
+async function handlePhotoPatch(req, res, schoolId) {
+  if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST required.' });
+  const photos = req.body?.photos;
+  if (!Array.isArray(photos) || !photos.length) {
+    return json(res, 400, { ok: false, error: 'POST body must include photos array.' });
+  }
+  if (photos.length > 50) {
+    return json(res, 400, { ok: false, error: 'Maximum 50 photos per request. Upload one class at a time.' });
+  }
+
+  const snapshot = await readSnapshot(schoolId);
+  if (!snapshot?.payload || !Array.isArray(snapshot.payload.students) || !snapshot.payload.students.length) {
+    return json(res, 404, { ok: false, error: 'School cloud roster not found.' });
+  }
+
+  const byAdmission = new Map();
+  snapshot.payload.students.forEach((student) => {
+    const key = normalizeAdmission(student?.admissionNo || student?.AdmissionNo);
+    if (key) byAdmission.set(key, student);
+  });
+
+  let patched = 0;
+  const touchedStudents = [];
+  photos.forEach((row) => {
+    if (!row || typeof row !== 'object') return;
+    const key = normalizeAdmission(row.admissionNo || row.AdmissionNo);
+    if (!key) return;
+    const student = byAdmission.get(key);
+    if (!student) return;
+    const photo = String(row.photo || row.photoDataUrl || '').trim();
+    if (!photo.startsWith('data:image')) return;
+    student.photo = photo;
+    student.photoDataUrl = photo;
+    touchedStudents.push(student);
+    patched += 1;
+  });
+
+  if (!patched) {
+    return json(res, 400, { ok: false, error: 'No matching students or valid photo data in this batch.' });
+  }
+
+  const payload = {
+    ...snapshot.payload,
+    savedAt: new Date().toISOString()
+  };
+  const savedBy = String(req.body?.savedBy || 'bulk-photo-upload').trim();
+  const written = await writeSnapshot(schoolId, payload, savedBy);
+  const savedAt = written?.snapshot?.saved_at || payload.savedAt;
+
+  return json(res, 200, {
+    ok: true,
+    configured: true,
+    schoolId,
+    patched,
+    savedAt,
+    studentCount: payload.students.length
+  });
+}
+
 async function route(req, res, action) {
   const act = String(action || req.query?.action || '').trim();
   if (act === 'cloudConfig') {
@@ -1345,7 +1405,7 @@ async function route(req, res, action) {
     return true;
   }
   if ([
-    'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments',
+    'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'photoPatch', 'nativeStudents', 'nativeMigrate', 'nativePayments',
     'rebuildSnapshot', 'wipeRoster', 'authLogin', 'authLogout', 'authSession', 'authChangePassword',
     'authAdminResetPassword', 'authAudit', 'tcIssue', 'tcGet', 'tcList', 'tcVerify', 'tcRevoke'
   ].includes(act)) {
@@ -1537,6 +1597,10 @@ async function erpCloudHandler(req, res) {
         native: true,
         feesNative: true
       });
+    }
+
+    if (req.method === 'POST' && action === 'photoPatch') {
+      return handlePhotoPatch(req, res, schoolId);
     }
 
     if (req.method === 'POST') {

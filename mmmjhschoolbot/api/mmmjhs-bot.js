@@ -1231,7 +1231,7 @@ module.exports = async function handler(req, res) {
     const action = String(req.query?.action || '').trim();
 
     // Cloud-native + snapshot compat (Supabase). Never touches @Vipinbellbot.
-    if (erpCloud && ['cloudConfig', 'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments', 'rebuildSnapshot', 'wipeRoster', 'authLogin', 'authLogout', 'authSession', 'authChangePassword', 'authAdminResetPassword', 'authAudit', 'tcIssue', 'tcGet', 'tcList', 'tcVerify', 'tcRevoke'].includes(action)) {
+    if (erpCloud && ['cloudConfig', 'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'photoPatch', 'nativeStudents', 'nativeMigrate', 'nativePayments', 'rebuildSnapshot', 'wipeRoster', 'authLogin', 'authLogout', 'authSession', 'authChangePassword', 'authAdminResetPassword', 'authAudit', 'tcIssue', 'tcGet', 'tcList', 'tcVerify', 'tcRevoke'].includes(action)) {
       if (typeof erpCloud.route === 'function') {
         const handled = await erpCloud.route(req, res, action);
         if (handled !== false) return;

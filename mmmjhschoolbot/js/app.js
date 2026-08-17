@@ -1374,6 +1374,13 @@ function mergeExactDuplicateStudentRows() {
     }
     if (!target.nfcUid && source.nfcUid) target.nfcUid = source.nfcUid;
     if (!target.photo && source.photo) target.photo = source.photo;
+    const mergedPhoto = (typeof preferStudentPhoto === 'function')
+      ? preferStudentPhoto(target.photo || target.photoDataUrl, source.photo || source.photoDataUrl)
+      : (target.photo || source.photo || '');
+    if (mergedPhoto) {
+      target.photo = mergedPhoto;
+      target.photoDataUrl = mergedPhoto;
+    }
     target.sessionDetails = { ...(source.sessionDetails || {}), ...(target.sessionDetails || {}) };
     target.attendanceLogs = { ...(source.attendanceLogs || {}), ...(target.attendanceLogs || {}) };
     target.examMarks = { ...(source.examMarks || {}), ...(target.examMarks || {}) };
@@ -9044,23 +9051,57 @@ function applyStagedBulkStudentPhotos() {
     : `Save ${queue.length} student photo(s)?`;
   if (!window.confirm(confirmMsg)) return;
 
+  void applyStagedBulkStudentPhotosAsync(queue);
+}
+
+async function applyStagedBulkStudentPhotosAsync(queue) {
+  const applyBtn = document.getElementById('bulkPhotoApplyBtn');
+  const statusEl = document.getElementById('bulkPhotoStatus');
+
   queue.forEach(row => {
     row.student.photo = row.dataUrl;
     row.student.photoDataUrl = row.dataUrl;
   });
 
   saveSchoolDataToStorage({ skipCloudPush: true });
-  if (typeof flushCloudPushNow === 'function') flushCloudPushNow();
-  else if (typeof pushSchoolDataToCloud === 'function') {
-    pushSchoolDataToCloud({ skipMergePull: true }).catch(err => console.warn('Photo cloud sync failed:', err));
+  window._erpCloudMemoryDirty = true;
+
+  if (applyBtn) {
+    applyBtn.disabled = true;
+    applyBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving to cloud…';
+  }
+  if (statusEl) {
+    statusEl.innerHTML = `<div style="color:#c084fc;"><i class="fa-solid fa-cloud-arrow-up fa-beat"></i> Uploading ${queue.length} photo(s) to cloud — please wait, do not refresh…</div>`;
   }
 
-  document.getElementById('bulkPhotoModal')?.remove();
-  showNotification(`Saved ${queue.length} student photo(s) and synced to the cloud.`, 'success');
-  window._bulkPhotoQueue = [];
+  try {
+    if (typeof pushBulkStudentPhotosToCloud === 'function') {
+      await pushBulkStudentPhotosToCloud(queue);
+    } else if (typeof pushStaffAuthorityToCloud === 'function') {
+      await pushStaffAuthorityToCloud();
+    } else if (typeof pushSchoolDataToCloud === 'function') {
+      await pushSchoolDataToCloud({ skipMergePull: true });
+    } else {
+      throw new Error('Cloud sync is not available on this page.');
+    }
 
-  if (String(window.location.hash || '').includes('students')) {
-    renderStudentsPage(document.getElementById('contentBody'));
+    document.getElementById('bulkPhotoModal')?.remove();
+    showNotification(`Saved ${queue.length} student photo(s) to the cloud. Refresh is safe now.`, 'success');
+    window._bulkPhotoQueue = [];
+
+    if (String(window.location.hash || '').includes('students')) {
+      renderStudentsPage(document.getElementById('contentBody'));
+    }
+  } catch (err) {
+    console.error('Bulk photo cloud save failed:', err);
+    if (applyBtn) {
+      applyBtn.disabled = false;
+      applyBtn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> Save Matched Photos';
+    }
+    if (statusEl) {
+      statusEl.innerHTML = `<div style="color:#f87171; line-height:1.6;"><strong>Cloud save failed.</strong> Photos are visible on this screen only.<br>${String(err.message || err)}<br>Try again with fewer photos (one class at a time), then refresh.</div>`;
+    }
+    showNotification(`Photo cloud save failed: ${err.message || err}. Do not refresh yet — try Save again.`, 'error');
   }
 }
 

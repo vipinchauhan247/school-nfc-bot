@@ -81,6 +81,10 @@
     return withCloudSecret(`${getErpCloudApiBase()}?action=cloudPush`);
   }
 
+  function cloudPhotoPatchUrl() {
+    return withCloudSecret(`${getErpCloudApiBase()}?action=photoPatch`);
+  }
+
   function cloudHeaders() {
     const headers = { Accept: 'application/json' };
     const secret = getCloudSecret();
@@ -297,10 +301,29 @@
     return R;
   }
 
+  function isRealStudentPhoto(value) {
+    const photo = String(value || '').trim();
+    if (!photo.startsWith('data:image')) return false;
+    if (/unsplash|placeholder|dicebear|gravatar/i.test(photo)) return false;
+    return photo.length > 120;
+  }
+
+  function preferStudentPhoto(localValue, remoteValue) {
+    const localPhoto = String(localValue || '').trim();
+    const remotePhoto = String(remoteValue || '').trim();
+    const localReal = isRealStudentPhoto(localPhoto);
+    const remoteReal = isRealStudentPhoto(remotePhoto);
+    if (localReal && !remoteReal) return localPhoto;
+    if (remoteReal && !localReal) return remotePhoto;
+    if (localReal && remoteReal) return localPhoto.length >= remotePhoto.length ? localPhoto : remotePhoto;
+    return localPhoto || remotePhoto;
+  }
+
   function mergeStudent(localStudent, remoteStudent) {
     const L = localStudent || {};
     const R = remoteStudent || {};
     const base = { ...R, ...L };
+    const photo = preferStudentPhoto(L.photo || L.photoDataUrl, R.photo || R.photoDataUrl);
     return {
       ...base,
       name: resolveStudentName(L, R),
@@ -309,6 +332,8 @@
       cardUid: preferText(L.cardUid || L.nfcUid, R.cardUid || R.nfcUid) || L.cardUid || R.cardUid,
       nfcUid: preferText(L.nfcUid, R.nfcUid) || L.nfcUid || R.nfcUid,
       telegramChatId: preferText(L.telegramChatId, R.telegramChatId) || L.telegramChatId || R.telegramChatId,
+      photo,
+      photoDataUrl: photo,
       feeRecords: mergeFeeRecords(L.feeRecords, R.feeRecords),
       currentFeeInfo: mergeFeeSession(L.currentFeeInfo, R.currentFeeInfo)
     };
@@ -875,6 +900,79 @@
     return data;
   }
 
+  async function pushStudentPhotoBatchToCloud(photos) {
+    const schoolId = getCloudSchoolId();
+    const savedBy = (typeof getCurrentActiveUser === 'function' && getCurrentActiveUser()?.name) || 'Bulk photo upload';
+    const res = await fetchWithRetry(cloudPhotoPatchUrl(), {
+      method: 'POST',
+      headers: { ...cloudHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ schoolId, photos, savedBy })
+    });
+    const data = await parseCloudResponse(res);
+    if (!data.ok) throw new Error(data.error || 'Photo cloud save failed.');
+    return data;
+  }
+
+  /** Save bulk-uploaded photos in small batches so refresh keeps them. */
+  async function pushBulkStudentPhotosToCloud(photoRows) {
+    const rows = Array.isArray(photoRows) ? photoRows.filter(row => row?.student && row?.dataUrl) : [];
+    if (!rows.length) throw new Error('No photos to save.');
+
+    cancelScheduledCloudPush();
+    window._erpCloudMemoryDirty = true;
+    window._erpCloudSyncState = 'syncing';
+
+    const BATCH_SIZE = 25;
+    let patched = 0;
+    let savedAt = '';
+
+    try {
+      for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+        const batch = rows.slice(i, i + BATCH_SIZE).map(row => ({
+          admissionNo: row.student.admissionNo || row.student.AdmissionNo,
+          photo: row.dataUrl,
+          photoDataUrl: row.dataUrl
+        }));
+        try {
+          const result = await pushStudentPhotoBatchToCloud(batch);
+          patched += Number(result.patched || batch.length);
+          savedAt = result.savedAt || savedAt;
+        } catch (batchErr) {
+          const msg = String(batchErr.message || batchErr);
+          const patchUnavailable = /404|not found|unknown|Method not allowed/i.test(msg);
+          if (patchUnavailable && typeof pushStaffAuthorityToCloud === 'function') {
+            const fallback = await pushStaffAuthorityToCloud();
+            patched = rows.length;
+            savedAt = fallback?.savedAt || savedAt;
+            break;
+          }
+          throw batchErr;
+        }
+      }
+
+      if (savedAt) {
+        localStorage.setItem(LS_LAST_CLOUD_AT, savedAt);
+        localStorage.setItem(LS_LAST_PULL, savedAt);
+        window._erpCloudLastPushAt = savedAt;
+      }
+      window._erpCloudLastPushCount = patched;
+      window._erpCloudLastPushError = '';
+      window._erpCloudSyncState = 'live';
+
+      if (typeof window.saveCloudDisplayCache === 'function' && typeof buildSchoolDataStoragePayload === 'function') {
+        try { window.saveCloudDisplayCache(buildSchoolDataStoragePayload()); } catch (e) {}
+      }
+
+      return { ok: true, patched, savedAt };
+    } catch (err) {
+      window._erpCloudLastPushError = err.message;
+      window._erpCloudSyncState = 'error';
+      throw err;
+    } finally {
+      window._erpCloudMemoryDirty = false;
+    }
+  }
+
   function flushCloudPushNow() {
     scheduleCloudPush(0);
   }
@@ -1057,6 +1155,8 @@
   }
 
   window.isErpCloudOnly = isCloudOnly;
+  window.isRealStudentPhoto = isRealStudentPhoto;
+  window.preferStudentPhoto = preferStudentPhoto;
   window.getCloudSchoolId = getCloudSchoolId;
   window.getCloudSecret = getCloudSecret;
   window.setCloudCredentials = setCloudCredentials;
@@ -1068,6 +1168,7 @@
   window.scheduleCloudPush = scheduleCloudPush;
   window.cancelScheduledCloudPush = cancelScheduledCloudPush;
   window.pushStaffAuthorityToCloud = pushStaffAuthorityToCloud;
+  window.pushBulkStudentPhotosToCloud = pushBulkStudentPhotosToCloud;
   window.flushCloudPushNow = flushCloudPushNow;
   window.getCloudSyncStatusText = getCloudSyncStatusText;
   window.mergeSchoolPayloadsForCloud = mergeSchoolPayloads;
