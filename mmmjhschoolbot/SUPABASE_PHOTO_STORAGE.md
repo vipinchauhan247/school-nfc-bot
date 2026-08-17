@@ -66,13 +66,23 @@ Hard refresh the ERP: **Ctrl+F5**.
 
 ## What teachers do (every time)
 
+### Option A — Upload JPG files from PC
+
 1. Open **Bulk Student Photo Upload**
 2. Select photos named by admission number (`1740.jpg`, etc.)
 3. Click **Save Matched Photos**
-4. Wait for: **"Saved X photo(s) to Supabase Storage. Refresh is safe"**
+4. Wait for: **"Saved X real photo(s) to Supabase Storage"** (or cloud)
 5. Done — no ZIP, no Vercel redeploy
 
-Upload **one class at a time** (max 25 per batch).
+### Option B — Import from old ERP CSV (fastest for whole school)
+
+1. Log in to **madanmohanmalviyaschool.com** → student list (one class)
+2. F12 Console → paste `scripts/old_erp_browser_photo_manifest.js` → CSV downloads
+3. Repeat per class; merge CSVs
+4. ERP → **Bulk Student Photo Upload** → upload CSV → **Import from Old ERP CSV**
+5. Server downloads each photo from old ERP into Supabase Storage automatically
+
+Upload **one class at a time** (max 20–25 per batch).
 
 ---
 
