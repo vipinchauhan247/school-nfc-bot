@@ -205,8 +205,80 @@ function applySchoolProfileToShell() {
 }
 
 function getClassTeacherForStudent(student) {
-  const cls = (SchoolData.classes || []).find(c => c.name === (student.currentClass || student.class));
-  return cls?.teacher || '';
+  const clsName = student.currentClass || student.class;
+  const sec = normalizeClassSectionKey(student.currentSection || student.section || 'A');
+  const cls = (SchoolData.classes || []).find(c => c.name === clsName);
+  if (!cls) return '';
+  const map = getClassSectionTeachers(cls);
+  return map[sec] || cls.teacher || '';
+}
+
+function normalizeClassSectionKey(section) {
+  const sec = String(section || 'A').trim().toUpperCase();
+  return sec || 'A';
+}
+
+function getClassSectionTeachers(classObj) {
+  if (!classObj) return {};
+  const map = { ...(classObj.sectionTeachers || {}) };
+  if (classObj.teacher) {
+    (classObj.sections || ['A']).forEach((section) => {
+      const key = normalizeClassSectionKey(section);
+      if (!map[key]) map[key] = classObj.teacher;
+    });
+  }
+  return map;
+}
+
+function setClassSectionTeacher(classObj, section, teacherName) {
+  if (!classObj) return;
+  if (!classObj.sectionTeachers) classObj.sectionTeachers = {};
+  const key = normalizeClassSectionKey(section);
+  const name = String(teacherName || '').trim();
+  if (name) classObj.sectionTeachers[key] = name;
+  else delete classObj.sectionTeachers[key];
+  const primarySection = normalizeClassSectionKey((classObj.sections || ['A'])[0]);
+  classObj.teacher = classObj.sectionTeachers[primarySection] || Object.values(classObj.sectionTeachers)[0] || '';
+}
+
+function getSessionDateBounds(session) {
+  const match = String(session || SchoolData.activeSession || '2026-27').match(/(\d{4})-(\d{2})/);
+  if (!match) return null;
+  const startYear = parseInt(match[1], 10);
+  const endYear = startYear + 1;
+  return { start: `${startYear}-04-01`, end: `${endYear}-03-31` };
+}
+
+function isDateInSession(dateKey, session) {
+  const bounds = getSessionDateBounds(session);
+  if (!bounds || !dateKey) return true;
+  const day = String(dateKey).slice(0, 10);
+  return day >= bounds.start && day <= bounds.end;
+}
+
+function getStudentAttendanceSummaryForReport(student, session = SchoolData.activeSession) {
+  const logs = student?.attendanceLogs || {};
+  let daysPresent = 0;
+  let daysAbsent = 0;
+  let daysLate = 0;
+  Object.entries(logs).forEach(([dateKey, log]) => {
+    if (!isDateInSession(dateKey, session)) return;
+    const status = String(log?.status || '').trim().toLowerCase();
+    if (status === 'present') daysPresent += 1;
+    else if (status === 'late') { daysPresent += 1; daysLate += 1; }
+    else if (status === 'absent') daysAbsent += 1;
+  });
+  const workingDays = daysPresent + daysAbsent;
+  const percentage = workingDays ? Math.round((daysPresent / workingDays) * 100) : null;
+  return { daysPresent, daysAbsent, daysLate, workingDays, percentage, session };
+}
+
+function formatReportCardAttendanceLine(summary) {
+  if (!summary || !summary.workingDays) {
+    return 'Attendance: Not recorded for this session yet';
+  }
+  const lateNote = summary.daysLate ? ` (incl. ${summary.daysLate} late)` : '';
+  return `Attendance: ${summary.daysPresent} / ${summary.workingDays} working days${lateNote} — ${summary.percentage}%`;
 }
 
 function getTeacherSignatureByName(teacherName) {
@@ -3788,13 +3860,13 @@ function renderUsersPage(container) {
         </button>
       </div>
 
-      <div class="data-table-container">
-        <table class="data-table" style="text-align:center; font-size:0.88rem;">
+      <div class="data-table-container users-matrix-scroll custom-matrix-scroll">
+        <table class="data-table users-permissions-matrix" style="text-align:center; font-size:0.88rem; min-width:1400px;">
           <thead>
             <tr style="background:#0f172a; color:#ffffff;">
-              <th style="text-align:left; padding:12px;">Staff User Name</th>
+              <th class="users-sticky-name" style="text-align:left; padding:12px;">Staff User Name</th>
+              <th class="users-sticky-role" style="text-align:left; padding:12px;">Role / Designation</th>
               <th style="text-align:left; padding:12px;">Staff ID</th>
-              <th style="text-align:left; padding:12px;">Role / Designation</th>
               <th style="text-align:left; padding:12px; background:rgba(2, 132, 199, 0.2); color:#38bdf8;">Username & Password</th>
               <th style="text-align:left; padding:12px; background:rgba(56, 189, 248, 0.15); color:#38bdf8;">Telegram Chat ID</th>
               <th style="text-align:left; padding:12px; background:rgba(99, 102, 241, 0.2); color:#818cf8;">Teacher Subject Mappings</th>
@@ -3815,9 +3887,9 @@ function renderUsersPage(container) {
 
               return `
                 <tr style="border-bottom:1px solid #334155;">
-                  <td style="text-align:left; font-weight:800; color:#38bdf8; padding:12px;">${u.name}</td>
+                  <td class="users-sticky-name" style="text-align:left; font-weight:800; color:#38bdf8; padding:12px;">${u.name}</td>
+                  <td class="users-sticky-role" style="text-align:left; padding:12px; color:#cbd5e1; font-weight:700;">${u.role}</td>
                   <td style="text-align:left; padding:12px;"><code style="color:#fbbf24; font-weight:800;">${u.uniqueId || u.id}</code></td>
-                  <td style="text-align:left; padding:12px; color:#cbd5e1; font-weight:700;">${u.role}</td>
 
                   <!-- USERNAME & PASSWORD -->
                   <td style="text-align:left; padding:12px;">
@@ -3864,17 +3936,17 @@ function renderUsersPage(container) {
 
                   <!-- CAN MANAGE FEES -->
                   <td style="padding:12px;">
-                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${u.canManageFees || u.role === 'Accountant' || u.role === 'Super Admin' ? 'checked' : ''} data-uid="${u.id}" data-field="canManageFees">
+                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${(!isTeacher && u.canManageFees) || u.role === 'Accountant' || u.role === 'Super Admin' || u.role === 'Principal' || u.role === 'Receptionist' ? 'checked' : ''} data-uid="${u.id}" data-field="canManageFees" ${isTeacher ? 'disabled title="Teachers cannot collect fees by default"' : ''}>
                   </td>
 
                   <!-- VIEW REVENUE -->
                   <td style="padding:12px;">
-                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${u.viewTotalRevenue ? 'checked' : ''} data-uid="${u.id}" data-field="viewTotalRevenue">
+                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${(!isTeacher && u.viewTotalRevenue) || u.role === 'Accountant' || u.role === 'Super Admin' || u.role === 'Principal' ? 'checked' : ''} data-uid="${u.id}" data-field="viewTotalRevenue" ${isTeacher ? 'disabled title="Teachers cannot view school revenue totals"' : ''}>
                   </td>
 
                   <!-- VIEW DUES -->
                   <td style="padding:12px;">
-                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${u.viewDueBalance ? 'checked' : ''} data-uid="${u.id}" data-field="viewDueBalance">
+                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${(!isTeacher && u.viewDueBalance) || u.role === 'Accountant' || u.role === 'Super Admin' || u.role === 'Principal' ? 'checked' : ''} data-uid="${u.id}" data-field="viewDueBalance" ${isTeacher ? 'disabled title="Teachers cannot view school-wide dues totals"' : ''}>
                   </td>
 
                   <!-- TELEGRAM BOT HUB ACCESS -->
@@ -5130,6 +5202,28 @@ function repairStaffFinancialVisibilityRights() {
     SchoolData._finRightsV2 = true;
     changed = true;
   }
+
+  if (!SchoolData._finRightsV3) {
+    (SchoolData.staffUsers || []).forEach((u) => {
+      if (!isTeacherRoleUser(u)) return;
+      if (u.viewDueBalance || u.viewTotalRevenue || u.canManageFees) changed = true;
+      u.viewDueBalance = false;
+      u.viewTotalRevenue = false;
+      u.canManageFees = false;
+      u.hideFees = true;
+      ensureStaffAccessRight(u, 'total_dues_view', 'view', false);
+      ensureStaffAccessRight(u, 'total_revenue_view', 'view', false);
+      ensureStaffAccessRight(u, 'fee_collection', 'view', false);
+      ensureStaffAccessRight(u, 'fee_collection', 'add', false);
+      ensureStaffAccessRight(u, 'fee_collection', 'modify', false);
+      ensureStaffAccessRight(u, 'student_dues_view', 'view', false);
+      ensureStaffAccessRight(u, 'fee_receipt_print', 'view', false);
+      ensureStaffAccessRight(u, 'fee_receipt_deletion', 'delete', false);
+      ensureStaffAccessRight(u, 'telegram_fee_notice', 'view', false);
+      changed = true;
+    });
+    SchoolData._finRightsV3 = true;
+  }
   return changed;
 }
 
@@ -6205,6 +6299,10 @@ function saveUserPermissionsMatrix() {
     const field = box.getAttribute('data-field');
     const uObj = SchoolData.staffUsers.find(x => x.id === uid);
     if (uObj) {
+      if (isTeacherRoleUser(uObj) && ['canManageFees', 'viewTotalRevenue', 'viewDueBalance'].includes(field)) {
+        uObj[field] = false;
+        return;
+      }
       uObj[field] = box.checked;
       // Sync Access Rights modules so dashboard/fees enforcement matches the matrix
       if (field === 'viewTotalRevenue') {
@@ -7155,6 +7253,10 @@ function viewCombinedConsolidatedReportCard(admissionNo) {
   const roll = student.currentRollNo || student.rollNo || '1';
   const sigs = SchoolData.signatures || {};
   const school = getSchoolProfile();
+  const classTeacherName = getClassTeacherForStudent(student) || sigs.teacherName || 'Class Teacher';
+  const classTeacherSignature = getTeacherSignatureByName(classTeacherName) || sigs.teacherSig || '';
+  const attendanceSummary = getStudentAttendanceSummaryForReport(student, currentSession);
+  const attendanceLine = formatReportCardAttendanceLine(attendanceSummary);
 
   const subjects = [
     { name: "English Language & Literature", ut1: 15, ut2: 15, hy: 70, ut3: 15, ut4: 14, fin: 68 },
@@ -7225,6 +7327,7 @@ function viewCombinedConsolidatedReportCard(admissionNo) {
             <div><strong>Admission No:</strong> <code>${student.admissionNo}</code></div>
             <div><strong>Class:</strong> ${cls} - ${sec} (Roll: ${roll})</div>
             <div><strong>Father:</strong> ${student.parentName} | <strong>Mother:</strong> ${student.motherName || 'N/A'} | <strong>DOB:</strong> <span style="color:#0284c7; font-weight:700;">${formatDobToDDMMYYYY(student.dob)}</span></div>
+            <div><strong>${attendanceLine}</strong> | <strong>Class Teacher:</strong> ${classTeacherName}</div>
           </div>
 
           <!-- SIDE-BY-SIDE DUAL TERM COMBINED MARKS TABLE -->
@@ -7300,10 +7403,10 @@ function viewCombinedConsolidatedReportCard(admissionNo) {
             <!-- TEACHER SIG -->
             <div style="text-align:center;">
               <div style="height:38px; display:flex; align-items:flex-end; justify-content:center;">
-                ${sigs.teacherSig ? `
-                  <img src="${sigs.teacherSig}" style="max-height:38px; max-width:110px; object-fit:contain;">
+                ${classTeacherSignature ? `
+                  <img src="${classTeacherSignature}" style="max-height:38px; max-width:110px; object-fit:contain;">
                 ` : `
-                  <span style="font-family:'Caveat', cursive; font-size:1.15rem; color:#4f46e5; font-weight:bold;">${sigs.teacherName || 'Varsha Chauhan'}</span>
+                  <span style="font-family:'Caveat', cursive; font-size:1.15rem; color:#4f46e5; font-weight:bold;">${classTeacherName}</span>
                 `}
               </div>
               <div style="border-top:1px solid #94a3b8; padding-top:2px; font-weight:600; color:#475569;">Class Teacher Signature</div>
@@ -7364,14 +7467,16 @@ function viewHalfYearlyReportCard(admissionNo) {
   const roll = student.currentRollNo || student.rollNo || '1';
   const sigs = SchoolData.signatures || {};
   const school = getSchoolProfile();
+  const currentSession = SchoolData.activeSession;
   const classTeacherName = getClassTeacherForStudent(student) || sigs.teacherName || 'Class Teacher';
   const classTeacherSignature = getTeacherSignatureByName(classTeacherName) || sigs.teacherSig || '';
   const principalSignature = school.principalSignatureDataUrl || sigs.principalSig || '';
+  const attendanceSummary = getStudentAttendanceSummaryForReport(student, currentSession);
+  const attendanceLine = formatReportCardAttendanceLine(attendanceSummary);
   const isPrimary = (cls.includes('Nursery') || cls.includes('LKG') || cls.includes('UKG') || cls.includes('Class 1') || cls.includes('Class 2') || cls.includes('Class 3') || cls.includes('Class 4') || cls.includes('Class 5'));
   
   const utMax = isPrimary ? 15 : 10;
   const hyMax = isPrimary ? 70 : 80;
-  const currentSession = SchoolData.activeSession;
 
   const configuredSubs = getSubjectsForClassAndExam(cls, 'half_yearly');
   const subjects = configuredSubs.map(s => {
@@ -7473,6 +7578,8 @@ function viewHalfYearlyReportCard(admissionNo) {
               <div><strong>Father Name:</strong> ${student.parentName}</div>
               <div><strong>Mother Name:</strong> ${student.motherName || 'N/A'}</div>
               <div><strong>Date of Birth:</strong> <strong style="color:#0284c7;">${formatDobToDDMMYYYY(student.dob)}</strong></div>
+              <div><strong>${attendanceLine}</strong></div>
+              <div><strong>Class Teacher:</strong> ${classTeacherName}</div>
             </div>
 
             <div style="display:flex; align-items:center; gap:12px;">
@@ -7594,14 +7701,16 @@ function viewFinalAnnualReportCard(admissionNo) {
   const roll = student.currentRollNo || student.rollNo || '1';
   const sigs = SchoolData.signatures || {};
   const school = getSchoolProfile();
+  const currentSession = SchoolData.activeSession;
   const classTeacherName = getClassTeacherForStudent(student) || sigs.teacherName || 'Class Teacher';
   const classTeacherSignature = getTeacherSignatureByName(classTeacherName) || sigs.teacherSig || '';
   const principalSignature = school.principalSignatureDataUrl || sigs.principalSig || '';
+  const attendanceSummary = getStudentAttendanceSummaryForReport(student, currentSession);
+  const attendanceLine = formatReportCardAttendanceLine(attendanceSummary);
   const isPrimary = (cls.includes('Nursery') || cls.includes('LKG') || cls.includes('UKG') || cls.includes('Class 1') || cls.includes('Class 2') || cls.includes('Class 3') || cls.includes('Class 4') || cls.includes('Class 5'));
   
   const utMax = isPrimary ? 15 : 10;
   const hyMax = isPrimary ? 70 : 80;
-  const currentSession = SchoolData.activeSession;
 
   const configuredSubs = getSubjectsForClassAndExam(cls, 'final_annual');
   const subjects = configuredSubs.map(s => {
@@ -7709,6 +7818,8 @@ function viewFinalAnnualReportCard(admissionNo) {
               <div><strong>Father Name:</strong> ${student.parentName}</div>
               <div><strong>Mother Name:</strong> ${student.motherName || 'N/A'}</div>
               <div><strong>Date of Birth:</strong> <strong style="color:#059669;">${formatDobToDDMMYYYY(student.dob)}</strong></div>
+              <div><strong>${attendanceLine}</strong></div>
+              <div><strong>Class Teacher:</strong> ${classTeacherName}</div>
             </div>
 
             <div>
@@ -10348,30 +10459,49 @@ function renderClassesPage(container) {
   `;
 }
 
-function getClassTeacherOptionsHtml(selectedTeacher = '', currentClassId = '') {
-  const assignedTeachers = new Map((SchoolData.classes || [])
-    .filter(c => c.id !== currentClassId && c.teacher)
-    .map(c => [String(c.teacher).trim().toLowerCase(), c.name]));
+function getClassTeacherOptionsHtml(selectedTeacher = '', currentClassId = '', currentSection = '') {
+  const assignedSlots = new Set();
+  (SchoolData.classes || []).forEach((cls) => {
+    const map = getClassSectionTeachers(cls);
+    (cls.sections || ['A']).forEach((section) => {
+      const key = normalizeClassSectionKey(section);
+      const teacher = map[key];
+      if (!teacher) return;
+      if (cls.id === currentClassId && normalizeClassSectionKey(currentSection) === key) return;
+      assignedSlots.add(`${String(teacher).trim().toLowerCase()}|${cls.id}|${key}`);
+    });
+  });
 
   const teacherNames = Array.from(new Set((SchoolData.teachers || []).map(t => t.name).filter(Boolean)));
   if (selectedTeacher && !teacherNames.includes(selectedTeacher)) teacherNames.unshift(selectedTeacher);
 
   return teacherNames.map(name => {
-    const assignedClass = assignedTeachers.get(String(name).trim().toLowerCase());
-    const disabled = assignedClass ? 'disabled' : '';
-    const suffix = assignedClass ? ` - already class teacher of ${assignedClass}` : '';
-    return `<option value="${name}" ${name === selectedTeacher ? 'selected' : ''} ${disabled}>${name}${suffix}</option>`;
+    const slotTakenElsewhere = (SchoolData.classes || []).some((cls) => {
+      if (cls.id === currentClassId) return false;
+      const map = getClassSectionTeachers(cls);
+      return Object.entries(map).some(([sec, teacher]) =>
+        String(teacher).trim().toLowerCase() === String(name).trim().toLowerCase() &&
+        normalizeClassSectionKey(currentSection || sec) === sec
+      );
+    });
+    const suffix = slotTakenElsewhere ? ' — assigned elsewhere' : '';
+    return `<option value="${name}" ${name === selectedTeacher ? 'selected' : ''}>${name}${suffix}</option>`;
   }).join('');
 }
 
-function validateUniqueClassTeacher(teacherName, currentClassId = '') {
-  const existing = (SchoolData.classes || []).find(c =>
-    c.id !== currentClassId &&
-    c.teacher &&
-    String(c.teacher).trim().toLowerCase() === String(teacherName).trim().toLowerCase()
-  );
-  if (existing) {
-    showNotification(`${teacherName} is already assigned as class teacher for ${existing.name}. Choose another teacher first.`, 'error');
+function validateUniqueClassTeacher(teacherName, currentClassId = '', currentSection = 'A') {
+  if (!teacherName) return true;
+  const secKey = normalizeClassSectionKey(currentSection);
+  const duplicate = (SchoolData.classes || []).find((cls) => {
+    if (cls.id === currentClassId) return false;
+    const map = getClassSectionTeachers(cls);
+    return Object.entries(map).some(([section, teacher]) =>
+      normalizeClassSectionKey(section) === secKey &&
+      String(teacher).trim().toLowerCase() === String(teacherName).trim().toLowerCase()
+    );
+  });
+  if (duplicate) {
+    showNotification(`${teacherName} is already class teacher for ${duplicate.name} Section ${secKey}.`, 'error');
     return false;
   }
   return true;
@@ -16069,11 +16199,19 @@ function exportTelegramLogCsv(category) {
 }
 
 function renderClassTeacherAssignmentsPage(container) {
+  const assignmentRows = (SchoolData.classes || []).flatMap((cls) =>
+    (cls.sections || ['A']).map((section) => {
+      const map = getClassSectionTeachers(cls);
+      const teacher = map[normalizeClassSectionKey(section)] || '';
+      return { cls, section, teacher };
+    })
+  );
+
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-chalkboard-user" style="color:#38bdf8"></i> Class Teacher Assignments</h2>
-        <p class="page-subtitle">Assign one unique class teacher per class. Teacher names come from Teachers Directory.</p>
+        <p class="page-subtitle">Assign one class teacher per <strong>class + section</strong>. Upload each teacher's signature in Teachers Directory — it prints on report cards automatically.</p>
       </div>
       <button class="btn btn-secondary" onclick="window.location.hash='teachers'"><i class="fa-solid fa-user-tie"></i> Teachers Directory</button>
     </div>
@@ -16084,25 +16222,30 @@ function renderClassTeacherAssignmentsPage(container) {
           <thead>
             <tr>
               <th>Class</th>
-              <th>Sections</th>
+              <th>Section</th>
               <th>Assigned Class Teacher</th>
+              <th>Signature on Report Card</th>
               <th>Room</th>
             </tr>
           </thead>
           <tbody>
-            ${(SchoolData.classes || []).map(c => `
+            ${assignmentRows.map(({ cls, section, teacher }) => {
+              const sig = getTeacherSignatureByName(teacher);
+              return `
               <tr>
-                <td><strong style="color:#38bdf8;">${c.name}</strong></td>
-                <td>${(c.sections || []).join(', ')}</td>
+                <td><strong style="color:#38bdf8;">${cls.name}</strong></td>
+                <td><span class="badge badge-purple">${section}</span></td>
                 <td>
-                  <select class="session-dropdown class-teacher-assign-select" data-class-id="${c.id}" style="max-width:320px;">
+                  <select class="session-dropdown class-teacher-assign-select" data-class-id="${cls.id}" data-section="${section}" style="max-width:320px;">
                     <option value="">Select class teacher</option>
-                    ${getClassTeacherOptionsHtml(c.teacher || '', c.id)}
+                    ${getClassTeacherOptionsHtml(teacher, cls.id, section)}
                   </select>
                 </td>
-                <td>${c.room || 'Room 101'}</td>
+                <td>${teacher ? (sig ? '<span style="color:#34d399; font-weight:700;">Uploaded</span>' : '<span style="color:#fbbf24;">Add in Teachers Directory</span>') : '—'}</td>
+                <td>${cls.room || 'Room 101'}</td>
               </tr>
-            `).join('')}
+            `;
+            }).join('')}
           </tbody>
         </table>
       </div>
@@ -16115,23 +16258,27 @@ function renderClassTeacherAssignmentsPage(container) {
 
 function saveClassTeacherAssignments() {
   const selects = Array.from(document.querySelectorAll('.class-teacher-assign-select'));
-  const seen = new Map();
+  const slotMap = new Map();
+
   for (const sel of selects) {
     const teacher = sel.value.trim();
+    const classId = sel.getAttribute('data-class-id');
+    const section = normalizeClassSectionKey(sel.getAttribute('data-section'));
     if (!teacher) continue;
-    if (seen.has(teacher.toLowerCase())) {
-      showNotification(`${teacher} is selected for more than one class. Please choose one class only.`, 'error');
-      return;
-    }
-    seen.set(teacher.toLowerCase(), sel.getAttribute('data-class-id'));
+    const slotKey = `${classId}|${section}`;
+    if (slotMap.has(slotKey)) continue;
+    slotMap.set(slotKey, teacher.toLowerCase());
   }
 
-  selects.forEach(sel => {
+  selects.forEach((sel) => {
     const cls = SchoolData.classes.find(c => c.id === sel.getAttribute('data-class-id'));
-    if (cls) cls.teacher = sel.value.trim();
+    if (!cls) return;
+    const section = normalizeClassSectionKey(sel.getAttribute('data-section'));
+    setClassSectionTeacher(cls, section, sel.value.trim());
   });
+
   saveSchoolDataToStorage();
-  showNotification('Class teacher assignments saved.', 'success');
+  showNotification('Class teacher assignments saved per class and section.', 'success');
   renderClassTeacherAssignmentsPage(document.getElementById('contentBody'));
 }
 
