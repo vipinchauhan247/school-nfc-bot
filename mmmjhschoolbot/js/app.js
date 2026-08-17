@@ -2637,14 +2637,38 @@ function normalizeSubjectCodeBase(value) {
 }
 
 /**
+ * Cloud merge sometimes stores subjects as an object — normalize to array without data loss.
+ */
+function normalizeSubjectsPayload(subjects) {
+  if (Array.isArray(subjects)) {
+    return subjects.filter((s) => s && typeof s === 'object');
+  }
+  if (subjects && typeof subjects === 'object') {
+    return Object.values(subjects).filter((s) => s && typeof s === 'object' && (s.code || s.name || s.id));
+  }
+  return [];
+}
+
+function ensureSchoolDataSubjectsArray() {
+  const normalized = normalizeSubjectsPayload(SchoolData.subjects);
+  if (!Array.isArray(SchoolData.subjects) || SchoolData.subjects.length !== normalized.length) {
+    SchoolData.subjects = normalized;
+  } else if (SchoolData.subjects !== normalized) {
+    SchoolData.subjects = normalized;
+  }
+  return SchoolData.subjects;
+}
+
+/**
  * Real Subjects Directory only — no mock ENG/MAT seeds, no duplicate Mathematics rows.
  * Optional forClass filters by All Classes / selected-classes scope.
  */
 function getDirectorySubjectsUnique(options = {}) {
+  ensureSchoolDataSubjectsArray();
   const forClass = options.forClass || null;
   const byBase = new Map();
 
-  (SchoolData.subjects || []).forEach((s) => {
+  SchoolData.subjects.forEach((s) => {
     const code = String(s?.code || '').trim();
     const name = String(s?.name || '').trim();
     if (!code || !name) return;
@@ -4211,7 +4235,7 @@ function renderExamSchedulePage(container) {
       </div>
 
       <datalist id="examTermPresets">${getExamScheduleTerms().map(t => `<option value="${escapeHtml(t)}"></option>`).join('')}</datalist>
-      <datalist id="examSubjectPresets">${(SchoolData.subjects || []).map(s => `<option value="${escapeHtml(s.name || '')}"></option>`).join('')}</datalist>
+      <datalist id="examSubjectPresets">${ensureSchoolDataSubjectsArray().map(s => `<option value="${escapeHtml(s.name || '')}"></option>`).join('')}</datalist>
 
       <div style="display:flex; justify-content:flex-end; margin-top:18px; gap:10px;">
         <button class="btn btn-secondary" onclick="window.location.hash='exams-admit-card'"><i class="fa-solid fa-id-card"></i> Print Admit Cards</button>
@@ -5888,7 +5912,9 @@ function readSubjectClassScopeFromForm() {
  * (English school-wide ≠ one teacher for every class).
  */
 function applyTeacherMappingsToSubjectsDirectory(teacher, mappings) {
-  if (!teacher || !Array.isArray(SchoolData.subjects)) return false;
+  if (!teacher) return false;
+  ensureSchoolDataSubjectsArray();
+  if (!SchoolData.subjects.length) return false;
   const linked = findStaffUserForTeacher(teacher);
   if (!linked || !isTeacherRoleUser(linked)) return false;
   const teacherName = String(teacher.name || linked.name || '').trim();
@@ -5957,7 +5983,8 @@ function syncSubjectTeachersFromLinkedMappings() {
  * Clears leftover demo names (Varsha, Lakshya, …) that are not logins.
  */
 function sanitizeSubjectsTeachersMustBeUsers() {
-  if (!Array.isArray(SchoolData.subjects)) return false;
+  ensureSchoolDataSubjectsArray();
+  if (!SchoolData.subjects.length) return false;
   let changed = false;
   SchoolData.subjects.forEach((sub) => {
     const raw = String(sub.teacher || '').trim();
@@ -8107,7 +8134,7 @@ function applySchoolDataStoragePayload(parsed, options) {
   }
   if (parsed.sessions) SchoolData.sessions = parsed.sessions;
   if (Array.isArray(parsed.teachers) || parsed.teachers) SchoolData.teachers = parsed.teachers || [];
-  if (parsed.subjects) SchoolData.subjects = parsed.subjects;
+  if (parsed.subjects) SchoolData.subjects = normalizeSubjectsPayload(parsed.subjects);
   if (Array.isArray(parsed.staffUsers)) {
     const prevByKey = new Map(
       (SchoolData.staffUsers || []).map((u) => [String(u.username || u.id || '').toLowerCase(), u])
@@ -8637,7 +8664,7 @@ function confirmRestoreDatabase() {
       if (data.signatures) SchoolData.signatures = data.signatures;
       if (data.sessions) SchoolData.sessions = data.sessions;
       if (data.teachers) SchoolData.teachers = data.teachers;
-      if (data.subjects) SchoolData.subjects = data.subjects;
+      if (data.subjects) SchoolData.subjects = normalizeSubjectsPayload(data.subjects);
       if (data.examSubjectConfigs) SchoolData.examSubjectConfigs = data.examSubjectConfigs;
       if (data.periodSettings) SchoolData.periodSettings = data.periodSettings;
       if (data.telegramLogs) SchoolData.telegramLogs = data.telegramLogs;
@@ -8923,20 +8950,32 @@ function getStudentInitials(name) {
   return parts.slice(0, 2).map(part => part[0]).join('').toUpperCase() || '?';
 }
 
-/** Student list/profile avatar — never show random Unsplash strangers; initials if no real photo. */
+function buildStudentInitialsAvatarStyle(sizePx) {
+  const fontSize = Math.max(10, Math.round(sizePx * 0.32));
+  return `width:${sizePx}px;height:${sizePx}px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#334155;color:#94a3b8;font-size:${fontSize}px;font-weight:800;flex-shrink:0;`;
+}
+
+/** Swap broken/missing photo img for initials circle — never stack both. */
+function replaceStudentPhotoWithInitials(img) {
+  if (!img || img.tagName !== 'IMG') return;
+  img.onerror = null;
+  const sizePx = Number(img.getAttribute('data-photo-size')) || 36;
+  const initials = img.getAttribute('data-photo-initials') || '?';
+  const el = document.createElement('div');
+  el.style.cssText = buildStudentInitialsAvatarStyle(sizePx);
+  el.textContent = initials;
+  img.replaceWith(el);
+}
+
+/** Student list/profile avatar — real photo only; initials when missing or broken. */
 function getStudentDirectoryPhotoHtml(student, sizePx = 36) {
   const photo = resolveStudentPhotoSrc(student);
-  const initials = escapeHtml(getStudentInitials(student?.name));
-  const fontSize = Math.max(10, Math.round(sizePx * 0.32));
-  const boxStyle = `width:${sizePx}px;height:${sizePx}px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#334155;color:#94a3b8;font-size:${fontSize}px;font-weight:800;flex-shrink:0;`;
+  const initials = getStudentInitials(student?.name);
+  const boxStyle = buildStudentInitialsAvatarStyle(sizePx);
   if (!photo) {
-    return `<div style="${boxStyle}">${initials}</div>`;
+    return `<div style="${boxStyle}">${escapeHtml(initials)}</div>`;
   }
-  const uid = `sdph-${String(student?.admissionNo || 'x').replace(/\W/g, '')}-${sizePx}`;
-  return `<span style="position:relative;width:${sizePx}px;height:${sizePx}px;flex-shrink:0;display:inline-block;">
-    <img id="${uid}" src="${photo}" alt="" style="width:${sizePx}px;height:${sizePx}px;border-radius:50%;object-fit:cover;" onerror="this.style.display='none'; var fb=document.getElementById('${uid}-fb'); if(fb) fb.style.display='flex';">
-    <div id="${uid}-fb" style="display:none;${boxStyle}">${initials}</div>
-  </span>`;
+  return `<img src="${photo}" alt="" data-photo-size="${sizePx}" data-photo-initials="${escapeHtml(initials)}" style="width:${sizePx}px;height:${sizePx}px;border-radius:50%;object-fit:cover;flex-shrink:0;display:block;background:#334155;" onerror="replaceStudentPhotoWithInitials(this)">`;
 }
 
 function loadJsZipLibrary() {
@@ -12551,7 +12590,7 @@ function renderSubjectsPage(container) {
   if (typeof sanitizeSubjectsTeachersMustBeUsers === 'function' && sanitizeSubjectsTeachersMustBeUsers()) {
     saveSchoolDataToStorage();
   }
-  const subjects = SchoolData.subjects || [];
+  const subjects = ensureSchoolDataSubjectsArray();
   const teacherUsers = getTeacherRoleUsersForSubjectAssign();
   const canAdd = canCurrentUserAddSubjects();
   const canModify = canCurrentUserModifySubjects();
@@ -17341,37 +17380,52 @@ function applyWebsiteAppearance() {
  * link so the injected one inherits that deployment's own classes and styling.
  */
 function ensureExamsAdmitCardNavLink() {
-  const subdir = document.querySelector('.nav-sub-directory[data-parent="exams"]');
-  if (!subdir) return null;
-  const links = Array.from(subdir.querySelectorAll('a'));
-  if (!links.length) return null;
-
-  const existing = links.find(a =>
-    (a.getAttribute('data-page') || '') === 'exams-admit-card' ||
-    (a.getAttribute('href') || '').includes('exams-admit-card')
+  const examsNav = document.querySelector(
+    'a.nav-item[data-page="exams"], a.nav-item[data-page="exams-entry"], a.nav-item[href="#exams"], a.nav-item[href="#exams-entry"]'
   );
-  if (existing) return existing;
+  let subdir = document.querySelector('.nav-sub-directory[data-parent="exams"]');
 
-  const link = links[links.length - 1].cloneNode(true);
-  link.setAttribute('href', '#exams-admit-card');
-  link.setAttribute('data-page', 'exams-admit-card');
-  link.classList.remove('active');
-
-  const icon = link.querySelector('i');
-  if (icon) icon.className = 'fa-solid fa-id-card';
-
-  const labelHost = link.querySelector('span');
-  if (labelHost) {
-    labelHost.textContent = 'Admit Card';
-  } else {
-    Array.from(link.childNodes)
-      .filter(node => node.nodeType === 3)
-      .forEach(node => node.remove());
-    link.appendChild(document.createTextNode(' Admit Card'));
+  if (!subdir && examsNav) {
+    subdir = document.createElement('div');
+    subdir.className = examsNav.nextElementSibling?.classList?.contains('nav-sub-directory')
+      ? examsNav.nextElementSibling.className
+      : 'nav-sub-directory';
+    subdir.setAttribute('data-parent', 'exams');
+    subdir.style.display = 'none';
+    examsNav.insertAdjacentElement('afterend', subdir);
   }
 
-  subdir.appendChild(link);
-  return link;
+  if (!subdir) return null;
+
+  const examLinks = [
+    { page: 'exams-entry', icon: 'fa-table-cells', label: 'Marks Entry' },
+    { page: 'exams-weightage', icon: 'fa-sliders', label: 'Subject Marks & Weightage' },
+    { page: 'exams-report-cards', icon: 'fa-award', label: 'Report Cards' },
+    { page: 'exams-schedule', icon: 'fa-calendar-days', label: 'Exam Schedule' },
+    { page: 'exams-admit-card', icon: 'fa-id-card', label: 'Admit Card' }
+  ];
+
+  examLinks.forEach((item) => {
+    const existing = subdir.querySelector(`a[data-page="${item.page}"], a[href="#${item.page}"]`);
+    if (existing) return;
+    const template = subdir.querySelector('a');
+    const link = template ? template.cloneNode(true) : document.createElement('a');
+    link.setAttribute('href', `#${item.page}`);
+    link.setAttribute('data-page', item.page);
+    link.classList.remove('active');
+    const icon = link.querySelector('i');
+    if (icon) icon.className = `fa-solid ${item.icon}`;
+    const labelHost = link.querySelector('span');
+    if (labelHost) {
+      labelHost.textContent = item.label;
+    } else {
+      Array.from(link.childNodes).filter((node) => node.nodeType === 3).forEach((node) => node.remove());
+      link.appendChild(document.createTextNode(` ${item.label}`));
+    }
+    subdir.appendChild(link);
+  });
+
+  return subdir.querySelector('a[data-page="exams-admit-card"], a[href="#exams-admit-card"]');
 }
 
 function updateSidebarSubdirectoryState(hash) {
@@ -20485,9 +20539,7 @@ function openStudentProfile(admissionNo) {
           <button onclick="document.getElementById('studentProfileModal').remove()" style="position:absolute; top:16px; right:16px; background:rgba(255,255,255,0.15); color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer; font-size:1.1rem; display:flex; align-items:center; justify-content:center;">X</button>
           
           <div style="display:flex; gap:20px; align-items:center; flex-wrap:wrap;">
-            <div style="border:3px solid #818cf8; border-radius:50%; box-shadow:0 10px 20px rgba(0,0,0,0.4); overflow:hidden; flex-shrink:0;">
-              ${getStudentDirectoryPhotoHtml(student, 90)}
-            </div>
+            ${getStudentDirectoryPhotoHtml(student, 90)}
             <div>
               <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
                 <h2 style="margin:0; color:#ffffff; font-size:1.5rem; font-weight:800; font-family:var(--font-heading, sans-serif);">${student.name}</h2>

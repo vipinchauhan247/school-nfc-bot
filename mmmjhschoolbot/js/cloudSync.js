@@ -28,6 +28,14 @@
   let versionProbeSupported = true;
   let fallbackPollTicks = 0;
 
+  function normalizeSubjectsList(subjects) {
+    if (Array.isArray(subjects)) return subjects.filter((s) => s && typeof s === 'object');
+    if (subjects && typeof subjects === 'object') {
+      return Object.values(subjects).filter((s) => s && typeof s === 'object' && (s.code || s.name || s.id));
+    }
+    return [];
+  }
+
   function isCloudOnly() {
     // Default ON for MMM JHS. Set window.ERP_CLOUD_ONLY = false only to re-enable hybrid.
     return window.ERP_CLOUD_ONLY !== false;
@@ -437,7 +445,7 @@
       schoolProfile: newerMeta.schoolProfile || olderMeta.schoolProfile,
       signatures: newerMeta.signatures || olderMeta.signatures,
       teachers,
-      subjects: newerMeta.subjects || olderMeta.subjects,
+      subjects: normalizeSubjectsList(newerMeta.subjects || olderMeta.subjects),
       sessions: newerMeta.sessions || olderMeta.sessions,
       classFeeMaster: newerMeta.classFeeMaster || olderMeta.classFeeMaster,
       feeScheduleRules: newerMeta.feeScheduleRules || olderMeta.feeScheduleRules,
@@ -1136,6 +1144,9 @@
       window._erpCloudLastPushError = '';
       window._erpCloudSyncState = 'live';
 
+      if (typeof saveSchoolDataToStorage === 'function') {
+        saveSchoolDataToStorage({ skipCloudPush: true });
+      }
       if (typeof window.saveCloudDisplayCache === 'function' && typeof buildSchoolDataStoragePayload === 'function') {
         try { window.saveCloudDisplayCache(buildSchoolDataStoragePayload()); } catch (e) {}
       }
