@@ -8907,6 +8907,9 @@ function resolveStudentPhotoSrc(student) {
   if (!photo) return '';
   if (photo.startsWith('data:image')) return photo;
   if (/unsplash|placeholder|dicebear|gravatar/i.test(photo)) return '';
+  if (isStudentPhotoAssetPath(photo)) return photo;
+  if (/supabase\.co\/storage\/v1\/object\/public\//i.test(photo)) return photo;
+  if (/^https?:\/\//i.test(photo)) return photo;
   return photo;
 }
 
@@ -9014,7 +9017,7 @@ function openBulkStudentPhotoModal() {
         <div style="background:rgba(139,92,246,0.10); border:1px solid rgba(139,92,246,0.45); border-radius:12px; padding:14px 16px; margin-bottom:18px; font-size:0.86rem; line-height:1.7;">
           <strong style="color:#c084fc;">Name each photo file after the student's admission number.</strong><br>
           Accepted: <code>1813.jpg</code>, <code>1813 Abhimanyu.jpg</code>, <code>adm-1813.png</code>, <code>IMG_1813.jpeg</code>.<br>
-          Photos are saved as website files under <code>assets/students/</code> (low bandwidth). After Save, download the ZIP and copy the <code>students</code> folder into your Vercel Drop <code>assets/students/</code> folder, then upload again.<br>
+          Photos upload to <strong>Supabase Storage</strong> when configured (best — automatic, survives refresh). Otherwise they save as <code>assets/students/</code> files + ZIP download for Vercel Drop.<br>
           Select a whole class at a time rather than all ${(SchoolData.students || []).length} students at once.
         </div>
 
@@ -9118,13 +9121,6 @@ async function applyStagedBulkStudentPhotosAsync(queue) {
   const statusEl = document.getElementById('bulkPhotoStatus');
   const knownCloudAt = String(localStorage.getItem('MMM_ERP_CLOUD_LAST_CLOUD_AT') || '');
 
-  queue.forEach(row => {
-    const assetPath = studentPhotoAssetPath(row.student.admissionNo);
-    row.assetPath = assetPath;
-    row.student.photo = assetPath;
-    row.student.photoDataUrl = assetPath;
-  });
-
   saveSchoolDataToStorage({ skipCloudPush: true });
   window._erpCloudMemoryDirty = true;
 
@@ -9133,39 +9129,73 @@ async function applyStagedBulkStudentPhotosAsync(queue) {
     applyBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving to cloud…';
   }
   if (statusEl) {
-    statusEl.innerHTML = `<div style="color:#c084fc;"><i class="fa-solid fa-cloud-arrow-up fa-beat"></i> Saving ${queue.length} photo link(s) to cloud — please wait…</div>`;
+    statusEl.innerHTML = `<div style="color:#c084fc;"><i class="fa-solid fa-cloud-arrow-up fa-beat"></i> Uploading ${queue.length} photo(s) — please wait…</div>`;
   }
 
   try {
-    let pushResult = null;
-    if (typeof pushStaffAuthorityToCloud === 'function') {
-      pushResult = await pushStaffAuthorityToCloud();
-    } else if (typeof pushSchoolDataToCloud === 'function') {
-      pushResult = await pushSchoolDataToCloud({ skipMergePull: true });
-    } else {
-      throw new Error('Cloud sync is not available on this page.');
+    let savedAt = '';
+    let usedStorage = false;
+
+    if (typeof pushBulkStudentPhotosToSupabaseStorage === 'function') {
+      try {
+        if (statusEl) {
+          statusEl.innerHTML = `<div style="color:#c084fc;"><i class="fa-solid fa-database fa-beat"></i> Uploading ${queue.length} photo(s) to Supabase Storage…</div>`;
+        }
+        const storageResult = await pushBulkStudentPhotosToSupabaseStorage(queue);
+        savedAt = String(storageResult?.savedAt || window._erpCloudLastPushAt || '').trim();
+        usedStorage = true;
+      } catch (storageErr) {
+        console.warn('Supabase Storage upload unavailable, falling back to assets folder:', storageErr);
+      }
     }
 
-    const savedAt = String(pushResult?.savedAt || window._erpCloudLastPushAt || '').trim();
-    if (!pushResult?.ok || !savedAt) {
-      throw new Error('Cloud did not confirm the save. Your server API may need an update.');
+    if (!usedStorage) {
+      queue.forEach(row => {
+        const assetPath = studentPhotoAssetPath(row.student.admissionNo);
+        row.assetPath = assetPath;
+        row.student.photo = assetPath;
+        row.student.photoDataUrl = assetPath;
+      });
+
+      if (statusEl) {
+        statusEl.innerHTML = `<div style="color:#c084fc;"><i class="fa-solid fa-cloud-arrow-up fa-beat"></i> Saving ${queue.length} photo link(s) to cloud…</div>`;
+      }
+
+      let pushResult = null;
+      if (typeof pushStaffAuthorityToCloud === 'function') {
+        pushResult = await pushStaffAuthorityToCloud();
+      } else if (typeof pushSchoolDataToCloud === 'function') {
+        pushResult = await pushSchoolDataToCloud({ skipMergePull: true });
+      } else {
+        throw new Error('Cloud sync is not available on this page.');
+      }
+
+      savedAt = String(pushResult?.savedAt || window._erpCloudLastPushAt || '').trim();
+      if (!pushResult?.ok || !savedAt) {
+        throw new Error('Cloud did not confirm the save. Your server API may need an update.');
+      }
     }
-    if (knownCloudAt && savedAt === knownCloudAt) {
+
+    if (knownCloudAt && savedAt && savedAt === knownCloudAt) {
       throw new Error('Cloud timestamp did not change — photos were not saved. Try again or contact admin.');
     }
 
-    if (statusEl) {
-      statusEl.innerHTML = `<div style="color:#34d399;"><i class="fa-solid fa-file-zipper"></i> Cloud saved. Preparing ZIP download…</div>`;
+    if (usedStorage) {
+      document.getElementById('bulkPhotoModal')?.remove();
+      showNotification(`Saved ${queue.length} photo(s) to Supabase Storage. Refresh is safe — all PCs will see them.`, 'success');
+    } else {
+      if (statusEl) {
+        statusEl.innerHTML = `<div style="color:#34d399;"><i class="fa-solid fa-file-zipper"></i> Cloud saved. Preparing ZIP download…</div>`;
+      }
+      await downloadStudentPhotosAssetZip(queue);
+      document.getElementById('bulkPhotoModal')?.remove();
+      showNotification(
+        `Saved ${queue.length} photo link(s) to cloud. ZIP downloaded — copy the students folder to assets/students/ on your PC and upload to Vercel.`,
+        'success'
+      );
     }
-    await downloadStudentPhotosAssetZip(queue);
 
-    document.getElementById('bulkPhotoModal')?.remove();
-    showNotification(
-      `Saved ${queue.length} photo link(s) to cloud. ZIP downloaded — copy the students folder to assets/students/ on your PC and upload to Vercel.`,
-      'success'
-    );
     window._bulkPhotoQueue = [];
-
     if (String(window.location.hash || '').includes('students')) {
       renderStudentsPage(document.getElementById('contentBody'));
     }

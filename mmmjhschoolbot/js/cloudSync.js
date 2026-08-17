@@ -85,6 +85,10 @@
     return withCloudSecret(`${getErpCloudApiBase()}?action=photoPatch`);
   }
 
+  function cloudPhotoStorageUrl() {
+    return withCloudSecret(`${getErpCloudApiBase()}?action=photoStorageUpload`);
+  }
+
   function cloudHeaders() {
     const headers = { Accept: 'application/json' };
     const secret = getCloudSecret();
@@ -304,6 +308,7 @@
   function isRealStudentPhoto(value) {
     const photo = String(value || '').trim();
     if (photo.startsWith('assets/students/') && /\.(jpe?g|png|webp)$/i.test(photo)) return true;
+    if (/supabase\.co\/storage\/v1\/object\/public\//i.test(photo)) return true;
     if (!photo.startsWith('data:image')) return false;
     if (/unsplash|placeholder|dicebear|gravatar/i.test(photo)) return false;
     return photo.length > 120;
@@ -917,6 +922,81 @@
     return data;
   }
 
+  async function pushStudentPhotoStorageBatchToCloud(photos) {
+    const schoolId = getCloudSchoolId();
+    const savedBy = (typeof getCurrentActiveUser === 'function' && getCurrentActiveUser()?.name) || 'Bulk photo upload';
+    const res = await fetchWithRetry(cloudPhotoStorageUrl(), {
+      method: 'POST',
+      headers: { ...cloudHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ schoolId, photos, savedBy })
+    });
+    const data = await parseCloudResponse(res);
+    if (!data.ok) throw new Error(data.error || 'Photo storage upload failed.');
+    if (!Number(data.patched) || !String(data.savedAt || '').trim() || !data.storage) {
+      throw new Error('Photo storage API is not deployed yet. Create the Supabase bucket and redeploy api/erp-cloud.js.');
+    }
+    return data;
+  }
+
+  /** Option C — upload images to Supabase Storage; cloud roster stores public URLs only. */
+  async function pushBulkStudentPhotosToSupabaseStorage(photoRows) {
+    const rows = Array.isArray(photoRows) ? photoRows.filter(row => row?.student && row?.dataUrl) : [];
+    if (!rows.length) throw new Error('No photos to save.');
+
+    cancelScheduledCloudPush();
+    window._erpCloudMemoryDirty = true;
+    window._erpCloudSyncState = 'syncing';
+
+    const BATCH_SIZE = 25;
+    let patched = 0;
+    let savedAt = '';
+
+    try {
+      for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+        const batch = rows.slice(i, i + BATCH_SIZE).map(row => ({
+          admissionNo: row.student.admissionNo || row.student.AdmissionNo,
+          photo: row.dataUrl,
+          photoDataUrl: row.dataUrl
+        }));
+        const result = await pushStudentPhotoStorageBatchToCloud(batch);
+        const uploaded = Array.isArray(result.uploaded) ? result.uploaded : [];
+        uploaded.forEach((item) => {
+          const key = String(item.admissionNo || '').trim().toLowerCase();
+          const row = rows.find(r => String(r.student?.admissionNo || '').trim().toLowerCase() === key);
+          if (!row || !item.photoUrl) return;
+          row.student.photo = item.photoUrl;
+          row.student.photoDataUrl = item.photoUrl;
+        });
+        patched += Number(result.patched || uploaded.length);
+        savedAt = result.savedAt || savedAt;
+      }
+
+      if (typeof saveSchoolDataToStorage === 'function') {
+        saveSchoolDataToStorage({ skipCloudPush: true });
+      }
+      if (savedAt) {
+        localStorage.setItem(LS_LAST_CLOUD_AT, savedAt);
+        localStorage.setItem(LS_LAST_PULL, savedAt);
+        window._erpCloudLastPushAt = savedAt;
+      }
+      window._erpCloudLastPushCount = patched;
+      window._erpCloudLastPushError = '';
+      window._erpCloudSyncState = 'live';
+
+      if (typeof window.saveCloudDisplayCache === 'function' && typeof buildSchoolDataStoragePayload === 'function') {
+        try { window.saveCloudDisplayCache(buildSchoolDataStoragePayload()); } catch (e) {}
+      }
+
+      return { ok: true, patched, savedAt, storage: true };
+    } catch (err) {
+      window._erpCloudLastPushError = err.message;
+      window._erpCloudSyncState = 'error';
+      throw err;
+    } finally {
+      window._erpCloudMemoryDirty = false;
+    }
+  }
+
   /** Save bulk-uploaded photos in small batches so refresh keeps them. */
   async function pushBulkStudentPhotosToCloud(photoRows) {
     const rows = Array.isArray(photoRows) ? photoRows.filter(row => row?.student && row?.dataUrl) : [];
@@ -1173,6 +1253,7 @@
   window.cancelScheduledCloudPush = cancelScheduledCloudPush;
   window.pushStaffAuthorityToCloud = pushStaffAuthorityToCloud;
   window.pushBulkStudentPhotosToCloud = pushBulkStudentPhotosToCloud;
+  window.pushBulkStudentPhotosToSupabaseStorage = pushBulkStudentPhotosToSupabaseStorage;
   window.flushCloudPushNow = flushCloudPushNow;
   window.getCloudSyncStatusText = getCloudSyncStatusText;
   window.mergeSchoolPayloadsForCloud = mergeSchoolPayloads;

@@ -1338,6 +1338,129 @@ async function handleCloudConfig(req, res) {
   return json(res, 200, cloudConfigBody(req));
 }
 
+function studentPhotoStorageBucket() {
+  return getEnv('ERP_STUDENT_PHOTO_BUCKET') || 'student-photos';
+}
+
+function decodeDataUrlImage(dataUrl) {
+  const match = String(dataUrl || '').match(/^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i);
+  if (!match) return null;
+  const mime = match[1].toLowerCase();
+  const buffer = Buffer.from(match[2], 'base64');
+  if (!buffer.length) return null;
+  let ext = 'jpg';
+  if (mime.includes('png')) ext = 'png';
+  else if (mime.includes('webp')) ext = 'webp';
+  return { buffer, mime, ext };
+}
+
+function studentPhotoStorageObjectPath(schoolId, admissionNo, ext) {
+  return `${schoolId}/${normalizeAdmission(admissionNo)}.${ext || 'jpg'}`;
+}
+
+function studentPhotoPublicUrl(schoolId, admissionNo, ext) {
+  const cfg = supabaseConfig();
+  const bucket = studentPhotoStorageBucket();
+  const objectPath = studentPhotoStorageObjectPath(schoolId, admissionNo, ext);
+  return `${cfg.url}/storage/v1/object/public/${bucket}/${objectPath}`;
+}
+
+async function uploadStudentPhotoToStorage(schoolId, admissionNo, dataUrl) {
+  const cfg = supabaseConfig();
+  if (!cfg) throw new Error('Supabase is not configured on the server.');
+  const decoded = decodeDataUrlImage(dataUrl);
+  if (!decoded) throw new Error(`Invalid image data for admission ${admissionNo}.`);
+  const bucket = studentPhotoStorageBucket();
+  const objectPath = studentPhotoStorageObjectPath(schoolId, admissionNo, decoded.ext);
+  const response = await fetch(`${cfg.url}/storage/v1/object/${bucket}/${objectPath}`, {
+    method: 'POST',
+    headers: {
+      apikey: cfg.key,
+      Authorization: `Bearer ${cfg.key}`,
+      'Content-Type': decoded.mime,
+      'x-upsert': 'true'
+    },
+    body: decoded.buffer
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    let message = text.slice(0, 240);
+    try {
+      const parsed = JSON.parse(text);
+      message = parsed.message || parsed.error || message;
+    } catch (err) {}
+    if (/bucket/i.test(message)) {
+      throw new Error(`Supabase Storage bucket "${bucket}" is missing. Create a public bucket with that exact name (see SUPABASE_PHOTO_STORAGE.md).`);
+    }
+    throw new Error(`Photo upload failed for ${admissionNo}: ${message}`);
+  }
+  return studentPhotoPublicUrl(schoolId, admissionNo, decoded.ext);
+}
+
+/**
+ * Option C — upload JPEG/PNG to Supabase Storage, store public URL in cloud snapshot.
+ * Small JSON requests; images live outside the roster payload.
+ */
+async function handlePhotoStorageUpload(req, res, schoolId) {
+  if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST required.' });
+  const photos = req.body?.photos;
+  if (!Array.isArray(photos) || !photos.length) {
+    return json(res, 400, { ok: false, error: 'POST body must include photos array.' });
+  }
+  if (photos.length > 25) {
+    return json(res, 400, { ok: false, error: 'Maximum 25 photos per request. Upload one class at a time.' });
+  }
+
+  const snapshot = await readSnapshot(schoolId);
+  if (!snapshot?.payload || !Array.isArray(snapshot.payload.students) || !snapshot.payload.students.length) {
+    return json(res, 404, { ok: false, error: 'School cloud roster not found.' });
+  }
+
+  const byAdmission = new Map();
+  snapshot.payload.students.forEach((student) => {
+    const key = normalizeAdmission(student?.admissionNo || student?.AdmissionNo);
+    if (key) byAdmission.set(key, student);
+  });
+
+  const uploaded = [];
+  for (const row of photos) {
+    if (!row || typeof row !== 'object') continue;
+    const key = normalizeAdmission(row.admissionNo || row.AdmissionNo);
+    if (!key) continue;
+    const student = byAdmission.get(key);
+    if (!student) continue;
+    const dataUrl = String(row.photo || row.photoDataUrl || '').trim();
+    if (!dataUrl.startsWith('data:image')) continue;
+    const publicUrl = await uploadStudentPhotoToStorage(schoolId, key, dataUrl);
+    student.photo = publicUrl;
+    student.photoDataUrl = publicUrl;
+    uploaded.push({ admissionNo: key, photoUrl: publicUrl });
+  }
+
+  if (!uploaded.length) {
+    return json(res, 400, { ok: false, error: 'No matching students or valid photo data in this batch.' });
+  }
+
+  const payload = {
+    ...snapshot.payload,
+    savedAt: new Date().toISOString()
+  };
+  const savedBy = String(req.body?.savedBy || 'bulk-photo-storage').trim();
+  const written = await writeSnapshot(schoolId, payload, savedBy);
+  const savedAt = written?.snapshot?.saved_at || payload.savedAt;
+
+  return json(res, 200, {
+    ok: true,
+    configured: true,
+    schoolId,
+    storage: true,
+    patched: uploaded.length,
+    uploaded,
+    savedAt,
+    studentCount: payload.students.length
+  });
+}
+
 /** Patch student passport photos in small batches (avoids Vercel 4.5MB body limit on full roster push). */
 async function handlePhotoPatch(req, res, schoolId) {
   if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST required.' });
@@ -1406,7 +1529,7 @@ async function route(req, res, action) {
     return true;
   }
   if ([
-    'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'photoPatch', 'nativeStudents', 'nativeMigrate', 'nativePayments',
+    'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'photoPatch', 'photoStorageUpload', 'nativeStudents', 'nativeMigrate', 'nativePayments',
     'rebuildSnapshot', 'wipeRoster', 'authLogin', 'authLogout', 'authSession', 'authChangePassword',
     'authAdminResetPassword', 'authAudit', 'tcIssue', 'tcGet', 'tcList', 'tcVerify', 'tcRevoke'
   ].includes(act)) {
@@ -1602,6 +1725,10 @@ async function erpCloudHandler(req, res) {
 
     if (req.method === 'POST' && action === 'photoPatch') {
       return handlePhotoPatch(req, res, schoolId);
+    }
+
+    if (req.method === 'POST' && action === 'photoStorageUpload') {
+      return handlePhotoStorageUpload(req, res, schoolId);
     }
 
     if (req.method === 'POST') {
