@@ -12466,6 +12466,308 @@ function buildReceiptRegisterCsvRows(receipts) {
   return csvRows;
 }
 
+/* ============================================================================
+   LEGACY FEE HISTORY IMPORT (from old ERP / Excel register)
+   ============================================================================ */
+let _parsedFeeHistoryRows = [];
+
+function parseLegacyFeeMonthList(raw) {
+  if (!raw) return [];
+  const monthMap = {
+    apr: 'April', aprl: 'April', april: 'April',
+    may: 'May',
+    jun: 'June', june: 'June',
+    jul: 'July', july: 'July',
+    aug: 'August', august: 'August',
+    sep: 'September', sept: 'September', september: 'September',
+    oct: 'October', october: 'October',
+    nov: 'November', november: 'November',
+    dec: 'December', december: 'December',
+    jan: 'January', january: 'January',
+    feb: 'February', february: 'February',
+    mar: 'March', march: 'March'
+  };
+  return [...new Set(String(raw).split(/[,|;+/]+/).map(part => {
+    const token = part.trim().toLowerCase().replace(/[^a-z]/g, '');
+    if (!token) return '';
+    if (monthMap[token]) return monthMap[token];
+    const hit = SCHOOL_SESSION_MONTHS.find(m => m.toLowerCase().startsWith(token.slice(0, 3)));
+    return hit || '';
+  }).filter(Boolean))];
+}
+
+function parseLegacyFeeAmount(raw) {
+  const n = Number(String(raw ?? '').replace(/[^\d.-]/g, ''));
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+}
+
+function downloadFeeHistoryImportTemplate() {
+  const sample = [
+    ['AdmissionNo', 'PaidMonths', 'PreviousSessionDue', 'ReceiptNo', 'PaymentDate', 'TotalPaid', 'TuitionPaid', 'AnnualPaid', 'ExamPaid', 'PaymentMode', 'Notes'],
+    ['1556', 'April, May, June', '0', 'OLD-1556-APR-JUN', '2026-06-15', '5400', '5400', '2200', '400', 'Cash', 'Imported from old ERP'],
+    ['1556', 'July, August', '0', 'OLD-1556-JUL-AUG', '2026-08-10', '3600', '3600', '', '', 'UPI', 'Second receipt from old ERP'],
+    ['2382', 'April, May, June, July, August', '500', 'OLD-2382-ALL', '2026-08-01', '7500', '7000', '2200', '400', 'Cash', 'Includes previous session due Rs 500']
+  ];
+  downloadCsvFile(`Fee_History_Import_Template_${SchoolData.activeSession}.csv`, sample);
+  showNotification('Downloaded fee history import template CSV.', 'success');
+}
+
+function openFeeHistoryImportModal() {
+  if (!hasUserAccessPermission(getCurrentActiveUser(), 'fee_collection', 'modify')) {
+    showNotification('Access Denied: fee history import needs Fee Collection modify permission.', 'warning');
+    return;
+  }
+  const existing = document.getElementById('feeHistoryImportModal');
+  if (existing) existing.remove();
+  _parsedFeeHistoryRows = [];
+  const currentSession = SchoolData.activeSession;
+
+  document.body.insertAdjacentHTML('beforeend', `
+    <div class="modal-overlay active" id="feeHistoryImportModal" style="z-index:99999;">
+      <div class="modal-box theme-panel-modal keyboard-scroll-panel" tabindex="0" style="max-width:760px; width:calc(100vw - 28px); max-height:calc(100vh - 28px); overflow-y:auto; padding:24px; border-radius:18px; border:2px solid #f59e0b; position:relative;">
+        <button onclick="document.getElementById('feeHistoryImportModal').remove()" style="position:absolute; top:14px; right:16px; background:var(--bg-card); color:var(--text-main); border:1px solid var(--border-color); width:32px; height:32px; border-radius:50%; cursor:pointer;">X</button>
+        <h3 style="margin:0 0 4px 0; color:#f59e0b; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+          <i class="fa-solid fa-file-import"></i> Import Fee History from Old ERP (CSV)
+        </h3>
+        <p class="theme-panel-muted" style="margin:0 0 14px 0; font-size:0.82rem;">Bring paid months, receipts and dues from your previous fee software into session <strong>${currentSession}</strong>. Students must already exist (import students first).</p>
+
+        <div style="background:var(--bg-card); padding:12px 16px; border-radius:10px; border:1px solid var(--border-color); margin-bottom:14px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+          <div style="font-size:0.78rem; color:var(--text-muted);">
+            Columns: <strong>AdmissionNo, PaidMonths, PreviousSessionDue, ReceiptNo, PaymentDate, TotalPaid, TuitionPaid, AnnualPaid, ExamPaid, PaymentMode</strong>
+          </div>
+          <button class="btn btn-secondary" onclick="downloadFeeHistoryImportTemplate()" style="background:#0284c7; color:#fff; border:none; font-weight:700;">
+            <i class="fa-solid fa-download"></i> Download Template
+          </button>
+        </div>
+
+        <div style="border:2px dashed #f59e0b; background:rgba(245,158,11,0.08); padding:18px; border-radius:12px; text-align:center; margin-bottom:14px;">
+          <input type="file" id="feeHistoryCsvInput" accept=".csv" style="display:none;" onchange="handleFeeHistoryCsvFileSelect(event)">
+          <button class="btn btn-primary" onclick="document.getElementById('feeHistoryCsvInput').click()" style="background:linear-gradient(135deg, #f59e0b 0%, #d97706 100%); border:none; font-weight:800;">
+            <i class="fa-solid fa-folder-open"></i> Browse Fee History CSV
+          </button>
+        </div>
+
+        <div id="feeHistoryPreviewBox" style="display:none; margin-bottom:14px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <strong style="color:var(--accent-primary);">Preview</strong>
+            <span class="badge badge-warning" id="feeHistoryCountBadge">0 rows</span>
+          </div>
+          <div class="keyboard-scroll-panel" tabindex="0" style="max-height:220px; overflow:auto; border:1px solid var(--border-color); border-radius:8px;">
+            <table class="data-table" style="font-size:0.75rem; min-width:900px;">
+              <thead><tr><th>Adm</th><th>Name</th><th>Paid Months</th><th>Prev Due</th><th>Receipt</th><th>Total</th><th>Annual</th><th>Exam</th></tr></thead>
+              <tbody id="feeHistoryPreviewBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <label style="display:flex; gap:8px; align-items:flex-start; margin-bottom:12px; font-size:0.78rem; color:var(--text-muted);">
+          <input type="checkbox" id="feeHistoryReplaceExisting">
+          <span><strong style="color:var(--text-main);">Replace existing fee receipts for this session</strong> before import. Leave unchecked to merge/add on top of current ERP receipts.</span>
+        </label>
+
+        <div style="display:flex; justify-content:flex-end; gap:10px;">
+          <button class="btn btn-secondary" onclick="document.getElementById('feeHistoryImportModal').remove()">Cancel</button>
+          <button class="btn btn-primary" id="feeHistoryImportBtn" onclick="importParsedFeeHistoryFromCsv()" disabled style="background:linear-gradient(135deg, #f59e0b 0%, #d97706 100%); border:none; font-weight:800;">
+            <i class="fa-solid fa-file-import"></i> Import Fee History
+          </button>
+        </div>
+      </div>
+    </div>
+  `);
+}
+
+function handleFeeHistoryCsvFileSelect(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const lines = String(e.target.result || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    if (lines.length < 2) {
+      showNotification('Fee history CSV needs a header row and at least one data row.', 'error');
+      return;
+    }
+
+    function parseCsvRow(text) {
+      const result = [];
+      let cur = '';
+      let inQuotes = false;
+      for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (c === '"') inQuotes = !inQuotes;
+        else if (c === ',' && !inQuotes) { result.push(cur.trim().replace(/^"|"$/g, '')); cur = ''; }
+        else cur += c;
+      }
+      result.push(cur.trim().replace(/^"|"$/g, ''));
+      return result;
+    }
+
+    const headers = parseCsvRow(lines[0]).map(h => h.toLowerCase());
+    const idx = (names) => headers.findIndex(h => names.some(n => h.replace(/[^a-z0-9]/g, '') === n.replace(/[^a-z0-9]/g, '')));
+    const admIdx = idx(['admissionno', 'admno', 'admissionnumber']);
+    const monthsIdx = idx(['paidmonths', 'months paid', 'monthspaid', 'paidmonth']);
+    const prevIdx = idx(['previoussessiondue', 'prevsessiondue', 'prevdue', 'olddue']);
+    const receiptIdx = idx(['receiptno', 'receiptnumber', 'legacyreceiptno']);
+    const dateIdx = idx(['paymentdate', 'date', 'receiptdate']);
+    const totalIdx = idx(['totalpaid', 'amountpaid', 'amount', 'total']);
+    const tuitionIdx = idx(['tuitionpaid', 'tuitionamount']);
+    const annualIdx = idx(['annualpaid', 'annualfeepaid', 'annualfee']);
+    const examIdx = idx(['exampaid', 'examfeepaid', 'examfee']);
+    const modeIdx = idx(['paymentmode', 'mode', 'paymode']);
+    const notesIdx = idx(['notes', 'remark', 'description']);
+
+    if (admIdx === -1 || monthsIdx === -1) {
+      showNotification('CSV must include AdmissionNo and PaidMonths columns. Download the template first.', 'error');
+      return;
+    }
+
+    _parsedFeeHistoryRows = [];
+    for (let i = 1; i < lines.length; i++) {
+      const vals = parseCsvRow(lines[i]);
+      const admNo = String(vals[admIdx] || '').trim();
+      const paidMonths = parseLegacyFeeMonthList(vals[monthsIdx]);
+      if (!admNo || !paidMonths.length) continue;
+      _parsedFeeHistoryRows.push({
+        admNo,
+        paidMonths,
+        previousSessionDue: parseLegacyFeeAmount(vals[prevIdx]),
+        receiptNo: String(vals[receiptIdx] || '').trim(),
+        paymentDate: String(vals[dateIdx] || '').trim(),
+        totalPaid: parseLegacyFeeAmount(vals[totalIdx]),
+        tuitionPaid: parseLegacyFeeAmount(vals[tuitionIdx]),
+        annualPaid: parseLegacyFeeAmount(vals[annualIdx]),
+        examPaid: parseLegacyFeeAmount(vals[examIdx]),
+        paymentMode: String(vals[modeIdx] || 'Cash').trim() || 'Cash',
+        notes: String(vals[notesIdx] || '').trim()
+      });
+    }
+
+    if (!_parsedFeeHistoryRows.length) {
+      showNotification('No valid fee history rows found. Check AdmissionNo and PaidMonths.', 'warning');
+      return;
+    }
+
+    const previewBody = document.getElementById('feeHistoryPreviewBody');
+    previewBody.innerHTML = _parsedFeeHistoryRows.slice(0, 40).map(row => {
+      const student = findStudentByAdmissionNo(row.admNo);
+      return `<tr>
+        <td>${escapeHtml(row.admNo)}</td>
+        <td>${escapeHtml(student?.name || 'NOT FOUND')}</td>
+        <td>${escapeHtml(row.paidMonths.join(', '))}</td>
+        <td>${row.previousSessionDue || 0}</td>
+        <td>${escapeHtml(row.receiptNo || 'AUTO')}</td>
+        <td>${row.totalPaid || '-'}</td>
+        <td>${row.annualPaid || '-'}</td>
+        <td>${row.examPaid || '-'}</td>
+      </tr>`;
+    }).join('');
+    document.getElementById('feeHistoryPreviewBox').style.display = 'block';
+    document.getElementById('feeHistoryCountBadge').innerText = `${_parsedFeeHistoryRows.length} row(s)`;
+    document.getElementById('feeHistoryImportBtn').disabled = false;
+    showNotification(`Parsed ${_parsedFeeHistoryRows.length} fee history row(s). Review preview, then Import.`, 'success');
+  };
+  reader.readAsText(file);
+}
+
+function buildLegacyFeePayment(student, row, session) {
+  const monthlyRate = getStudentMonthlyTuitionRate(student, session);
+  const paidCurrentMonths = row.paidMonths.map(month => ({ month, amount: monthlyRate }));
+  const selectedMonthsTotal = row.tuitionPaid || paidCurrentMonths.reduce((sum, item) => sum + Number(item.amount || 0), 0);
+  const paidExtraItems = [];
+  if (row.annualPaid > 0) paidExtraItems.push({ label: 'Annual Charges', amount: row.annualPaid });
+  if (row.examPaid > 0) paidExtraItems.push({ label: 'Exam Fee', amount: row.examPaid });
+  const amount = row.totalPaid || (selectedMonthsTotal + paidExtraItems.reduce((s, i) => s + i.amount, 0));
+  const receiptNo = row.receiptNo || `IMP-${session}-${student.admissionNo}-${row.paidMonths.join('').slice(0, 8)}-${Date.now().toString().slice(-4)}`;
+  let date = row.paymentDate || new Date().toISOString().split('T')[0];
+  if (date.includes('/')) {
+    const parts = date.split('/');
+    if (parts.length === 3) date = `${parts[2].length === 2 ? '20' + parts[2] : parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+  }
+  return {
+    receiptNo,
+    date,
+    time: getNowReceiptTime(),
+    paidAt: new Date(`${date}T12:00:00`).toISOString(),
+    amount,
+    selectedMonthsTotal,
+    extraChargesTotal: paidExtraItems.reduce((s, i) => s + i.amount, 0),
+    paidCurrentMonths,
+    paidPrevMonths: [],
+    paidExtraItems,
+    walletApplied: 0,
+    excessSaved: 0,
+    partialDueCarried: 0,
+    month: `Imported (${session}): ${row.paidMonths.join(', ')}${paidExtraItems.length ? ' | ' + paidExtraItems.map(i => `${i.label} Rs${i.amount}`).join(', ') : ''}${row.notes ? ' | ' + row.notes : ''}`,
+    mode: row.paymentMode || 'Cash',
+    studentName: student.name,
+    admissionNo: student.admissionNo,
+    importedFromLegacy: true
+  };
+}
+
+function importParsedFeeHistoryFromCsv() {
+  if (!_parsedFeeHistoryRows.length) return;
+  const session = SchoolData.activeSession;
+  const replaceExisting = document.getElementById('feeHistoryReplaceExisting')?.checked === true;
+  const grouped = new Map();
+
+  _parsedFeeHistoryRows.forEach(row => {
+    const key = normalizeAdmissionLookup(row.admNo);
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(row);
+  });
+
+  let updatedStudents = 0;
+  let importedReceipts = 0;
+  let missingStudents = 0;
+  const missingList = [];
+
+  grouped.forEach((rows, admKey) => {
+    const student = findStudentByAdmissionNo(admKey);
+    if (!student) {
+      missingStudents += rows.length;
+      missingList.push(admKey);
+      return;
+    }
+    if (!student.feeRecords) student.feeRecords = {};
+    if (!student.feeRecords[session]) {
+      student.feeRecords[session] = {
+        monthlyTuition: getStudentMonthlyTuitionRate(student, session),
+        paidMonths: [],
+        dueMonths: [...SCHOOL_SESSION_MONTHS],
+        payments: []
+      };
+    }
+    if (replaceExisting) {
+      student.feeRecords[session].payments = [];
+    }
+    let maxPrevDue = Number(student.feeRecords[session].previousSessionDue || student.currentFeeInfo?.previousSessionDue || 0);
+    rows.forEach(row => {
+      const payment = buildLegacyFeePayment(student, row, session);
+      const exists = (student.feeRecords[session].payments || []).some(p => p.receiptNo === payment.receiptNo);
+      if (!exists) {
+        student.feeRecords[session].payments.push(payment);
+        importedReceipts++;
+      }
+      if (row.previousSessionDue > maxPrevDue) maxPrevDue = row.previousSessionDue;
+    });
+    student.feeRecords[session].previousSessionDue = maxPrevDue;
+    normalizeFeeRecordFromReceipts(student, session);
+    updatedStudents++;
+  });
+
+  saveSchoolDataToStorage();
+  if (typeof flushCloudPushNow === 'function') flushCloudPushNow();
+  else if (typeof pushSchoolDataToCloud === 'function') pushSchoolDataToCloud().catch(() => {});
+
+  document.getElementById('feeHistoryImportModal')?.remove();
+  _parsedFeeHistoryRows = [];
+  showNotification(
+    `Fee history import done: ${updatedStudents} student(s), ${importedReceipts} receipt(s) added.${missingStudents ? ` ${missingStudents} row(s) skipped — admission not found (${missingList.slice(0, 5).join(', ')}${missingList.length > 5 ? '...' : ''}).` : ''}`,
+    missingStudents ? 'warning' : 'success'
+  );
+  if (window.location.hash.includes('fees')) renderFeesPage(document.getElementById('contentBody'));
+}
+
 function openClassFeeMasterModal() {
   const existing = document.getElementById('classFeeMasterModal');
   if (existing) existing.remove();
@@ -12957,6 +13259,9 @@ function renderFeesPage(container) {
         <button class="btn btn-primary" style="background:linear-gradient(135deg, #10b981 0%, #059669 100%); color:#ffffff; border:none; font-weight:800; padding:10px 18px; display:flex; align-items:center; gap:8px;" onclick="openQuickFeeSelectModal()"><i class="fa-solid fa-indian-rupee-sign"></i> Collect Fee Now</button>
         <button class="btn btn-secondary" style="background:#0284c7; color:#ffffff; border:none; font-weight:800; padding:10px 18px;" onclick="window.location.hash='receipts'"><i class="fa-solid fa-file-invoice-dollar"></i> Fee Receipts Ledger</button>
         <button class="btn btn-secondary" onclick="openClassFeeMasterModal()"><i class="fa-solid fa-sliders"></i> Master Fee Configurator</button>
+        <button class="btn btn-secondary" onclick="openFeeHistoryImportModal()" style="background:#d97706; color:#ffffff; border:none; font-weight:800; padding:10px 18px;" title="Import paid months and receipts from your old ERP Excel/CSV">
+          <i class="fa-solid fa-file-import"></i> Import Old ERP Fees
+        </button>
         <button class="btn btn-telegram" onclick="triggerBulkFeeReminder()"><i class="fa-solid fa-paper-plane"></i> Bulk Reminders</button>
         <button class="btn btn-secondary" style="background:#0f766e; color:#ffffff; border:none; font-weight:800; padding:10px 18px;" onclick="syncStudentFeesToGoogleSheet()" title="Push fee due columns to Google Sheet Students tab for /fees bot command"><i class="fa-solid fa-cloud-arrow-up"></i> Sync Fees → Sheet</button>
         <button class="btn btn-secondary" style="background:#475569; color:#ffffff; border:none; font-weight:800; padding:10px 14px;" onclick="syncStudentFeesToGoogleSheet({ dryRun: true })" title="Preview only — does not write to sheet"><i class="fa-solid fa-eye"></i> Preview</button>
