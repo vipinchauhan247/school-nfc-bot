@@ -9136,8 +9136,8 @@ function openBulkStudentCsvModal() {
             </label>
           </div>
           <label style="display:flex; gap:8px; align-items:center; margin-top:10px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.45); border-radius:8px; padding:9px; color:#fde68a;">
-            <input type="checkbox" id="addMissingStudentsOnCsvImport" onchange="updateCsvImportPreviewStats()">
-            <span>Add CSV admission numbers that are not already in ERP as new students</span>
+            <input type="checkbox" id="addMissingStudentsOnCsvImport" onchange="updateCsvImportPreviewStats()" ${!(SchoolData.students || []).length ? 'checked' : ''}>
+            <span>Add CSV admission numbers that are not already in ERP as new students${!(SchoolData.students || []).length ? ' <strong>(required — student list is empty)</strong>' : ''}</span>
           </label>
         </div>
 
@@ -9623,7 +9623,14 @@ function importParsedStudentsFromCsv() {
   if (modal) modal.remove();
 
   const modeText = importMode === 'fillBlanks' ? 'filled blank ERP fields only' : 'replaced ERP fields using non-blank CSV values';
-  showNotification(`Import complete: ${updatedExistingContactFields} existing record(s) ${modeText}. ${addedCount} new student(s) added. ${skippedNewAdmissionNumbers} unmatched CSV row(s) skipped.`, 'success');
+  const summary = `Import complete: ${updatedExistingContactFields} existing record(s) ${modeText}. ${addedCount} new student(s) added. ${skippedNewAdmissionNumbers} unmatched CSV row(s) skipped.`;
+  if (addedCount === 0 && skippedNewAdmissionNumbers > 0 && !addMissingStudents) {
+    showNotification(`${summary} Turn on "Add CSV admission numbers… as new students" when the list is empty or admission numbers are new.`, 'warning');
+  } else if (addedCount === 0 && updatedExistingContactFields === 0 && skippedNewAdmissionNumbers === 0) {
+    showNotification('Import finished but no rows were applied. Check CSV columns and admission numbers.', 'warning');
+  } else {
+    showNotification(summary, addedCount || updatedExistingContactFields ? 'success' : 'warning');
+  }
   _parsedBulkStudents = [];
 
   const mainContent = document.getElementById('contentBody');
