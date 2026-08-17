@@ -2313,6 +2313,7 @@ function renderLoginPage(container) {
         <section class="login-panel">
           <h2>Welcome back</h2>
           <p class="login-sub">Sign in with your own staff username and password. Ask Super Admin if you do not have an account.</p>
+          ${!(SchoolData.staffUsers || []).length ? `<div style="background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.45); color:#fecaca; padding:12px 14px; border-radius:10px; margin-bottom:14px; font-size:0.84rem; line-height:1.6;"><strong>No staff logins in cloud.</strong> Contact admin to restore staff accounts in User Management / cloud snapshot.</div>` : ''}
           <form class="login-form" onsubmit="event.preventDefault(); submitDirectLoginForm();">
             <div class="login-field">
               <label for="loginUsernameInput">Username</label>
