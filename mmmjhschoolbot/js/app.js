@@ -208,6 +208,25 @@ function applySchoolProfileToShell() {
   if (nameEl) nameEl.textContent = profile.shortName;
   if (taglineEl) taglineEl.textContent = profile.address;
   document.title = `${profile.name} ERP | School Management System`;
+  applyWebsiteFavicon();
+}
+
+/** Browser tab icon — uses uploaded school logo, same source as printed documents. */
+function applyWebsiteFavicon() {
+  const logo = getPrintLogoSource();
+  if (!logo) return;
+
+  const mime = logo.startsWith('data:') ? (logo.match(/^data:([^;]+)/)?.[1] || 'image/png') : 'image/png';
+  ['icon', 'shortcut icon', 'apple-touch-icon'].forEach(rel => {
+    let link = document.querySelector(`link[rel="${rel}"]`);
+    if (!link) {
+      link = document.createElement('link');
+      link.rel = rel;
+      document.head.appendChild(link);
+    }
+    link.type = mime;
+    link.href = logo;
+  });
 }
 
 function getClassTeacherForStudent(student) {
@@ -4595,9 +4614,9 @@ function buildAdmitCardHtml(student, term, schedule, options = {}) {
  * 4-per-A4 was tried and dropped: a 6-subject date sheet does not fit in 67mm.
  */
 const ADMIT_CARD_LAYOUTS = {
-  2: { page: 'A4 portrait', margin: '8mm', height: '136mm', gap: '6mm', scale: 1, maxRows: 12, label: '2 per A4 (A5 size each)' },
-  3: { page: 'A4 portrait', margin: '8mm', height: '89mm', gap: '5mm', scale: 0.84, maxRows: 7, label: '3 per A4 (saves paper)' },
-  a5: { page: 'A5 portrait', margin: '6mm', height: '196mm', gap: '0mm', scale: 1.05, maxRows: 16, label: '1 per A5 sheet' }
+  2: { page: 'A4 portrait', margin: '7mm', minHeight: '0', gap: '6mm', scale: 1.22, maxRows: 10, label: '2 per A4 (large print)' },
+  3: { page: 'A4 portrait', margin: '7mm', minHeight: '0', gap: '5mm', scale: 1.02, maxRows: 7, label: '3 per A4 (compact)' },
+  a5: { page: 'A5 portrait', margin: '6mm', minHeight: '0', gap: '0mm', scale: 1.18, maxRows: 14, label: '1 per A5 sheet (large)' }
 };
 
 function getAdmitCardLayout(perPage) {
@@ -4615,46 +4634,45 @@ function getAdmitCardPrintStyles(perPage = 2) {
     * { box-sizing: border-box; }
     body { font-family: 'Inter', Arial, sans-serif; margin:0; background:#fff; color:#0f172a;
       -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
-    .admit-card { border:1.5px solid #0f172a; border-radius:5px; padding:${px(9)} ${px(11)};
-      margin-bottom:${L.gap}; height:${L.height}; display:flex; flex-direction:column;
-      page-break-inside:avoid; break-inside:avoid; overflow:hidden; }
+    .admit-card { border:2px solid #0f172a; border-radius:6px; padding:${px(12)} ${px(14)};
+      margin-bottom:${L.gap}; min-height:${L.minHeight === '0' ? 'auto' : L.minHeight}; display:flex; flex-direction:column;
+      page-break-inside:avoid; break-inside:avoid; }
     .admit-card:nth-child(${perSheet}n) { margin-bottom:0; page-break-after:always; break-after:page; }
     .admit-card:last-child { page-break-after:auto; break-after:auto; }
 
-    .ac-head { display:flex; align-items:center; gap:${px(10)}; border-bottom:1.5px solid #0f172a; padding-bottom:${px(5)}; }
-    /* Logo prints clean: no plate, no border, no rounding */
-    .ac-logo { width:${px(52)}; height:${px(52)}; object-fit:contain; background:none !important;
-      border:0 !important; border-radius:0 !important; padding:0 !important; box-shadow:none !important; }
+    .ac-head { display:flex; align-items:center; gap:${px(12)}; border-bottom:2px solid #0f172a; padding-bottom:${px(8)}; }
+    .ac-logo { width:${px(68)}; height:${px(68)}; object-fit:contain; background:none !important;
+      border:0 !important; border-radius:0 !important; padding:0 !important; box-shadow:none !important; flex-shrink:0; }
     .ac-school { text-align:center; flex:1; }
-    .ac-school h1 { margin:0; font-size:${px(15)}; letter-spacing:.3px; text-transform:uppercase; line-height:1.15; }
-    .ac-school p { margin:1px 0 ${px(3)}; font-size:${px(9.5)}; color:#475569; }
-    .ac-school h2 { margin:0; font-size:${px(11.5)}; background:#0f172a; color:#fff; display:inline-block;
-      padding:${px(2)} ${px(11)}; border-radius:3px; letter-spacing:.5px; }
+    .ac-school h1 { margin:0; font-size:${px(22)}; font-weight:900; letter-spacing:.4px; text-transform:uppercase; line-height:1.12; color:#0f172a; }
+    .ac-school p { margin:2px 0 ${px(5)}; font-size:${px(11.5)}; color:#334155; font-weight:600; line-height:1.25; }
+    .ac-school h2 { margin:0; font-size:${px(14.5)}; font-weight:800; background:#0f172a; color:#fff; display:inline-block;
+      padding:${px(4)} ${px(14)}; border-radius:4px; letter-spacing:.6px; }
 
-    .ac-body { display:flex; gap:${px(8)}; align-items:stretch; margin-top:${px(7)}; }
+    .ac-body { display:flex; gap:${px(10)}; align-items:stretch; margin-top:${px(9)}; }
     .ac-info { flex:1; border-collapse:collapse; }
-    .ac-info td { border:1px solid #cbd5e1; padding:${px(3.5)} ${px(7)}; width:50%; }
-    .ac-info span { display:block; font-size:${px(8)}; text-transform:uppercase; color:#64748b; letter-spacing:.4px; }
-    .ac-info strong { font-size:${px(11)}; }
-    .ac-photo { width:${(26 * s).toFixed(1)}mm; border:1px solid #94a3b8; border-radius:3px; display:flex;
-      align-items:center; justify-content:center; overflow:hidden; background:#f8fafc; }
+    .ac-info td { border:1.5px solid #64748b; padding:${px(6)} ${px(9)}; width:50%; vertical-align:top; }
+    .ac-info span { display:block; font-size:${px(10)}; text-transform:uppercase; color:#475569; letter-spacing:.5px; font-weight:700; margin-bottom:2px; }
+    .ac-info strong { font-size:${px(14.5)}; font-weight:800; color:#0f172a; line-height:1.2; }
+    .ac-photo { width:${(32 * s).toFixed(1)}mm; min-height:${(38 * s).toFixed(1)}mm; border:1.5px solid #64748b; border-radius:4px; display:flex;
+      align-items:center; justify-content:center; overflow:hidden; background:#f8fafc; flex-shrink:0; }
     .ac-photo img { width:100%; height:100%; object-fit:cover; }
-    .ac-photo span { font-size:${px(7.5)}; color:#64748b; text-align:center; line-height:1.4; letter-spacing:.3px; }
+    .ac-photo span { font-size:${px(10)}; color:#64748b; text-align:center; line-height:1.4; letter-spacing:.3px; font-weight:700; }
 
-    .ac-section-title { margin:${px(7)} 0 ${px(3)}; font-size:${px(10)}; font-weight:800; text-transform:uppercase;
-      letter-spacing:.6px; border-left:3px solid #0f172a; padding-left:${px(6)}; }
+    .ac-section-title { margin:${px(9)} 0 ${px(4)}; font-size:${px(12.5)}; font-weight:900; text-transform:uppercase;
+      letter-spacing:.7px; border-left:4px solid #0f172a; padding-left:${px(8)}; color:#0f172a; }
     .ac-sched { width:100%; border-collapse:collapse; }
-    .ac-sched th { background:#e2e8f0; border:1px solid #94a3b8; padding:${px(2.5)} ${px(4)}; font-size:${px(9)}; text-transform:uppercase; }
-    .ac-sched td { border:1px solid #cbd5e1; padding:${px(2.5)} ${px(4)}; font-size:${px(10)}; }
+    .ac-sched th { background:#e2e8f0; border:1.5px solid #64748b; padding:${px(5)} ${px(6)}; font-size:${px(11)}; font-weight:800; text-transform:uppercase; }
+    .ac-sched td { border:1.5px solid #94a3b8; padding:${px(5)} ${px(6)}; font-size:${px(12.5)}; font-weight:600; }
 
-    /* Instructions and signatures share one row so signatures never clip on dense layouts */
-    .ac-foot { margin-top:auto; padding-top:${px(5)}; display:flex; gap:${px(10)}; align-items:flex-end; }
-    .ac-rules { flex:1; font-size:${px(8)}; color:#334155; line-height:1.35; }
-    .ac-sign { display:flex; gap:${px(10)}; flex:0 0 auto; }
-    .ac-sign-box { width:${px(86)}; text-align:center; }
-    .ac-sign-line { height:${px(17)}; border-bottom:1px solid #0f172a; }
-    .ac-sign-img { height:${px(19)}; object-fit:contain; display:block; margin:0 auto; }
-    .ac-sign-box span { font-size:${px(8)}; font-weight:700; display:block; margin-top:1px; }
+    .ac-foot { margin-top:${px(8)}; padding-top:${px(6)}; border-top:1px solid #cbd5e1; display:flex; gap:${px(12)}; align-items:flex-end; }
+    .ac-rules { flex:1; font-size:${px(10.5)}; color:#1e293b; line-height:1.45; font-weight:600; }
+    .ac-rules strong { font-size:${px(11.5)}; }
+    .ac-sign { display:flex; gap:${px(14)}; flex:0 0 auto; }
+    .ac-sign-box { width:${px(98)}; text-align:center; }
+    .ac-sign-line { height:${px(22)}; border-bottom:1.5px solid #0f172a; }
+    .ac-sign-img { height:${px(24)}; object-fit:contain; display:block; margin:0 auto; }
+    .ac-sign-box span { font-size:${px(10.5)}; font-weight:800; display:block; margin-top:3px; }
   `;
 }
 
@@ -4675,7 +4693,8 @@ function openAdmitCardPrintWindow(cardsHtml, title, perPage = 2) {
     <!DOCTYPE html>
     <html>
       <head>
-        <title>${title}</title>
+        <title>${escapeHtml(getSchoolProfile().shortName || 'Admit Card')} — ${title}</title>
+        <link rel="icon" href="${getPrintLogoSource()}">
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
         <style>${getAdmitCardPrintStyles(perPage)}</style>
       </head>
@@ -9045,9 +9064,73 @@ function applyStagedBulkStudentPhotos() {
   }
 }
 
+function canCurrentUserReactivateStudents() {
+  const role = String(getCurrentActiveUser()?.role || '').toLowerCase().trim();
+  return role.includes('super admin') || role.includes('principal');
+}
+
+/** Return a left/inactive student to the active roster for the current session. */
+function reactivateInactiveStudent(admissionNo) {
+  if (!canCurrentUserReactivateStudents()) {
+    showNotification('Only Super Admin or Principal can bring back inactive students.', 'warning');
+    return;
+  }
+
+  const student = findStudentByAdmissionNo(admissionNo);
+  if (!student) {
+    showNotification('Student record not found in this device roster.', 'error');
+    return;
+  }
+  if (isStudentActiveForRoster(student)) {
+    showNotification(`${student.name} is already active in the roster.`, 'info');
+    return;
+  }
+
+  const session = SchoolData.activeSession || '2026-27';
+  const cls = student.currentClass || student.class || 'Class 5';
+  const sec = student.currentSection || student.section || 'A';
+  const hadTc = !!(student.tcCertificateNo || student.tcNo);
+
+  let confirmMsg = `Bring back ${student.name} (Adm ${student.admissionNo}) to the active roster?\n\nThey will reappear in class lists, attendance, fees, exams and admit cards for Session ${session} (${cls} - ${sec}).`;
+  if (hadTc) {
+    confirmMsg += `\n\nNote: An issued TC (${student.tcCertificateNo || student.tcNo}) stays on the permanent cloud register. Reactivating does not cancel it.`;
+  }
+  if (!window.confirm(confirmMsg)) return;
+
+  student.status = 'Active';
+  delete student.leftAt;
+  if (!student.sessionDetails) student.sessionDetails = {};
+  if (!student.sessionDetails[session]) {
+    student.sessionDetails[session] = {
+      class: cls,
+      section: sec,
+      rollNo: student.currentRollNo || student.rollNo || '',
+      status: 'Active'
+    };
+  } else {
+    student.sessionDetails[session].status = 'Active';
+    if (!student.sessionDetails[session].class) student.sessionDetails[session].class = cls;
+    if (!student.sessionDetails[session].section) student.sessionDetails[session].section = sec;
+  }
+
+  saveSchoolDataToStorage({ skipCloudPush: true });
+  if (typeof flushCloudPushNow === 'function') flushCloudPushNow();
+  else if (typeof pushSchoolDataToCloud === 'function') {
+    pushSchoolDataToCloud({ skipMergePull: true }).catch(err => console.warn('Reactivate cloud sync failed:', err));
+  }
+
+  showNotification(`${student.name} is active again in Session ${session}.`, 'success');
+  if (String(window.location.hash || '').includes('left-students')) {
+    renderLeftStudentsPage(document.getElementById('contentBody'));
+  } else if (String(window.location.hash || '').includes('tc-register')) {
+    loadTcRegisterIntoPage();
+  }
+}
+
 function renderLeftStudentsPage(container) {
   const students = getLeftStudents();
   const currentSession = SchoolData.activeSession || '2026-27';
+  const canReactivate = canCurrentUserReactivateStudents();
   container.innerHTML = `
     <div class="page-header">
       <div>
@@ -9081,6 +9164,7 @@ function renderLeftStudentsPage(container) {
                   <td>${tcNo ? `<strong>${escapeHtml(tcNo)}</strong><br>` : ''}<small>${student.leftAt ? formatErpDateTime(student.leftAt) : 'Historical record'}</small><br><small>${escapeHtml(student.leftReason || '')}</small></td>
                   <td>${dueAmount > 0 ? `<span class="badge badge-danger">Due: Rs ${dueAmount.toLocaleString('en-IN')}</span>` : '<span class="badge badge-success">No recorded due</span>'}</td>
                   <td><div style="display:flex; gap:6px; flex-wrap:wrap;">
+                    ${canReactivate ? `<button class="btn btn-primary" style="padding:5px 9px; background:linear-gradient(135deg,#10b981,#059669); border:none;" onclick="reactivateInactiveStudent('${student.admissionNo}')" title="Return to active roster"><i class="fa-solid fa-user-check"></i> Bring Back</button>` : ''}
                     <button class="btn btn-secondary" style="padding:5px 9px;" onclick="openStudentProfile('${student.admissionNo}')"><i class="fa-solid fa-eye"></i> Profile</button>
                     <button class="btn btn-secondary" style="padding:5px 9px; color:#34d399;" onclick="openCollectFeeModal('${student.admissionNo}')"><i class="fa-solid fa-receipt"></i> Fees</button>
                     <button class="btn btn-primary" style="padding:5px 9px;" onclick="reprintIssuedTransferCertificate('${student.admissionNo}')"><i class="fa-solid fa-qrcode"></i> Issued TC</button>
@@ -9201,8 +9285,8 @@ async function loadTcRegisterIntoPage() {
     return;
   }
 
-  const rosterAdmissions = new Set((SchoolData.students || []).map(s => normalizeAdmissionLookup(s.admissionNo)));
   const revokedCount = certificates.filter(c => String(c.status || '').toLowerCase() !== 'valid').length;
+  const canReactivate = canCurrentUserReactivateStudents();
 
   host.innerHTML = `
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; gap:12px; flex-wrap:wrap;">
@@ -9236,7 +9320,9 @@ async function loadTcRegisterIntoPage() {
             const session = getTcSnapshotField(c, 'academic_session', 'academicSession');
             const issuedBy = getTcSnapshotField(c, 'issued_by_name', 'issuedByName') || '—';
             const isValid = String(c.status || 'valid').toLowerCase() === 'valid';
-            const inRoster = rosterAdmissions.has(normalizeAdmissionLookup(adm));
+            const rosterStudent = findStudentByAdmissionNo(adm);
+            const inRoster = !!rosterStudent;
+            const isLeft = rosterStudent && !isStudentActiveForRoster(rosterStudent);
             const searchable = `${name} ${adm} ${certNo}`.toLowerCase();
             return `
               <tr class="tc-register-row" data-search="${escapeHtml(searchable)}">
@@ -9244,7 +9330,8 @@ async function loadTcRegisterIntoPage() {
                 <td>
                   <strong>${escapeHtml(name)}</strong>
                   ${cls ? `<br><small style="color:var(--text-muted);">${escapeHtml(cls)}${sec ? ` - ${escapeHtml(sec)}` : ''}</small>` : ''}
-                  ${inRoster ? '' : '<br><span class="badge badge-warning" style="font-size:0.68rem;">not in current roster</span>'}
+                  ${!inRoster ? '<br><span class="badge badge-warning" style="font-size:0.68rem;">student record missing from roster</span>' : ''}
+                  ${isLeft ? '<br><span class="badge badge-warning" style="font-size:0.68rem;">left / inactive — can be brought back</span>' : ''}
                 </td>
                 <td><span class="adm-no-chip">${escapeHtml(adm)}</span></td>
                 <td>${escapeHtml(session)}</td>
@@ -9254,9 +9341,12 @@ async function loadTcRegisterIntoPage() {
                   ? '<span class="badge badge-success">Valid</span>'
                   : `<span class="badge badge-danger">Revoked</span>${c.revoked_at ? `<br><small>${escapeHtml(formatErpDateTime(c.revoked_at))}</small>` : ''}`}</td>
                 <td style="text-align:center;">
-                  <button class="btn btn-primary" style="padding:5px 10px; font-size:0.75rem;" onclick="reprintIssuedTransferCertificate('${escapeHtml(adm)}')">
-                    <i class="fa-solid fa-print"></i> Reprint
-                  </button>
+                  <div style="display:flex; gap:6px; justify-content:center; flex-wrap:wrap;">
+                    ${isLeft && canReactivate ? `<button class="btn btn-primary" style="padding:5px 10px; font-size:0.75rem; background:linear-gradient(135deg,#10b981,#059669); border:none;" onclick="reactivateInactiveStudent('${escapeHtml(adm)}')"><i class="fa-solid fa-user-check"></i> Bring Back</button>` : ''}
+                    <button class="btn btn-primary" style="padding:5px 10px; font-size:0.75rem;" onclick="reprintIssuedTransferCertificate('${escapeHtml(adm)}')">
+                      <i class="fa-solid fa-print"></i> Reprint
+                    </button>
+                  </div>
                 </td>
               </tr>`;
           }).join('')}
@@ -20059,6 +20149,8 @@ function openStudentProfile(admissionNo) {
   const totalLogs = Object.keys(attLogs).length;
   const presentCount = Object.values(attLogs).filter(l => l.status === 'Present').length;
   const attPercentage = totalLogs > 0 ? Math.round((presentCount / totalLogs) * 100) : null;
+  const isInactive = !isStudentActiveForRoster(student);
+  const canReactivate = canCurrentUserReactivateStudents();
 
   const modalHtml = `
     <div class="modal-overlay active" id="studentProfileModal" style="z-index:99999; backdrop-filter:blur(8px);">
@@ -20075,6 +20167,8 @@ function openStudentProfile(admissionNo) {
                 <h2 style="margin:0; color:#ffffff; font-size:1.5rem; font-weight:800; font-family:var(--font-heading, sans-serif);">${student.name}</h2>
                 <span class="adm-no-chip profile-header-adm">Adm ${student.admissionNo}</span>
                 <span style="background:#059669; color:#ffffff; padding:3px 10px; border-radius:12px; font-size:0.75rem; font-weight:700;">Roll No: ${rollNo}</span>
+                ${isInactive ? `<span style="background:#f59e0b; color:#0f172a; padding:3px 10px; border-radius:12px; font-size:0.75rem; font-weight:800;">Left / Inactive</span>` : ''}
+                ${isInactive && canReactivate ? `<button class="btn btn-primary" style="padding:4px 12px; font-size:0.75rem; background:linear-gradient(135deg,#10b981,#059669); border:none;" onclick="document.getElementById('studentProfileModal').remove(); reactivateInactiveStudent('${student.admissionNo}');"><i class="fa-solid fa-user-check"></i> Bring Back to Active</button>` : ''}
               </div>
               
               <div style="margin-top:6px; color:#c7d2fe; font-size:0.88rem; display:flex; gap:16px; flex-wrap:wrap;">
