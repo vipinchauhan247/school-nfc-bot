@@ -1876,6 +1876,7 @@ function handleRouting() {
       case 'nfc': renderNfcPage(container); break;
       case 'students': renderStudentsPage(container); break;
       case 'left-students': renderLeftStudentsPage(container); break;
+      case 'tc-register': renderTcRegisterPage(container); break;
       case 'admissions': renderAdmissionsPage(container); break;
       case 'attendance': renderAttendancePage(container); break;
       case 'fees': renderFeesPage(container); break;
@@ -1948,6 +1949,8 @@ function handleRouting() {
 }
 
 function setupNavigation() {
+  ensureExamsAdmitCardNavLink();
+
   const mobileMenuBtn = document.getElementById('mobileMenuBtn');
   const closeSidebarBtn = document.getElementById('closeSidebarBtn');
   const sidebarOverlay = document.getElementById('sidebarOverlay');
@@ -2376,10 +2379,7 @@ function renderDashboard(container) {
   
   let totalDues = 0;
   students.forEach(s => {
-    const feeInfo = s.currentFeeInfo;
-    if (feeInfo && feeInfo.dueMonths) {
-      totalDues += (feeInfo.dueMonths.length * getStudentMonthlyTuitionRate(s)) + (feeInfo.previousSessionDue || 0);
-    }
+    totalDues += getStudentTotalDueAmount(s);
   });
 
   const activeUser = getCurrentActiveUser();
@@ -8789,8 +8789,7 @@ function renderStudentsPage(container) {
           </thead>
           <tbody>
             ${students.map(s => {
-              const fee = s.currentFeeInfo;
-              const dueAmount = (fee.dueMonths.length * getStudentMonthlyTuitionRate(s)) + (fee.previousSessionDue || 0);
+              const dueAmount = getStudentTotalDueAmount(s);
 
               return `
                 <tr class="student-dir-row" data-name="${s.name.toLowerCase()}" data-adm="${s.admissionNo}" data-class="${s.currentClass}">
@@ -8863,21 +8862,23 @@ function renderLeftStudentsPage(container) {
         <h2 class="page-title"><i class="fa-solid fa-user-clock" style="color:#f59e0b"></i> Left / Inactive Students</h2>
         <p class="page-subtitle">Historical records remain in the cloud. Fees, receipts, marks, report cards and issued TCs are preserved.</p>
       </div>
-      <button class="btn btn-primary" onclick="window.location.hash='students'"><i class="fa-solid fa-users"></i> Active Students</button>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" style="background:#0284c7; color:#fff; border:none; font-weight:800;" onclick="window.location.hash='tc-register'"><i class="fa-solid fa-file-shield"></i> TC Register (Cloud)</button>
+        <button class="btn btn-primary" onclick="window.location.hash='students'"><i class="fa-solid fa-users"></i> Active Students</button>
+      </div>
     </div>
     <div class="glass-card">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; gap:12px; flex-wrap:wrap;">
         <input type="text" id="leftStudentSearchInput" placeholder="Search name, admission or certificate no…" class="session-dropdown" style="width:340px;" onkeyup="filterLeftStudentsTable()">
         <span class="badge badge-warning">${students.length} left / inactive record${students.length === 1 ? '' : 's'}</span>
       </div>
+      <div id="leftStudentsCloudTcNotice" style="margin-bottom:14px;"></div>
       <div class="data-table-container">
         <table class="data-table" id="leftStudentsTable">
           <thead><tr><th>Student</th><th>Admission</th><th>Last Class</th><th>Left / TC Details</th><th>Fee Record</th><th>Actions</th></tr></thead>
           <tbody>
             ${students.length ? students.map(student => {
-              const fee = student.currentFeeInfo || {};
-              const dueMonths = Array.isArray(fee.dueMonths) ? fee.dueMonths : [];
-              const dueAmount = (dueMonths.length * getStudentMonthlyTuitionRate(student)) + Number(fee.previousSessionDue || 0) + Number(student.partialDue || 0);
+              const dueAmount = getStudentTotalDueAmount(student);
               const tcNo = student.tcCertificateNo || student.tcNo || '';
               const searchable = `${student.name || ''} ${student.admissionNo || ''} ${tcNo}`.toLowerCase();
               return `
@@ -8898,11 +8899,183 @@ function renderLeftStudentsPage(container) {
         </table>
       </div>
     </div>`;
+
+  flagCloudTcHoldersMissingFromRoster();
 }
 
 function filterLeftStudentsTable() {
   const query = String(document.getElementById('leftStudentSearchInput')?.value || '').trim().toLowerCase();
   document.querySelectorAll('#leftStudentsTable .left-student-row').forEach(row => {
+    row.style.display = !query || String(row.getAttribute('data-search') || '').includes(query) ? '' : 'none';
+  });
+}
+
+/* ============================================================================
+   TRANSFER CERTIFICATE REGISTER (permanent cloud record)
+   ============================================================================ */
+
+/** Issued TCs live in their own append-only cloud table, so they outlive roster edits and CSV re-imports. */
+async function fetchIssuedTcRegister() {
+  const result = await callErpSecurityApi('tcList', {
+    method: 'GET',
+    query: { sessionToken: getErpSessionToken() }
+  });
+  return Array.isArray(result.certificates) ? result.certificates : [];
+}
+
+function getTcSnapshotField(certificate, ...keys) {
+  const snapshot = certificate?.student_snapshot || certificate?.studentSnapshot || {};
+  for (const key of keys) {
+    const value = certificate?.[key] ?? snapshot?.[key];
+    if (value !== undefined && value !== null && String(value).trim() !== '') return String(value);
+  }
+  return '';
+}
+
+/**
+ * A TC in the cloud whose student is no longer in the roster means the roster was
+ * replaced (usually a CSV re-import). Say so plainly instead of silently hiding the record.
+ */
+async function flagCloudTcHoldersMissingFromRoster() {
+  const host = document.getElementById('leftStudentsCloudTcNotice');
+  if (!host) return;
+  let certificates = [];
+  try {
+    certificates = await fetchIssuedTcRegister();
+  } catch (error) {
+    host.innerHTML = `<div style="padding:10px 14px; border-radius:10px; background:rgba(148,163,184,0.12); border:1px solid rgba(148,163,184,0.35); font-size:0.82rem; color:var(--text-muted);">
+      Could not read the cloud TC register right now (${escapeHtml(error.message || 'network error')}). Issued certificates are still stored in the cloud.
+    </div>`;
+    return;
+  }
+
+  const rosterAdmissions = new Set((SchoolData.students || []).map(s => normalizeAdmissionLookup(s.admissionNo)));
+  const orphans = certificates.filter(c => !rosterAdmissions.has(normalizeAdmissionLookup(c.admission_no || c.admissionNo)));
+
+  if (!certificates.length) {
+    host.innerHTML = '';
+    return;
+  }
+
+  host.innerHTML = `
+    <div style="padding:12px 14px; border-radius:10px; background:rgba(2,132,199,0.12); border:1px solid rgba(2,132,199,0.45); font-size:0.85rem; color:var(--text-main);">
+      <strong>${certificates.length}</strong> transfer certificate${certificates.length === 1 ? '' : 's'} on permanent cloud record.
+      ${orphans.length ? `<span style="color:#f59e0b; font-weight:700;">${orphans.length} belong${orphans.length === 1 ? 's' : ''} to student${orphans.length === 1 ? '' : 's'} no longer in this session's roster</span> — the certificate is still valid and reprintable.` : 'All of them match a student in the current roster.'}
+      <a href="#tc-register" style="color:#38bdf8; font-weight:700; margin-left:6px;">Open TC Register</a>
+    </div>`;
+}
+
+function renderTcRegisterPage(container) {
+  container.innerHTML = `
+    <div class="page-header">
+      <div>
+        <h2 class="page-title"><i class="fa-solid fa-file-shield" style="color:#0284c7"></i> Transfer Certificate Register</h2>
+        <p class="page-subtitle">Every TC ever issued, read straight from the permanent cloud record. Roster edits and CSV re-imports cannot remove these.</p>
+      </div>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="renderTcRegisterPage(document.getElementById('contentBody'))"><i class="fa-solid fa-rotate"></i> Reload</button>
+        <button class="btn btn-primary" onclick="window.location.hash='left-students'"><i class="fa-solid fa-user-clock"></i> Left / Inactive Students</button>
+      </div>
+    </div>
+    <div class="glass-card">
+      <div id="tcRegisterBody" style="padding:24px; text-align:center; color:var(--text-muted);">
+        <i class="fa-solid fa-spinner fa-spin"></i> Reading the cloud TC register…
+      </div>
+    </div>`;
+
+  loadTcRegisterIntoPage();
+}
+
+async function loadTcRegisterIntoPage() {
+  const host = document.getElementById('tcRegisterBody');
+  if (!host) return;
+
+  let certificates = [];
+  try {
+    certificates = await fetchIssuedTcRegister();
+  } catch (error) {
+    host.innerHTML = `<div style="padding:24px; text-align:center;">
+      <p style="color:#f87171; font-weight:700; margin:0 0 8px 0;">Could not load the TC register.</p>
+      <p style="color:var(--text-muted); font-size:0.85rem; margin:0;">${escapeHtml(error.message || 'Network error')}</p>
+      <p style="color:var(--text-muted); font-size:0.8rem; margin:10px 0 0 0;">Sign in again if your session expired. Certificates are never deleted by this screen.</p>
+    </div>`;
+    return;
+  }
+
+  if (!certificates.length) {
+    host.innerHTML = `<div style="padding:30px; text-align:center; color:var(--text-muted);">
+      No transfer certificate has been issued yet. Issue one from a student profile and it will appear here permanently.
+    </div>`;
+    return;
+  }
+
+  const rosterAdmissions = new Set((SchoolData.students || []).map(s => normalizeAdmissionLookup(s.admissionNo)));
+  const revokedCount = certificates.filter(c => String(c.status || '').toLowerCase() !== 'valid').length;
+
+  host.innerHTML = `
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; gap:12px; flex-wrap:wrap;">
+      <input type="text" id="tcRegisterSearchInput" placeholder="Search name, admission or certificate no…" class="session-dropdown" style="width:340px;" onkeyup="filterTcRegisterTable()">
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <span class="badge badge-info">${certificates.length} issued</span>
+        ${revokedCount ? `<span class="badge badge-danger">${revokedCount} revoked</span>` : ''}
+      </div>
+    </div>
+    <div class="data-table-container">
+      <table class="data-table" id="tcRegisterTable">
+        <thead>
+          <tr>
+            <th>Certificate No</th>
+            <th>Student</th>
+            <th>Adm No</th>
+            <th>Session</th>
+            <th>Issued On</th>
+            <th>Issued By</th>
+            <th>Status</th>
+            <th style="text-align:center;">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${certificates.map(c => {
+            const adm = getTcSnapshotField(c, 'admission_no', 'admissionNo');
+            const name = getTcSnapshotField(c, 'name', 'student_name', 'studentName') || '(name not recorded)';
+            const cls = getTcSnapshotField(c, 'currentClass', 'class');
+            const sec = getTcSnapshotField(c, 'currentSection', 'section');
+            const certNo = getTcSnapshotField(c, 'certificate_no', 'certificateNo');
+            const session = getTcSnapshotField(c, 'academic_session', 'academicSession');
+            const issuedBy = getTcSnapshotField(c, 'issued_by_name', 'issuedByName') || '—';
+            const isValid = String(c.status || 'valid').toLowerCase() === 'valid';
+            const inRoster = rosterAdmissions.has(normalizeAdmissionLookup(adm));
+            const searchable = `${name} ${adm} ${certNo}`.toLowerCase();
+            return `
+              <tr class="tc-register-row" data-search="${escapeHtml(searchable)}">
+                <td><code style="color:#c084fc; font-weight:800;">${escapeHtml(certNo)}</code></td>
+                <td>
+                  <strong>${escapeHtml(name)}</strong>
+                  ${cls ? `<br><small style="color:var(--text-muted);">${escapeHtml(cls)}${sec ? ` - ${escapeHtml(sec)}` : ''}</small>` : ''}
+                  ${inRoster ? '' : '<br><span class="badge badge-warning" style="font-size:0.68rem;">not in current roster</span>'}
+                </td>
+                <td><span class="adm-no-chip">${escapeHtml(adm)}</span></td>
+                <td>${escapeHtml(session)}</td>
+                <td><small>${escapeHtml(formatErpDateTime(c.issued_at || c.issuedAt))}</small></td>
+                <td><small>${escapeHtml(issuedBy)}</small></td>
+                <td>${isValid
+                  ? '<span class="badge badge-success">Valid</span>'
+                  : `<span class="badge badge-danger">Revoked</span>${c.revoked_at ? `<br><small>${escapeHtml(formatErpDateTime(c.revoked_at))}</small>` : ''}`}</td>
+                <td style="text-align:center;">
+                  <button class="btn btn-primary" style="padding:5px 10px; font-size:0.75rem;" onclick="reprintIssuedTransferCertificate('${escapeHtml(adm)}')">
+                    <i class="fa-solid fa-print"></i> Reprint
+                  </button>
+                </td>
+              </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>`;
+}
+
+function filterTcRegisterTable() {
+  const query = String(document.getElementById('tcRegisterSearchInput')?.value || '').trim().toLowerCase();
+  document.querySelectorAll('#tcRegisterTable .tc-register-row').forEach(row => {
     row.style.display = !query || String(row.getAttribute('data-search') || '').includes(query) ? '' : 'none';
   });
 }
@@ -12383,6 +12556,32 @@ function getStudentFeeCategoryStatus(student) {
   return { tuitionDue, annualDue, examDue, totalDue: tuitionDue + annualDue + examDue, overdueMonths };
 }
 
+/**
+ * The one figure every screen must agree on: money owed today.
+ * Counts only months already due (April..current month), never the whole session,
+ * and offsets any advance sitting in the student wallet.
+ */
+function getStudentTotalDueAmount(student) {
+  if (!student) return 0;
+  const status = getStudentFeeCategoryStatus(student);
+  const partialDue = Number(student.partialDue || 0);
+  const wallet = getVerifiedStudentWalletBalance(student);
+  return Math.max(0, status.totalDue + partialDue - wallet);
+}
+
+function getStudentDueSummary(student) {
+  const status = getStudentFeeCategoryStatus(student);
+  const fee = student?.currentFeeInfo || {};
+  return {
+    status,
+    overdueMonths: status.overdueMonths,
+    previousSessionDue: Number(fee.previousSessionDue || 0),
+    partialDue: Number(student?.partialDue || 0),
+    wallet: getVerifiedStudentWalletBalance(student),
+    totalDue: getStudentTotalDueAmount(student)
+  };
+}
+
 function getStudentFeePaidBreakdown(student, session = SchoolData.activeSession) {
   const payments = student.feeRecords?.[session]?.payments || [];
   let tuitionPaid = 0;
@@ -13316,9 +13515,8 @@ function openQuickFeeSelectModal() {
 
         <div style="max-height:360px; overflow-y:auto; border:1px solid #334155; border-radius:12px; padding:8px; background:#1e293b;" id="quickFeeStudentListContainer">
           ${students.map(s => {
-            const fee = s.currentFeeInfo || {};
             const overdue = getCurrentOverdueMonths(s);
-            const dueAmount = (overdue.length * getStudentMonthlyTuitionRate(s)) + (fee.previousSessionDue || 0);
+            const dueAmount = getStudentTotalDueAmount(s);
 
             return `
               <div class="quick-fee-student-item" data-search="${s.name.toLowerCase()} ${s.admissionNo} ${s.parentPhone}" style="display:flex; justify-content:space-between; align-items:center; padding:12px; border-bottom:1px solid #334155; gap:12px;">
@@ -13470,16 +13668,8 @@ function renderFeesPage(container) {
     const payments = s.feeRecords[currentSession]?.payments || [];
     return acc + payments.reduce((pAcc, p) => pAcc + (p.amount || 0), 0);
   }, 0);
-  const pendingTotal = students.reduce((acc, s) => {
-    const fee = s.currentFeeInfo || {};
-    const overdueMonths = getCurrentOverdueMonths(s);
-    return acc + (overdueMonths.length * getStudentMonthlyTuitionRate(s)) + (fee.previousSessionDue || 0);
-  }, 0);
-  const defaulterCount = students.filter(s => {
-    const fee = s.currentFeeInfo || {};
-    const overdueMonths = getCurrentOverdueMonths(s);
-    return (overdueMonths.length > 0 || (fee.previousSessionDue || 0) > 0);
-  }).length;
+  const pendingTotal = students.reduce((acc, s) => acc + getStudentTotalDueAmount(s), 0);
+  const defaulterCount = students.filter(s => getStudentTotalDueAmount(s) > 0).length;
 
   container.innerHTML = `
     <div class="page-header">
@@ -13571,7 +13761,7 @@ function renderFeesPage(container) {
               const fee = s.currentFeeInfo || {};
               const status = getStudentFeeCategoryStatus(s);
               const overdueMonths = status.overdueMonths;
-              const dueAmount = status.totalDue;
+              const dueAmount = getStudentTotalDueAmount(s);
               const paidAmount = (s.feeRecords?.[currentSession]?.payments || []).reduce((acc, p) => acc + (p.amount || 0), 0);
 
               return `
@@ -13647,7 +13837,7 @@ function getCurrentFeeLedgerRows() {
       payments,
       paidAmount,
       overdueMonths,
-      dueAmount: status.totalDue
+      dueAmount: getStudentTotalDueAmount(s)
     };
   }).filter(row => {
     const s = row.student;
@@ -16524,7 +16714,48 @@ function applyWebsiteAppearance() {
   }
 }
 
+/**
+ * The exam sub-directory links are static markup in index.html, and deployments
+ * shipped before admit cards existed have no Admit Card entry. Clone a sibling
+ * link so the injected one inherits that deployment's own classes and styling.
+ */
+function ensureExamsAdmitCardNavLink() {
+  const subdir = document.querySelector('.nav-sub-directory[data-parent="exams"]');
+  if (!subdir) return null;
+  const links = Array.from(subdir.querySelectorAll('a'));
+  if (!links.length) return null;
+
+  const existing = links.find(a =>
+    (a.getAttribute('data-page') || '') === 'exams-admit-card' ||
+    (a.getAttribute('href') || '').includes('exams-admit-card')
+  );
+  if (existing) return existing;
+
+  const link = links[links.length - 1].cloneNode(true);
+  link.setAttribute('href', '#exams-admit-card');
+  link.setAttribute('data-page', 'exams-admit-card');
+  link.classList.remove('active');
+
+  const icon = link.querySelector('i');
+  if (icon) icon.className = 'fa-solid fa-id-card';
+
+  const labelHost = link.querySelector('span');
+  if (labelHost) {
+    labelHost.textContent = 'Admit Card';
+  } else {
+    Array.from(link.childNodes)
+      .filter(node => node.nodeType === 3)
+      .forEach(node => node.remove());
+    link.appendChild(document.createTextNode(' Admit Card'));
+  }
+
+  subdir.appendChild(link);
+  return link;
+}
+
 function updateSidebarSubdirectoryState(hash) {
+  ensureExamsAdmitCardNavLink();
+
   const activeParent =
     hash.startsWith('telegram') ? 'telegram-bot' :
     hash.startsWith('exams') ? 'exams' :
@@ -18004,7 +18235,7 @@ function triggerBulkFeeReminder() {
   const students = getStudentsByActiveSession();
   let count = 0;
   students.forEach(s => {
-    if (s.currentFeeInfo && s.currentFeeInfo.dueMonths.length > 0) {
+    if (getStudentTotalDueAmount(s) > 0) {
       triggerSingleFeeReminder(s.admissionNo);
       count++;
     }
@@ -19602,16 +19833,16 @@ function openStudentProfile(admissionNo) {
   const sec = student.currentSection || student.section || 'A';
   const rollNo = student.rollNo || student.currentRollNo || '01';
 
-  // Fee Details
+  // Fee Details — same figures the Fee Management ledger shows
   const feeRec = (student.feeRecords && student.feeRecords[currentSession]) ? student.feeRecords[currentSession] : (student.currentFeeInfo || {});
   const paidMonths = feeRec.paidMonths || [];
-  const dueMonths = feeRec.dueMonths || ["June", "July", "August"];
+  const dueSummary = getStudentDueSummary(student);
+  const dueMonths = dueSummary.overdueMonths;
   const monthlyTuition = getStudentMonthlyTuitionRate(student, currentSession);
-  const previousSessionDue = feeRec.previousSessionDue || 0;
-  const currentTuitionDue = dueMonths.length * monthlyTuition;
-  const walletBalance = getVerifiedStudentWalletBalance(student, currentSession);
-  const partialDue = student.partialDue || 0;
-  const totalNetDue = Math.max(0, currentTuitionDue + previousSessionDue + partialDue - walletBalance);
+  const previousSessionDue = dueSummary.previousSessionDue;
+  const walletBalance = dueSummary.wallet;
+  const partialDue = dueSummary.partialDue;
+  const totalNetDue = dueSummary.totalDue;
 
   // Payment history payments array
   const payments = (feeRec.payments || []);
