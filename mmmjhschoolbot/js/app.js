@@ -186,13 +186,19 @@ function getPrintLogoSource() {
 }
 
 function getSchoolLogoHtml(size = 62) {
-  const profile = getSchoolProfile();
-  const logoSrc = profile.logoDataUrl || 'assets/school_logo.png';
+  const logoSrc = getPrintLogoSource();
   return `<img src="${logoSrc}" alt="School Logo" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center; border:2px solid #d4af37; background:#ffffff; padding:2px;">`;
 }
 
+/** Official crest on report-card headers (dark gradient) — transparent logo, no white box. */
+function getReportCardLogoHtml(size = 65) {
+  const logoSrc = getPrintLogoSource();
+  return `<img src="${logoSrc}" alt="School Logo" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center; border:2px solid #d4af37; flex-shrink:0;">`;
+}
+
 function getTransferCertificateLogoHtml(size = 78) {
-  return `<img src="assets/school_logo_tc.png" alt="School Logo" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center;">`;
+  const logoSrc = getPrintLogoSource();
+  return `<img src="${logoSrc}" alt="School Logo" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center;">`;
 }
 
 function applySchoolProfileToShell() {
@@ -5218,11 +5224,66 @@ function repairStaffFinancialVisibilityRights() {
       ensureStaffAccessRight(u, 'fee_collection', 'modify', false);
       ensureStaffAccessRight(u, 'student_dues_view', 'view', false);
       ensureStaffAccessRight(u, 'fee_receipt_print', 'view', false);
+      ensureStaffAccessRight(u, 'fee_receipt_deletion', 'view', false);
       ensureStaffAccessRight(u, 'fee_receipt_deletion', 'delete', false);
       ensureStaffAccessRight(u, 'telegram_fee_notice', 'view', false);
       changed = true;
     });
     SchoolData._finRightsV3 = true;
+  }
+
+  if (!SchoolData._finRightsV4) {
+    const feeKeys = (ERP_MODULES_LIST.fees || []).map((m) => m.key);
+    const teacherExamConfigKeys = ['class_weightage_config', 'class_subject_setup'];
+    const denyAllActions = (rightsObj, key) => {
+      if (!rightsObj[key]) rightsObj[key] = {};
+      ['view', 'add', 'modify', 'delete'].forEach((action) => {
+        rightsObj[key][action] = false;
+      });
+    };
+
+    (SchoolData.staffUsers || []).forEach((u) => {
+      const role = String(u.role || '').trim();
+      if (isErpAdminUser(u) || role === 'Accountant') return;
+
+      if (role === 'Receptionist') {
+        ['view', 'add', 'modify', 'delete'].forEach((action) => {
+          ensureStaffAccessRight(u, 'fee_receipt_deletion', action, false);
+        });
+        changed = true;
+        return;
+      }
+
+      if (isTeacherRoleUser(u) || role === 'Exam Incharge' || role === 'Subject Teacher') {
+        feeKeys.forEach((key) => {
+          ['view', 'add', 'modify', 'delete'].forEach((action) => {
+            ensureStaffAccessRight(u, key, action, false);
+          });
+        });
+        teacherExamConfigKeys.forEach((key) => {
+          ['view', 'add', 'modify', 'delete'].forEach((action) => {
+            ensureStaffAccessRight(u, key, action, false);
+          });
+        });
+        u.viewDueBalance = false;
+        u.viewTotalRevenue = false;
+        u.canManageFees = false;
+        u.hideFees = true;
+        changed = true;
+      }
+    });
+
+    ['Class Teacher & Subject Teacher', 'Subject Teacher', 'Class Teacher', 'Exam Incharge'].forEach((roleName) => {
+      const template = getRolePermissionTemplate(roleName);
+      if (!template) return;
+      feeKeys.forEach((key) => denyAllActions(template, key));
+      if (roleName !== 'Exam Incharge') {
+        teacherExamConfigKeys.forEach((key) => denyAllActions(template, key));
+      }
+      changed = true;
+    });
+
+    SchoolData._finRightsV4 = true;
   }
   return changed;
 }
@@ -5324,6 +5385,12 @@ function canCurrentUserDeleteSubjects() {
   return role.includes('super admin') || role.includes('principal');
 }
 
+function canCurrentUserDeleteFeeReceipts(user = getCurrentActiveUser()) {
+  if (!user) return false;
+  if (isErpAdminUser(user)) return true;
+  return hasUserAccessPermission(user, 'fee_receipt_deletion', 'delete') === true;
+}
+
 function canCurrentUserAddSubjects() {
   const user = getCurrentActiveUser();
   if (!user) return false;
@@ -5409,7 +5476,9 @@ function getDefaultAccessRightsForRole(role) {
         base[mod.key] = { view: false, add: false, modify: false, delete: false };
       }
     } else if (isTeacher) {
-      if (['exam_marks_entry', 'report_cards_print', 'exam_exports', 'attendance_register', 'student_directory'].includes(mod.key)) {
+      if (mod.key.includes('fee') || mod.key.includes('revenue') || mod.key.includes('dues') || mod.key === 'telegram_fee_notice') {
+        base[mod.key] = { view: false, add: false, modify: false, delete: false };
+      } else if (['exam_marks_entry', 'report_cards_print', 'exam_exports', 'attendance_register', 'student_directory'].includes(mod.key)) {
         base[mod.key] = { view: true, add: true, modify: true, delete: false };
       } else if (['teacher_subject_mappings', 'timetable_management', 'exam_schedule_manage', 'admit_card_print'].includes(mod.key)) {
         base[mod.key] = { view: true, add: false, modify: false, delete: false };
@@ -7309,7 +7378,7 @@ function viewCombinedConsolidatedReportCard(admissionNo) {
           <!-- 1-PAGE COMBINED HEADER WITH EMBLEM -->
           <div style="display:flex; align-items:center; justify-content:space-between; border-bottom:3px double #0f172a; padding-bottom:10px; margin-bottom:12px;">
             <div style="display:flex; align-items:center; gap:14px;">
-              ${getSchoolLogoHtml(60)}
+              ${getReportCardLogoHtml(60)}
               <div>
                 <h2 style="font-family:'Playfair Display', serif; font-size:1.3rem; margin:0; color:#0f172a; text-transform:uppercase;">${school.name}</h2>
                 <p style="margin:2px 0 0 0; font-size:0.75rem; color:#475569; font-weight:600;">${school.address} - Session ${currentSession}</p>
@@ -7547,7 +7616,7 @@ function viewHalfYearlyReportCard(admissionNo) {
         <!-- LUXURY GRADIENT HEADER WITH OFFICIAL LOGO EMBLEM -->
         <div style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #1e1b4b 100%); color:#ffffff; padding:20px 24px; border-top-left-radius:16px; border-top-right-radius:16px; display:flex; align-items:center; justify-content:space-between; position:relative; border-bottom:4px solid #f59e0b;">
           <div style="display:flex; align-items:center; gap:16px;">
-            ${getSchoolLogoHtml(65)}
+            ${getReportCardLogoHtml(65)}
             <div>
               <h1 style="font-family:'Playfair Display', serif; font-size:1.4rem; letter-spacing:1px; margin:0; color:#ffffff;">${school.name.toUpperCase()}</h1>
               <p style="margin:2px 0 0 0; font-size:0.8rem; color:#cbd5e1; font-weight:500;">${school.address}</p>
@@ -7787,7 +7856,7 @@ function viewFinalAnnualReportCard(admissionNo) {
         <!-- LUXURY GRADIENT HEADER WITH OFFICIAL CREST LOGO -->
         <div style="background: linear-gradient(135deg, #065f46 0%, #047857 50%, #0f172a 100%); color:#ffffff; padding:20px 24px; border-top-left-radius:16px; border-top-right-radius:16px; display:flex; align-items:center; justify-content:space-between; border-bottom:4px solid #f59e0b; position:relative;">
           <div style="display:flex; align-items:center; gap:16px;">
-            ${getSchoolLogoHtml(65)}
+            ${getReportCardLogoHtml(65)}
             <div>
               <h1 style="font-family:'Playfair Display', serif; font-size:1.4rem; letter-spacing:1px; margin:0; color:#ffffff;">${school.name.toUpperCase()}</h1>
               <p style="margin:2px 0 0 0; font-size:0.8rem; color:#a7f3d0; font-weight:500;">${school.address} - Session ${currentSession}</p>
@@ -10664,17 +10733,12 @@ function saveClassEdit(classId) {
 }
 
 function canCurrentUserDeleteClasses() {
-  const activeUser = getCurrentActiveUser();
-  return !!activeUser && (
-    activeUser.role === 'Super Admin' ||
-    activeUser.role === 'Principal' ||
-    hasUserAccessPermission(activeUser, 'class_teacher_assignment', 'delete')
-  );
+  return isErpAdminUser(getCurrentActiveUser());
 }
 
 function deleteClass(classId) {
   if (!canCurrentUserDeleteClasses()) {
-    showNotification('Access denied: class teachers cannot delete classes.', 'warning');
+    showNotification('Access denied: only Super Admin / Principal can delete classes.', 'warning');
     return;
   }
 
@@ -15843,6 +15907,7 @@ function renderReceiptsLedgerPage(container) {
   const allReceipts = getAllFeeReceipts();
   const totalCollected = allReceipts.reduce((acc, r) => acc + (r.amount || 0), 0);
   const canSeeRevenue = canUserViewSchoolTotalRevenue();
+  const canDeleteReceipts = canCurrentUserDeleteFeeReceipts();
 
   container.innerHTML = `
     <div class="page-header">
@@ -15933,9 +15998,11 @@ function renderReceiptsLedgerPage(container) {
                     <button class="btn btn-telegram" style="padding:4px 10px; font-size:0.75rem; font-weight:800; background:#0088cc; color:#ffffff; border:none; border-radius:4px; cursor:pointer;" onclick="openTelegramReceiptDispatchModal('${r.admissionNo}', '${r.receiptNo}', '${r.studentIndex}')" title="Send A4 Voucher / Thermal PDF / Text Receipt to Parent via Telegram">
                       <i class="fa-brands fa-telegram"></i> Telegram PDF
                     </button>
+                    ${canDeleteReceipts ? `
                     <button class="btn btn-secondary" style="padding:4px 8px; font-size:0.75rem; background:#dc2626; color:#ffffff; border:none; font-weight:700;" onclick="deleteAndCancelFeeReceipt('${r.admissionNo}', '${r.receiptNo}', '${r.studentIndex}')" title="Delete Receipt & Reverse Revenue Collection">
                       <i class="fa-solid fa-trash"></i> Cancel / Delete
                     </button>
+                    ` : ''}
                   </div>
                 </td>
               </tr>
@@ -15995,6 +16062,10 @@ function exportReceiptsCSV() {
 }
 
 async function deleteAndCancelFeeReceipt(admissionNo, receiptNo, studentIndex) {
+  if (!canCurrentUserDeleteFeeReceipts()) {
+    showNotification('Access denied: fee receipt deletion is restricted to admin / accountant.', 'warning');
+    return;
+  }
   const receiptContext = findReceiptContext(admissionNo, receiptNo, studentIndex);
   const student = receiptContext.student;
   if (!student) {
