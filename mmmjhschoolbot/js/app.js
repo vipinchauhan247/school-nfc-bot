@@ -8756,6 +8756,9 @@ function renderStudentsPage(container) {
           <button class="btn btn-secondary" onclick="openBulkStudentCsvModal()" style="background:#059669; color:#ffffff; border:none; font-weight:bold;">
             <i class="fa-solid fa-file-csv"></i> Import CSV
           </button>
+          <button class="btn btn-secondary" onclick="openBulkStudentPhotoModal()" style="background:#8b5cf6; color:#ffffff; border:none; font-weight:bold;">
+            <i class="fa-solid fa-images"></i> Bulk Photo Upload
+          </button>
         ` : ''}
         ${canBulkDeleteStudents ? `
           <button class="btn btn-secondary" onclick="deleteAllStudentsForFreshCsvImport()" style="background:#dc2626; color:#ffffff; border:none; font-weight:bold;">
@@ -8851,6 +8854,195 @@ function filterStudentsDirectoryTable() {
 
     r.style.display = (matchQuery && matchClass) ? '' : 'none';
   });
+}
+
+/* ============================================================================
+   BULK STUDENT PHOTO UPLOAD (matched by admission number in the file name)
+   ============================================================================ */
+
+const BULK_PHOTO_MAX_WIDTH = 240;
+const BULK_PHOTO_MAX_HEIGHT = 320;
+const BULK_PHOTO_JPEG_QUALITY = 0.72;
+
+/** Photos travel inside the cloud roster payload, so shrink each one to passport size before storing. */
+function resizeImageFileToDataUrl(file, maxWidth = BULK_PHOTO_MAX_WIDTH, maxHeight = BULK_PHOTO_MAX_HEIGHT) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('File could not be read.'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('Not a readable image file.'));
+      img.onload = () => {
+        const scale = Math.min(maxWidth / img.width, maxHeight / img.height, 1);
+        const width = Math.max(1, Math.round(img.width * scale));
+        const height = Math.max(1, Math.round(img.height * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, width, height);
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', BULK_PHOTO_JPEG_QUALITY));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+/** Accepts "1813.jpg", "1813 Abhimanyu.jpg", "adm-1813.png" and "IMG_1813.jpeg". */
+function extractAdmissionNoFromFileName(fileName) {
+  const base = String(fileName || '').replace(/\.[^.]+$/, '').trim();
+  if (/^\d+$/.test(base)) return base;
+  const leading = base.match(/^\D*(\d{2,})/);
+  if (leading) return leading[1];
+  const anywhere = base.match(/\d{2,}/);
+  return anywhere ? anywhere[0] : '';
+}
+
+function estimateDataUrlBytes(dataUrl) {
+  const base64 = String(dataUrl || '').split(',')[1] || '';
+  return Math.round(base64.length * 0.75);
+}
+
+function formatBytesShort(bytes) {
+  if (!bytes) return '0 KB';
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function openBulkStudentPhotoModal() {
+  document.getElementById('bulkPhotoModal')?.remove();
+  window._bulkPhotoQueue = [];
+
+  document.body.insertAdjacentHTML('beforeend', `
+    <div class="modal-overlay active" id="bulkPhotoModal" style="z-index:1000000; backdrop-filter:blur(6px);">
+      <div class="modal-box" style="max-width:820px; width:96%; max-height:90vh; overflow-y:auto; background:var(--card-bg, #0f172a); color:var(--text-main, #fff); border:2px solid #8b5cf6; border-radius:18px; padding:24px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border-color, #334155); padding-bottom:12px; margin-bottom:16px;">
+          <h3 style="margin:0; color:#c084fc; display:flex; align-items:center; gap:10px;">
+            <i class="fa-solid fa-images"></i> Bulk Student Photo Upload
+          </h3>
+          <button onclick="document.getElementById('bulkPhotoModal').remove()" style="background:#334155; color:#fff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer;">X</button>
+        </div>
+
+        <div style="background:rgba(139,92,246,0.10); border:1px solid rgba(139,92,246,0.45); border-radius:12px; padding:14px 16px; margin-bottom:18px; font-size:0.86rem; line-height:1.7;">
+          <strong style="color:#c084fc;">Name each photo file after the student's admission number.</strong><br>
+          Accepted: <code>1813.jpg</code>, <code>1813 Abhimanyu.jpg</code>, <code>adm-1813.png</code>, <code>IMG_1813.jpeg</code>.<br>
+          Every photo is automatically cropped to passport size (${BULK_PHOTO_MAX_WIDTH}&times;${BULK_PHOTO_MAX_HEIGHT}) so the cloud roster stays small.
+          Select a whole class at a time rather than all ${(SchoolData.students || []).length} students at once.
+        </div>
+
+        <label style="font-weight:800; display:block; margin-bottom:8px;">Choose photo files (you can select many at once)</label>
+        <input type="file" id="bulkPhotoInput" accept="image/*" multiple class="session-dropdown" style="width:100%; padding:10px;" onchange="stageBulkStudentPhotos(this)">
+
+        <div id="bulkPhotoStatus" style="margin-top:16px;"></div>
+        <div id="bulkPhotoPreview" style="margin-top:14px;"></div>
+
+        <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:20px; flex-wrap:wrap;">
+          <button class="btn btn-secondary" onclick="document.getElementById('bulkPhotoModal').remove()">Cancel</button>
+          <button class="btn btn-primary" id="bulkPhotoApplyBtn" style="background:linear-gradient(135deg, #8b5cf6 0%, #6d28d9 100%); border:none;" disabled onclick="applyStagedBulkStudentPhotos()">
+            <i class="fa-solid fa-floppy-disk"></i> Save Matched Photos
+          </button>
+        </div>
+      </div>
+    </div>`);
+}
+
+async function stageBulkStudentPhotos(input) {
+  const files = Array.from(input?.files || []);
+  const status = document.getElementById('bulkPhotoStatus');
+  const preview = document.getElementById('bulkPhotoPreview');
+  const applyBtn = document.getElementById('bulkPhotoApplyBtn');
+  if (!files.length || !status || !preview) return;
+
+  window._bulkPhotoQueue = [];
+  if (applyBtn) applyBtn.disabled = true;
+  status.innerHTML = `<div style="color:var(--text-muted);"><i class="fa-solid fa-spinner fa-spin"></i> Reading and resizing ${files.length} photo${files.length === 1 ? '' : 's'}…</div>`;
+  preview.innerHTML = '';
+
+  const rows = [];
+  for (const file of files) {
+    const admissionNo = extractAdmissionNoFromFileName(file.name);
+    const student = admissionNo ? findStudentByAdmissionNo(admissionNo) : null;
+    let dataUrl = '';
+    let error = '';
+    if (student) {
+      try {
+        dataUrl = await resizeImageFileToDataUrl(file);
+      } catch (e) {
+        error = e.message || 'Could not process image.';
+      }
+    }
+    rows.push({ fileName: file.name, admissionNo, student, dataUrl, error, originalBytes: file.size });
+  }
+
+  window._bulkPhotoQueue = rows.filter(r => r.student && r.dataUrl);
+  const unmatched = rows.filter(r => !r.student);
+  const failed = rows.filter(r => r.student && !r.dataUrl);
+  const totalBytes = window._bulkPhotoQueue.reduce((sum, r) => sum + estimateDataUrlBytes(r.dataUrl), 0);
+  const originalBytes = rows.reduce((sum, r) => sum + (r.originalBytes || 0), 0);
+
+  status.innerHTML = `
+    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+      <span class="badge badge-success">${window._bulkPhotoQueue.length} matched</span>
+      ${unmatched.length ? `<span class="badge badge-warning">${unmatched.length} no matching admission no</span>` : ''}
+      ${failed.length ? `<span class="badge badge-danger">${failed.length} unreadable</span>` : ''}
+      <span class="badge badge-info">${formatBytesShort(originalBytes)} → ${formatBytesShort(totalBytes)} after resize</span>
+    </div>`;
+
+  preview.innerHTML = `
+    <div class="data-table-container" style="max-height:340px; overflow-y:auto;">
+      <table class="data-table" style="font-size:0.82rem;">
+        <thead><tr><th style="width:60px;">Photo</th><th>File</th><th>Adm No</th><th>Matched Student</th><th>Result</th></tr></thead>
+        <tbody>
+          ${rows.map(r => `
+            <tr>
+              <td>${r.dataUrl ? `<img src="${r.dataUrl}" style="width:34px; height:44px; object-fit:cover; border-radius:4px; border:1px solid #334155;">` : '<span style="color:#64748b;">—</span>'}</td>
+              <td><small>${escapeHtml(r.fileName)}</small></td>
+              <td>${r.admissionNo ? `<span class="adm-no-chip">${escapeHtml(r.admissionNo)}</span>` : '<span style="color:#f59e0b;">none found</span>'}</td>
+              <td>${r.student
+                ? `<strong>${escapeHtml(r.student.name || '')}</strong><br><small style="color:var(--text-muted);">${escapeHtml(r.student.currentClass || '')} - ${escapeHtml(r.student.currentSection || '')}</small>`
+                : '<span style="color:var(--text-muted);">no student with this admission no</span>'}</td>
+              <td>${r.dataUrl
+                ? '<span class="badge badge-success">Ready</span>'
+                : `<span class="badge badge-warning">Skipped</span>${r.error ? `<br><small>${escapeHtml(r.error)}</small>` : ''}`}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+
+  if (applyBtn) applyBtn.disabled = window._bulkPhotoQueue.length === 0;
+}
+
+function applyStagedBulkStudentPhotos() {
+  const queue = Array.isArray(window._bulkPhotoQueue) ? window._bulkPhotoQueue : [];
+  if (!queue.length) return showNotification('No photos matched an admission number.', 'warning');
+
+  const replacing = queue.filter(r => getStudentPhotoForAdmitCard(r.student)).length;
+  const confirmMsg = replacing
+    ? `Save ${queue.length} photo(s)? ${replacing} student(s) already have a photo and it will be replaced.`
+    : `Save ${queue.length} student photo(s)?`;
+  if (!window.confirm(confirmMsg)) return;
+
+  queue.forEach(row => {
+    row.student.photo = row.dataUrl;
+    row.student.photoDataUrl = row.dataUrl;
+  });
+
+  saveSchoolDataToStorage({ skipCloudPush: true });
+  if (typeof flushCloudPushNow === 'function') flushCloudPushNow();
+  else if (typeof pushSchoolDataToCloud === 'function') {
+    pushSchoolDataToCloud({ skipMergePull: true }).catch(err => console.warn('Photo cloud sync failed:', err));
+  }
+
+  document.getElementById('bulkPhotoModal')?.remove();
+  showNotification(`Saved ${queue.length} student photo(s) and synced to the cloud.`, 'success');
+  window._bulkPhotoQueue = [];
+
+  if (String(window.location.hash || '').includes('students')) {
+    renderStudentsPage(document.getElementById('contentBody'));
+  }
 }
 
 function renderLeftStudentsPage(container) {
