@@ -1505,22 +1505,25 @@ function studentPhotoPublicUrl(schoolId, admissionNo, ext) {
   return `${cfg.url}/storage/v1/object/public/${bucket}/${objectPath}`;
 }
 
-async function uploadStudentPhotoToStorage(schoolId, admissionNo, dataUrl) {
+async function uploadStudentPhotoBufferToStorage(schoolId, admissionNo, buffer, mime) {
   const cfg = supabaseConfig();
   if (!cfg) throw new Error('Supabase is not configured on the server.');
-  const decoded = decodeDataUrlImage(dataUrl);
-  if (!decoded) throw new Error(`Invalid image data for admission ${admissionNo}.`);
+  if (!buffer || !buffer.length) throw new Error(`Empty image for admission ${admissionNo}.`);
+  const normalizedMime = String(mime || 'image/jpeg').toLowerCase();
+  let ext = 'jpg';
+  if (normalizedMime.includes('png')) ext = 'png';
+  else if (normalizedMime.includes('webp')) ext = 'webp';
   const bucket = studentPhotoStorageBucket();
-  const objectPath = studentPhotoStorageObjectPath(schoolId, admissionNo, decoded.ext);
+  const objectPath = studentPhotoStorageObjectPath(schoolId, admissionNo, ext);
   const response = await fetch(`${cfg.url}/storage/v1/object/${bucket}/${objectPath}`, {
     method: 'POST',
     headers: {
       apikey: cfg.key,
       Authorization: `Bearer ${cfg.key}`,
-      'Content-Type': decoded.mime,
+      'Content-Type': normalizedMime || 'image/jpeg',
       'x-upsert': 'true'
     },
-    body: decoded.buffer
+    body: buffer
   });
   const text = await response.text();
   if (!response.ok) {
@@ -1534,7 +1537,32 @@ async function uploadStudentPhotoToStorage(schoolId, admissionNo, dataUrl) {
     }
     throw new Error(`Photo upload failed for ${admissionNo}: ${message}`);
   }
-  return studentPhotoPublicUrl(schoolId, admissionNo, decoded.ext);
+  return studentPhotoPublicUrl(schoolId, admissionNo, ext);
+}
+
+async function uploadStudentPhotoToStorage(schoolId, admissionNo, dataUrl) {
+  const decoded = decodeDataUrlImage(dataUrl);
+  if (!decoded) throw new Error(`Invalid image data for admission ${admissionNo}.`);
+  return uploadStudentPhotoBufferToStorage(schoolId, admissionNo, decoded.buffer, decoded.mime);
+}
+
+async function downloadRemoteStudentPhoto(url, cookie) {
+  const cleanUrl = String(url || '').trim();
+  if (!/^https?:\/\//i.test(cleanUrl)) throw new Error('Invalid photo URL.');
+  const headers = {
+    'User-Agent': 'MMM-ERP-PhotoImport/1.0',
+    Accept: 'image/*,*/*'
+  };
+  const sessionCookie = String(cookie || '').trim();
+  if (sessionCookie) headers.Cookie = sessionCookie;
+  const response = await fetch(cleanUrl, { headers, redirect: 'follow' });
+  if (!response.ok) throw new Error(`Download failed HTTP ${response.status}`);
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (!buffer.length) throw new Error('Empty image file.');
+  if (buffer.length > 2 * 1024 * 1024) throw new Error('Image too large (max 2 MB).');
+  const mime = (response.headers.get('content-type') || 'image/jpeg').split(';')[0].trim();
+  if (!/^image\//i.test(mime)) throw new Error(`Not an image (${mime || 'unknown type'}).`);
+  return { buffer, mime };
 }
 
 /**
@@ -1596,6 +1624,88 @@ async function handlePhotoStorageUpload(req, res, schoolId) {
     storage: true,
     patched: uploaded.length,
     uploaded,
+    savedAt,
+    studentCount: payload.students.length
+  });
+}
+
+/**
+ * Import student photos from external URLs (old ERP /uploads/ links).
+ * Server downloads each image and stores it in Supabase Storage.
+ */
+async function handlePhotoImportFromUrls(req, res, schoolId) {
+  if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST required.' });
+  const items = req.body?.items;
+  if (!Array.isArray(items) || !items.length) {
+    return json(res, 400, { ok: false, error: 'POST body must include items array with admissionNo and url.' });
+  }
+  if (items.length > 20) {
+    return json(res, 400, { ok: false, error: 'Maximum 20 photos per request. Import one class at a time.' });
+  }
+
+  const snapshot = await readSnapshot(schoolId);
+  if (!snapshot?.payload || !Array.isArray(snapshot.payload.students) || !snapshot.payload.students.length) {
+    return json(res, 404, { ok: false, error: 'School cloud roster not found.' });
+  }
+
+  const byAdmission = new Map();
+  snapshot.payload.students.forEach((student) => {
+    const key = normalizeAdmission(student?.admissionNo || student?.AdmissionNo);
+    if (key) byAdmission.set(key, student);
+  });
+
+  const cookie = String(req.body?.cookie || '').trim();
+  const uploaded = [];
+  const failed = [];
+
+  for (const row of items) {
+    if (!row || typeof row !== 'object') continue;
+    const key = normalizeAdmission(row.admissionNo || row.AdmissionNo);
+    const sourceUrl = String(row.url || row.photoUrl || row.photo || '').trim();
+    if (!key || !sourceUrl) continue;
+    const student = byAdmission.get(key);
+    if (!student) {
+      failed.push({ admissionNo: key, error: 'Student not found in cloud roster.' });
+      continue;
+    }
+    try {
+      const downloaded = await downloadRemoteStudentPhoto(sourceUrl, cookie);
+      const publicUrl = await uploadStudentPhotoBufferToStorage(schoolId, key, downloaded.buffer, downloaded.mime);
+      student.photo = publicUrl;
+      student.photoDataUrl = publicUrl;
+      uploaded.push({ admissionNo: key, photoUrl: publicUrl, sourceUrl });
+    } catch (err) {
+      failed.push({ admissionNo: key, error: err.message || String(err), sourceUrl });
+    }
+  }
+
+  if (!uploaded.length) {
+    return json(res, 400, {
+      ok: false,
+      error: failed.length
+        ? `No photos imported. First error: ${failed[0].error}`
+        : 'No matching students or valid photo URLs in this batch.',
+      failed
+    });
+  }
+
+  const payload = {
+    ...snapshot.payload,
+    savedAt: new Date().toISOString()
+  };
+  const savedBy = String(req.body?.savedBy || 'old-erp-photo-import').trim();
+  const written = await writeSnapshot(schoolId, payload, savedBy);
+  const savedAt = written?.snapshot?.saved_at || payload.savedAt;
+
+  return json(res, 200, {
+    ok: true,
+    configured: true,
+    schoolId,
+    storage: true,
+    imported: uploaded.length,
+    patched: uploaded.length,
+    uploaded,
+    failed,
     savedAt,
     studentCount: payload.students.length
   });
@@ -1669,7 +1779,7 @@ async function route(req, res, action) {
     return true;
   }
   if ([
-    'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'photoPatch', 'photoStorageUpload', 'nativeStudents', 'nativeMigrate', 'nativePayments',
+    'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'photoPatch', 'photoStorageUpload', 'photoImportFromUrls', 'nativeStudents', 'nativeMigrate', 'nativePayments',
     'rebuildSnapshot', 'wipeRoster', 'recoverFromTcRegister', 'authLogin', 'authLogout', 'authSession', 'authChangePassword',
     'authAdminResetPassword', 'authAudit', 'tcIssue', 'tcGet', 'tcList', 'tcVerify', 'tcRevoke'
   ].includes(act)) {
@@ -1880,6 +1990,10 @@ async function erpCloudHandler(req, res) {
 
     if (req.method === 'POST' && action === 'photoStorageUpload') {
       return handlePhotoStorageUpload(req, res, schoolId);
+    }
+
+    if (req.method === 'POST' && action === 'photoImportFromUrls') {
+      return handlePhotoImportFromUrls(req, res, schoolId);
     }
 
     if (req.method === 'POST') {

@@ -9041,13 +9041,24 @@ function openBulkStudentPhotoModal() {
         </div>
 
         <div style="background:rgba(139,92,246,0.10); border:1px solid rgba(139,92,246,0.45); border-radius:12px; padding:14px 16px; margin-bottom:18px; font-size:0.86rem; line-height:1.7;">
-          <strong style="color:#c084fc;">Name each photo file after the student's admission number.</strong><br>
-          Accepted: <code>1813.jpg</code>, <code>1813 Abhimanyu.jpg</code>, <code>adm-1813.png</code>, <code>IMG_1813.jpeg</code>.<br>
-          Photos upload to <strong>Supabase Storage</strong> when configured (best — automatic, survives refresh). Otherwise they save as <code>assets/students/</code> files + ZIP download for Vercel Drop.<br>
-          Select a whole class at a time rather than all ${(SchoolData.students || []).length} students at once.
+          <strong style="color:#c084fc;">Real photos are not stored in cloud anymore — you must upload them again.</strong><br>
+          Name each file after admission number: <code>1813.jpg</code>, <code>1186 Harshita.jpg</code>, etc.<br>
+          Photos save to <strong>Supabase Storage</strong> (best) or cloud directly — both survive refresh on all PCs.<br>
+          Select one class at a time (max ~25 per save batch).
         </div>
 
-        <label style="font-weight:800; display:block; margin-bottom:8px;">Choose photo files (you can select many at once)</label>
+        <div style="background:rgba(16,185,129,0.08); border:1px solid rgba(16,185,129,0.35); border-radius:12px; padding:14px 16px; margin-bottom:18px;">
+          <strong style="color:#34d399; display:block; margin-bottom:8px;"><i class="fa-solid fa-cloud-arrow-down"></i> Restore from old ERP (fastest for all students)</strong>
+          <div style="font-size:0.84rem; line-height:1.65; color:#cbd5e1; margin-bottom:10px;">
+            1. Log in to <strong>madanmohanmalviyaschool.com</strong> → student list → F12 Console → run <code>old_erp_browser_photo_manifest.js</code><br>
+            2. Upload the CSV here (columns: AdmissionNo, PhotoUrl). Server downloads each photo into Supabase Storage.
+          </div>
+          <input type="file" id="oldErpPhotoCsvInput" accept=".csv,text/csv" class="session-dropdown" style="width:100%; padding:10px; margin-bottom:8px;" onchange="stageOldErpPhotoCsv(this)">
+          <input type="text" id="oldErpPhotoCookie" placeholder="Optional: old ERP session cookie if downloads fail (F12 → Network → Cookie header)" class="session-dropdown" style="width:100%; padding:10px; font-size:0.8rem;">
+          <div id="oldErpPhotoCsvStatus" style="margin-top:8px; font-size:0.84rem;"></div>
+        </div>
+
+        <label style="font-weight:800; display:block; margin-bottom:8px;">Or choose photo files from your PC</label>
         <input type="file" id="bulkPhotoInput" accept="image/*" multiple class="session-dropdown" style="width:100%; padding:10px;" onchange="stageBulkStudentPhotos(this)">
 
         <div id="bulkPhotoStatus" style="margin-top:16px;"></div>
@@ -9055,6 +9066,9 @@ function openBulkStudentPhotoModal() {
 
         <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:20px; flex-wrap:wrap;">
           <button class="btn btn-secondary" onclick="document.getElementById('bulkPhotoModal').remove()">Cancel</button>
+          <button class="btn btn-secondary" id="oldErpPhotoImportBtn" style="background:#059669; color:#fff; border:none; display:none;" onclick="applyOldErpPhotoCsvImport()">
+            <i class="fa-solid fa-cloud-arrow-down"></i> Import from Old ERP CSV
+          </button>
           <button class="btn btn-primary" id="bulkPhotoApplyBtn" style="background:linear-gradient(135deg, #8b5cf6 0%, #6d28d9 100%); border:none;" disabled onclick="applyStagedBulkStudentPhotos()">
             <i class="fa-solid fa-floppy-disk"></i> Save Matched Photos
           </button>
@@ -9129,6 +9143,89 @@ async function stageBulkStudentPhotos(input) {
   if (applyBtn) applyBtn.disabled = window._bulkPhotoQueue.length === 0;
 }
 
+function parseOldErpPhotoCsvText(text) {
+  const lines = String(text || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const items = [];
+  lines.forEach((line, index) => {
+    const parts = line.split(',').map(part => part.trim().replace(/^"|"$/g, ''));
+    if (!parts.length) return;
+    if (index === 0 && /admission|photo|url|filename/i.test(parts[0])) return;
+    const admissionNo = String(parts[0] || '').replace(/\.0$/, '').trim();
+    const url = String(parts[1] || parts[parts.length - 1] || '').trim();
+    if (!admissionNo || !/^https?:\/\//i.test(url)) return;
+    const student = typeof findStudentByAdmissionNo === 'function' ? findStudentByAdmissionNo(admissionNo) : null;
+    items.push({ admissionNo, url, student, studentName: student?.name || '' });
+  });
+  return items;
+}
+
+async function stageOldErpPhotoCsv(input) {
+  const file = input?.files?.[0];
+  const statusEl = document.getElementById('oldErpPhotoCsvStatus');
+  const importBtn = document.getElementById('oldErpPhotoImportBtn');
+  window._oldErpPhotoImportQueue = [];
+  if (!file || !statusEl) return;
+
+  try {
+    const text = await file.text();
+    const items = parseOldErpPhotoCsvText(text);
+    const matched = items.filter(item => item.student);
+    const unmatched = items.length - matched.length;
+    window._oldErpPhotoImportQueue = matched;
+    if (importBtn) importBtn.style.display = matched.length ? 'inline-flex' : 'none';
+    statusEl.innerHTML = matched.length
+      ? `<span style="color:#34d399;">${matched.length} photo URL(s) matched to students${unmatched ? ` (${unmatched} skipped — no admission match)` : ''}.</span>`
+      : `<span style="color:#f87171;">No valid rows found. CSV needs AdmissionNo,PhotoUrl columns.</span>`;
+  } catch (err) {
+    if (importBtn) importBtn.style.display = 'none';
+    statusEl.innerHTML = `<span style="color:#f87171;">Could not read CSV: ${escapeHtml(String(err.message || err))}</span>`;
+  }
+}
+
+async function applyOldErpPhotoCsvImport() {
+  const queue = Array.isArray(window._oldErpPhotoImportQueue) ? window._oldErpPhotoImportQueue : [];
+  if (!queue.length) return showNotification('Upload a CSV from old ERP first.', 'warning');
+  if (!window.confirm(`Import ${queue.length} photo(s) from old ERP into cloud storage?\n\nDo one class CSV at a time. This may take a few minutes.`)) return;
+
+  const importBtn = document.getElementById('oldErpPhotoImportBtn');
+  const statusEl = document.getElementById('oldErpPhotoCsvStatus');
+  const cookie = String(document.getElementById('oldErpPhotoCookie')?.value || '').trim();
+
+  if (importBtn) {
+    importBtn.disabled = true;
+    importBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Importing…';
+  }
+  if (statusEl) {
+    statusEl.innerHTML = `<div style="color:#34d399;"><i class="fa-solid fa-cloud-arrow-down fa-beat"></i> Downloading ${queue.length} photo(s) from old ERP…</div>`;
+  }
+
+  try {
+    if (typeof pushBulkPhotoImportFromUrls !== 'function') {
+      throw new Error('Photo import is not available. Upload latest js/cloudSync.js and redeploy api/erp-cloud.js on Vercel.');
+    }
+    const result = await pushBulkPhotoImportFromUrls(queue, cookie);
+    const failed = Array.isArray(result.failed) ? result.failed.length : 0;
+    document.getElementById('bulkPhotoModal')?.remove();
+    showNotification(
+      `Imported ${result.imported || queue.length} real photo(s) from old ERP.${failed ? ` ${failed} failed — check cookie or URL.` : ''} Refresh to see them.`,
+      failed ? 'warning' : 'success'
+    );
+    if (String(window.location.hash || '').includes('students')) {
+      renderStudentsPage(document.getElementById('contentBody'));
+    }
+  } catch (err) {
+    console.error('Old ERP photo import failed:', err);
+    if (importBtn) {
+      importBtn.disabled = false;
+      importBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Import from Old ERP CSV';
+    }
+    if (statusEl) {
+      statusEl.innerHTML = `<div style="color:#f87171; line-height:1.6;"><strong>Import failed.</strong><br>${escapeHtml(String(err.message || err))}<br>Create Supabase bucket <code>student-photos</code> (public) and redeploy API if needed.</div>`;
+    }
+    showNotification(`Photo import failed: ${err.message || err}`, 'error');
+  }
+}
+
 function applyStagedBulkStudentPhotos() {
   const queue = Array.isArray(window._bulkPhotoQueue) ? window._bulkPhotoQueue : [];
   if (!queue.length) return showNotification('No photos matched an admission number.', 'warning');
@@ -9161,6 +9258,7 @@ async function applyStagedBulkStudentPhotosAsync(queue) {
   try {
     let savedAt = '';
     let usedStorage = false;
+    let usedCloudPatch = false;
 
     if (typeof pushBulkStudentPhotosToSupabaseStorage === 'function') {
       try {
@@ -9171,11 +9269,28 @@ async function applyStagedBulkStudentPhotosAsync(queue) {
         savedAt = String(storageResult?.savedAt || window._erpCloudLastPushAt || '').trim();
         usedStorage = true;
       } catch (storageErr) {
-        console.warn('Supabase Storage upload unavailable, falling back to assets folder:', storageErr);
+        console.warn('Supabase Storage upload unavailable, trying cloud photo patch:', storageErr);
       }
     }
 
-    if (!usedStorage) {
+    if (!usedStorage && typeof pushBulkStudentPhotosToCloud === 'function') {
+      try {
+        if (statusEl) {
+          statusEl.innerHTML = `<div style="color:#c084fc;"><i class="fa-solid fa-cloud-arrow-up fa-beat"></i> Saving ${queue.length} real photo(s) to cloud…</div>`;
+        }
+        queue.forEach(row => {
+          row.student.photo = row.dataUrl;
+          row.student.photoDataUrl = row.dataUrl;
+        });
+        const patchResult = await pushBulkStudentPhotosToCloud(queue);
+        savedAt = String(patchResult?.savedAt || window._erpCloudLastPushAt || '').trim();
+        usedCloudPatch = true;
+      } catch (patchErr) {
+        console.warn('Cloud photo patch unavailable, falling back to assets folder:', patchErr);
+      }
+    }
+
+    if (!usedStorage && !usedCloudPatch) {
       queue.forEach(row => {
         const assetPath = studentPhotoAssetPath(row.student.admissionNo);
         row.assetPath = assetPath;
@@ -9208,7 +9323,10 @@ async function applyStagedBulkStudentPhotosAsync(queue) {
 
     if (usedStorage) {
       document.getElementById('bulkPhotoModal')?.remove();
-      showNotification(`Saved ${queue.length} photo(s) to Supabase Storage. Refresh is safe — all PCs will see them.`, 'success');
+      showNotification(`Saved ${queue.length} real photo(s) to Supabase Storage. Refresh is safe — all PCs will see them.`, 'success');
+    } else if (usedCloudPatch) {
+      document.getElementById('bulkPhotoModal')?.remove();
+      showNotification(`Saved ${queue.length} real photo(s) to cloud. Refresh is safe — all PCs will see them.`, 'success');
     } else {
       if (statusEl) {
         statusEl.innerHTML = `<div style="color:#34d399;"><i class="fa-solid fa-file-zipper"></i> Cloud saved. Preparing ZIP download…</div>`;
