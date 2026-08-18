@@ -28,6 +28,113 @@
   let versionProbeSupported = true;
   let fallbackPollTicks = 0;
 
+  function normalizeSubjectsList(subjects) {
+    if (Array.isArray(subjects)) return subjects.filter((s) => s && typeof s === 'object');
+    if (subjects && typeof subjects === 'object') {
+      return Object.values(subjects).filter((s) => s && typeof s === 'object' && (s.code || s.name || s.id));
+    }
+    return [];
+  }
+
+  function normalizePeriodSettingsList(periodSettings) {
+    if (Array.isArray(periodSettings) && periodSettings.length) {
+      return periodSettings.filter((p) => p && typeof p === 'object');
+    }
+    if (periodSettings && typeof periodSettings === 'object') {
+      const vals = Object.values(periodSettings).filter((p) => p && typeof p === 'object' && (p.name || p.periodNo));
+      if (vals.length) return vals;
+    }
+    return [];
+  }
+
+  function mergePeriodSettingsLists(localPeriods, remotePeriods) {
+    const local = normalizePeriodSettingsList(localPeriods);
+    const remote = normalizePeriodSettingsList(remotePeriods);
+    return remote.length ? remote : local;
+  }
+
+  function subjectMergeKey(subject) {
+    return String(subject?.code || subject?.id || subject?.name || '').trim().toLowerCase();
+  }
+
+  /** Never let an empty cloud array wipe subjects saved on another PC. */
+  function mergeSubjectsLists(localSubjects, remoteSubjects) {
+    const local = normalizeSubjectsList(localSubjects);
+    const remote = normalizeSubjectsList(remoteSubjects);
+    if (!remote.length) return local;
+    if (!local.length) return remote;
+    const byKey = new Map();
+    local.forEach((item) => {
+      const key = subjectMergeKey(item);
+      if (key) byKey.set(key, item);
+    });
+    remote.forEach((item) => {
+      const key = subjectMergeKey(item);
+      if (!key) return;
+      byKey.set(key, { ...(byKey.get(key) || {}), ...item });
+    });
+    return Array.from(byKey.values());
+  }
+
+  function staffUserMergeKey(user) {
+    return String(user?.username || user?.id || '').trim().toLowerCase();
+  }
+
+  function mergeStaffUsersLists(localUsers, remoteUsers) {
+    const local = Array.isArray(localUsers) ? localUsers.filter(Boolean) : [];
+    const remote = Array.isArray(remoteUsers) ? remoteUsers.filter(Boolean) : [];
+    if (!remote.length) return local;
+    if (!local.length) return remote;
+    const byKey = new Map();
+    local.forEach((item) => {
+      const key = staffUserMergeKey(item);
+      if (key) byKey.set(key, item);
+    });
+    remote.forEach((item) => {
+      const key = staffUserMergeKey(item);
+      if (!key) return;
+      const prev = byKey.get(key) || {};
+      byKey.set(key, {
+        ...prev,
+        ...item,
+        password: item.password || prev.password || ''
+      });
+    });
+    return Array.from(byKey.values());
+  }
+
+  function teacherMergeKey(teacher) {
+    return String(teacher?.id || teacher?.name || '').trim().toLowerCase();
+  }
+
+  function mergeTeachersLists(localTeachers, remoteTeachers) {
+    const local = Array.isArray(localTeachers) ? localTeachers.filter(Boolean) : [];
+    const remote = Array.isArray(remoteTeachers) ? remoteTeachers.filter(Boolean) : [];
+    if (!remote.length) return local;
+    if (!local.length) return remote;
+    const byKey = new Map();
+    local.forEach((item) => {
+      const key = teacherMergeKey(item);
+      if (key) byKey.set(key, item);
+    });
+    remote.forEach((item) => {
+      const key = teacherMergeKey(item);
+      if (!key) return;
+      byKey.set(key, { ...(byKey.get(key) || {}), ...item });
+    });
+    return Array.from(byKey.values());
+  }
+
+  function mergePlainObjectsPreferNonEmpty(localObj, remoteObj) {
+    const local = localObj && typeof localObj === 'object' ? localObj : {};
+    const remote = remoteObj && typeof remoteObj === 'object' ? remoteObj : {};
+    const localKeys = Object.keys(local);
+    const remoteKeys = Object.keys(remote);
+    if (!remoteKeys.length) return local;
+    if (!localKeys.length) return remote;
+    return { ...local, ...remote };
+  }
+
   function isCloudOnly() {
     // Default ON for MMM JHS. Set window.ERP_CLOUD_ONLY = false only to re-enable hybrid.
     return window.ERP_CLOUD_ONLY !== false;
@@ -46,6 +153,14 @@
     if (secret !== undefined) localStorage.setItem(LS_SECRET, String(secret || '').trim());
   }
 
+  function isLiveSchoolWebsiteHost() {
+    const h = String(window.location.hostname || '').replace(/^www\./, '').toLowerCase();
+    return h === 'mmmjhschool.com'
+      || h.endsWith('.vercel.app')
+      || h === 'madanmohanmalviyaschool.com'
+      || h.includes('mmmjhschool');
+  }
+
   function getErpCloudApiBase() {
     if (typeof getMmmjhsBotApiBase === 'function') return getMmmjhsBotApiBase();
     const host = window.location.hostname;
@@ -53,6 +168,7 @@
       const port = String(window.MMMJHS_BOT_LOCAL_PORT || '8085').trim();
       return `${window.location.protocol}//${host}:${port}/api/mmmjhs-bot`;
     }
+    if (isLiveSchoolWebsiteHost()) return '/api/mmmjhs-bot';
     return 'https://mmmjhschoolbot.onrender.com/api/mmmjhs-bot';
   }
 
@@ -72,6 +188,18 @@
     return withCloudSecret(`${getErpCloudApiBase()}?action=cloudPush`);
   }
 
+  function cloudPhotoPatchUrl() {
+    return withCloudSecret(`${getErpCloudApiBase()}?action=photoPatch`);
+  }
+
+  function cloudPhotoStorageUrl() {
+    return withCloudSecret(`${getErpCloudApiBase()}?action=photoStorageUpload`);
+  }
+
+  function cloudPhotoImportUrl() {
+    return withCloudSecret(`${getErpCloudApiBase()}?action=photoImportFromUrls`);
+  }
+
   function cloudHeaders() {
     const headers = { Accept: 'application/json' };
     const secret = getCloudSecret();
@@ -79,12 +207,17 @@
     return headers;
   }
 
+  function isPhotoApiUnavailableError(err) {
+    const msg = String(err?.message || err || '').toLowerCase();
+    return /not deployed|not found \(404\)|unknown action|cloud api not found|fake ok/i.test(msg);
+  }
+
   async function fetchWithRetry(url, options, retries) {
     const max = retries == null ? 2 : retries;
     let lastErr;
     for (let attempt = 0; attempt <= max; attempt++) {
       const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-      const timeoutMs = 20000;
+      const timeoutMs = Number(options?.timeoutMs) || 20000;
       const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
       try {
         const opts = Object.assign({}, options || {});
@@ -92,7 +225,7 @@
         return await fetch(url, opts);
       } catch (err) {
         lastErr = err && err.name === 'AbortError'
-          ? new Error('Cloud request timed out. Check Render / internet and refresh.')
+          ? new Error('Cloud request timed out. Check internet and refresh — live site should use Vercel /api, not Render.')
           : err;
         if (attempt < max) await new Promise((resolve) => setTimeout(resolve, 2500));
       } finally {
@@ -136,7 +269,7 @@
       return JSON.parse(text);
     } catch (err) {
       if (res.status === 404) {
-        throw new Error('Cloud API not found on Render (404). Redeploy render-server.js + api/erp-cloud.js.');
+        throw new Error('Cloud API not found (404). Deploy api/mmmjhs-bot.js + api/erp-cloud.js on Vercel and hard-refresh the site.');
       }
       throw new Error(`Cloud fetch failed (HTTP ${res.status}): ${text.slice(0, 120)}`);
     }
@@ -288,10 +421,53 @@
     return R;
   }
 
+  function isRealStudentPhoto(value) {
+    const photo = String(value || '').trim();
+    if (photo.startsWith('assets/students/') && /\.(jpe?g|png|webp)$/i.test(photo)) return true;
+    if (/supabase\.co\/storage\/v1\/object\/public\//i.test(photo)) return true;
+    if (!photo.startsWith('data:image')) return false;
+    if (/unsplash|placeholder|dicebear|gravatar/i.test(photo)) return false;
+    return photo.length > 120;
+  }
+
+  function normalizeClassesList(classes) {
+    if (Array.isArray(classes)) return classes.filter((c) => c && typeof c === 'object' && (c.name || c.id));
+    if (classes && typeof classes === 'object') {
+      return Object.values(classes).filter((c) => c && typeof c === 'object' && (c.name || c.id));
+    }
+    return [];
+  }
+
+  function preferStudentPhoto(localValue, remoteValue) {
+    const localPhoto = String(localValue || '').trim();
+    const remotePhoto = String(remoteValue || '').trim();
+    const localReal = isRealStudentPhoto(localPhoto);
+    const remoteReal = isRealStudentPhoto(remotePhoto);
+    if (localReal && !remoteReal) return localPhoto;
+    if (remoteReal && !localReal) return remotePhoto;
+    if (localReal && remoteReal) return localPhoto.length >= remotePhoto.length ? localPhoto : remotePhoto;
+    return localPhoto || remotePhoto;
+  }
+
+  function mergeCloudOnlyStudents(localStudents, remoteStudents) {
+    const localByAdm = new Map((localStudents || []).map((s) => [admissionKey(s), s]));
+    return (remoteStudents || []).map((remoteStudent) => {
+      const key = admissionKey(remoteStudent);
+      const localStudent = localByAdm.get(key);
+      if (!localStudent) return remoteStudent;
+      const photo = preferStudentPhoto(
+        localStudent.photo || localStudent.photoDataUrl,
+        remoteStudent.photo || remoteStudent.photoDataUrl
+      );
+      return { ...remoteStudent, photo, photoDataUrl: photo };
+    });
+  }
+
   function mergeStudent(localStudent, remoteStudent) {
     const L = localStudent || {};
     const R = remoteStudent || {};
     const base = { ...R, ...L };
+    const photo = preferStudentPhoto(L.photo || L.photoDataUrl, R.photo || R.photoDataUrl);
     return {
       ...base,
       name: resolveStudentName(L, R),
@@ -300,6 +476,8 @@
       cardUid: preferText(L.cardUid || L.nfcUid, R.cardUid || R.nfcUid) || L.cardUid || R.cardUid,
       nfcUid: preferText(L.nfcUid, R.nfcUid) || L.nfcUid || R.nfcUid,
       telegramChatId: preferText(L.telegramChatId, R.telegramChatId) || L.telegramChatId || R.telegramChatId,
+      photo,
+      photoDataUrl: photo,
       feeRecords: mergeFeeRecords(L.feeRecords, R.feeRecords),
       currentFeeInfo: mergeFeeSession(L.currentFeeInfo, R.currentFeeInfo)
     };
@@ -369,17 +547,20 @@
     let staffUsers;
     let teachers;
     if (localStudentsAuthoritative) {
-      staffUsers = Array.isArray(local.staffUsers) ? local.staffUsers : (remote.staffUsers || []);
-      teachers = Array.isArray(local.teachers) ? local.teachers : (remote.teachers || []);
+      staffUsers = mergeStaffUsersLists(local.staffUsers, remote.staffUsers);
+      teachers = mergeTeachersLists(local.teachers, remote.teachers);
     } else if (remoteStudentsAuthoritative) {
-      staffUsers = Array.isArray(remote.staffUsers) ? remote.staffUsers : (local.staffUsers || []);
-      teachers = Array.isArray(remote.teachers) ? remote.teachers : (local.teachers || []);
+      staffUsers = mergeStaffUsersLists(remote.staffUsers, local.staffUsers);
+      teachers = mergeTeachersLists(remote.teachers, local.teachers);
     } else {
-      staffUsers = Array.isArray(newerMeta.staffUsers) ? newerMeta.staffUsers
-        : (Array.isArray(olderMeta.staffUsers) ? olderMeta.staffUsers : []);
-      teachers = Array.isArray(newerMeta.teachers) ? newerMeta.teachers
-        : (Array.isArray(olderMeta.teachers) ? olderMeta.teachers : []);
+      staffUsers = mergeStaffUsersLists(olderMeta.staffUsers, newerMeta.staffUsers);
+      teachers = mergeTeachersLists(olderMeta.teachers, newerMeta.teachers);
     }
+
+    const mergedSubjects = mergeSubjectsLists(
+      localStudentsAuthoritative ? local.subjects : remote.subjects,
+      localStudentsAuthoritative ? remote.subjects : local.subjects
+    );
 
     return {
       ...olderMeta,
@@ -388,17 +569,21 @@
       savedAt: new Date().toISOString(),
       students,
       cancelledReceipts,
-      classes: (newerMeta.classes && newerMeta.classes.length) ? newerMeta.classes : (olderMeta.classes || []),
+      classes: (() => {
+        const remoteClasses = normalizeClassesList(remote.classes);
+        const localClasses = normalizeClassesList(local.classes);
+        return remoteClasses.length ? remoteClasses : localClasses;
+      })(),
       staffUsers,
       schoolProfile: newerMeta.schoolProfile || olderMeta.schoolProfile,
       signatures: newerMeta.signatures || olderMeta.signatures,
       teachers,
-      subjects: newerMeta.subjects || olderMeta.subjects,
+      subjects: mergedSubjects,
       sessions: newerMeta.sessions || olderMeta.sessions,
-      classFeeMaster: newerMeta.classFeeMaster || olderMeta.classFeeMaster,
-      feeScheduleRules: newerMeta.feeScheduleRules || olderMeta.feeScheduleRules,
-      examSubjectConfigs: newerMeta.examSubjectConfigs || olderMeta.examSubjectConfigs,
-      periodSettings: newerMeta.periodSettings || olderMeta.periodSettings,
+      classFeeMaster: mergePlainObjectsPreferNonEmpty(olderMeta.classFeeMaster, newerMeta.classFeeMaster),
+      feeScheduleRules: mergePlainObjectsPreferNonEmpty(olderMeta.feeScheduleRules, newerMeta.feeScheduleRules),
+      examSubjectConfigs: mergePlainObjectsPreferNonEmpty(olderMeta.examSubjectConfigs, newerMeta.examSubjectConfigs),
+      periodSettings: mergePeriodSettingsLists(olderMeta.periodSettings, newerMeta.periodSettings),
       activeSession: newerMeta.activeSession || olderMeta.activeSession
     };
   }
@@ -663,8 +848,19 @@
       if (cloudOnly && memoryDirty) {
         merged = mergeSchoolPayloads(localPayload, cloudPayload, { localStudentsAuthoritative: true });
       } else if (cloudOnly) {
+        const remoteClasses = normalizeClassesList(cloudPayload.classes);
+        const localClasses = normalizeClassesList(localPayload.classes);
         merged = {
           ...cloudPayload,
+          students: mergeCloudOnlyStudents(localPayload.students, cloudPayload.students),
+          classes: remoteClasses.length ? remoteClasses : localClasses,
+          subjects: mergeSubjectsLists(localPayload.subjects, cloudPayload.subjects),
+          staffUsers: mergeStaffUsersLists(localPayload.staffUsers, cloudPayload.staffUsers),
+          teachers: mergeTeachersLists(localPayload.teachers, cloudPayload.teachers),
+          examSubjectConfigs: mergePlainObjectsPreferNonEmpty(localPayload.examSubjectConfigs, cloudPayload.examSubjectConfigs),
+          classFeeMaster: mergePlainObjectsPreferNonEmpty(localPayload.classFeeMaster, cloudPayload.classFeeMaster),
+          feeScheduleRules: mergePlainObjectsPreferNonEmpty(localPayload.feeScheduleRules, cloudPayload.feeScheduleRules),
+          periodSettings: mergePeriodSettingsLists(localPayload.periodSettings, cloudPayload.periodSettings),
           cancelledReceipts: mergeCancelledReceipts(localPayload.cancelledReceipts, cloudPayload.cancelledReceipts),
           savedAt: cloudPayload.savedAt || snapshot.saved_at || new Date().toISOString()
         };
@@ -713,6 +909,12 @@
       if (!applied) throw new Error('Cloud snapshot could not be applied.');
       if (typeof repairCrossDeviceStudentIdentityDrift === 'function') {
         repairCrossDeviceStudentIdentityDrift();
+      }
+      if (typeof ensureSchoolDataClasses === 'function') {
+        ensureSchoolDataClasses();
+      }
+      if (typeof loadStudentPhotoCacheFromIdb === 'function') {
+        try { await loadStudentPhotoCacheFromIdb(); } catch (e) {}
       }
 
       const cloudStamp = snapshot.saved_at || cloudPayload.savedAt || new Date().toISOString();
@@ -864,6 +1066,289 @@
       try { window.saveCloudDisplayCache(buildSchoolDataStoragePayload()); } catch (e) {}
     }
     return data;
+  }
+
+  async function pushStudentPhotoBatchToCloud(photos) {
+    const schoolId = getCloudSchoolId();
+    const savedBy = (typeof getCurrentActiveUser === 'function' && getCurrentActiveUser()?.name) || 'Bulk photo upload';
+    const res = await fetchWithRetry(cloudPhotoPatchUrl(), {
+      method: 'POST',
+      headers: { ...cloudHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ schoolId, photos, savedBy }),
+      timeoutMs: 90000
+    });
+    const data = await parseCloudResponse(res);
+    if (!data.ok) throw new Error(data.error || 'Photo cloud save failed.');
+    if (!Number(data.patched) || !String(data.savedAt || '').trim()) {
+      throw new Error('Photo API is not deployed on the server yet (got a fake OK). Use assets folder upload or redeploy api/erp-cloud.js.');
+    }
+    return data;
+  }
+
+  async function pushStudentPhotoStorageBatchToCloud(photos) {
+    const schoolId = getCloudSchoolId();
+    const savedBy = (typeof getCurrentActiveUser === 'function' && getCurrentActiveUser()?.name) || 'Bulk photo upload';
+    const res = await fetchWithRetry(cloudPhotoStorageUrl(), {
+      method: 'POST',
+      headers: { ...cloudHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ schoolId, photos, savedBy }),
+      timeoutMs: 120000
+    });
+    const data = await parseCloudResponse(res);
+    if (!data.ok) throw new Error(data.error || 'Photo storage upload failed.');
+    if (!Number(data.patched) || !String(data.savedAt || '').trim() || !data.storage) {
+      throw new Error('Photo storage API is not deployed yet. Create the Supabase bucket and redeploy api/erp-cloud.js.');
+    }
+    return data;
+  }
+
+  async function pushPhotoImportFromUrlsBatch(items, cookie) {
+    const schoolId = getCloudSchoolId();
+    const savedBy = (typeof getCurrentActiveUser === 'function' && getCurrentActiveUser()?.name) || 'Old ERP photo import';
+    const res = await fetchWithRetry(cloudPhotoImportUrl(), {
+      method: 'POST',
+      headers: { ...cloudHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ schoolId, items, cookie: cookie || '', savedBy })
+    });
+    const data = await parseCloudResponse(res);
+    if (!data.ok) throw new Error(data.error || 'Photo import failed.');
+    if (!Number(data.imported || data.patched) || !String(data.savedAt || '').trim()) {
+      throw new Error('Photo import API is not deployed yet. Redeploy api/erp-cloud.js on Vercel.');
+    }
+    return data;
+  }
+
+  /** Import photos from old ERP URLs (CSV manifest) into Supabase Storage. */
+  async function pushBulkPhotoImportFromUrls(importRows, cookie) {
+    const rows = Array.isArray(importRows) ? importRows.filter(row => row?.admissionNo && row?.url) : [];
+    if (!rows.length) throw new Error('No photo URLs to import.');
+
+    cancelScheduledCloudPush();
+    window._erpCloudMemoryDirty = true;
+    window._erpCloudSyncState = 'syncing';
+
+    const BATCH_SIZE = 15;
+    let imported = 0;
+    let savedAt = '';
+    const allUploaded = [];
+    const allFailed = [];
+
+    try {
+      for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+        const batch = rows.slice(i, i + BATCH_SIZE).map(row => ({
+          admissionNo: row.admissionNo,
+          url: row.url
+        }));
+        const result = await pushPhotoImportFromUrlsBatch(batch, cookie);
+        const uploaded = Array.isArray(result.uploaded) ? result.uploaded : [];
+        uploaded.forEach((item) => {
+          const key = String(item.admissionNo || '').trim().toLowerCase();
+          const student = typeof findStudentByAdmissionNo === 'function'
+            ? findStudentByAdmissionNo(item.admissionNo)
+            : (SchoolData.students || []).find(s => String(s.admissionNo || '').trim().toLowerCase() === key);
+          if (student && item.photoUrl) {
+            student.photo = item.photoUrl;
+            student.photoDataUrl = item.photoUrl;
+          }
+        });
+        allUploaded.push(...uploaded);
+        if (Array.isArray(result.failed)) allFailed.push(...result.failed);
+        imported += Number(result.imported || result.patched || uploaded.length);
+        savedAt = result.savedAt || savedAt;
+      }
+
+      if (typeof saveSchoolDataToStorage === 'function') {
+        saveSchoolDataToStorage({ skipCloudPush: true });
+      }
+      if (savedAt) {
+        localStorage.setItem(LS_LAST_CLOUD_AT, savedAt);
+        localStorage.setItem(LS_LAST_PULL, savedAt);
+        window._erpCloudLastPushAt = savedAt;
+      }
+      window._erpCloudLastPushCount = imported;
+      window._erpCloudLastPushError = '';
+      window._erpCloudSyncState = 'live';
+
+      if (typeof window.saveCloudDisplayCache === 'function' && typeof buildSchoolDataStoragePayload === 'function') {
+        try { window.saveCloudDisplayCache(buildSchoolDataStoragePayload()); } catch (e) {}
+      }
+
+      return { ok: true, imported, savedAt, uploaded: allUploaded, failed: allFailed, storage: true };
+    } catch (err) {
+      window._erpCloudLastPushError = err.message;
+      window._erpCloudSyncState = 'error';
+      throw err;
+    } finally {
+      window._erpCloudMemoryDirty = false;
+    }
+  }
+
+  function estimatePhotoPayloadBytes(photos) {
+    return (photos || []).reduce((sum, row) => {
+      const photo = String(row?.photo || row?.photoDataUrl || row?.dataUrl || '');
+      return sum + photo.length + 96;
+    }, 200);
+  }
+
+  /** Keep each API request under Vercel ~4.5MB body limit (use 2MB safety cap). */
+  function splitPhotoUploadBatches(photoRows, options) {
+    const opts = options || {};
+    const maxBytes = Number(opts.maxBytes) || 2000000;
+    const maxCount = Number(opts.maxCount) || 12;
+    const rows = Array.isArray(photoRows) ? photoRows.filter(row => row?.student && row?.dataUrl) : [];
+    const batches = [];
+    let current = [];
+    let currentBytes = 0;
+
+    rows.forEach((row) => {
+      const item = {
+        admissionNo: row.student.admissionNo || row.student.AdmissionNo,
+        photo: row.dataUrl,
+        photoDataUrl: row.dataUrl,
+        _sourceRow: row
+      };
+      const itemBytes = estimatePhotoPayloadBytes([item]);
+      if (current.length && (current.length >= maxCount || currentBytes + itemBytes > maxBytes)) {
+        batches.push(current);
+        current = [];
+        currentBytes = 0;
+      }
+      current.push(item);
+      currentBytes += itemBytes;
+    });
+    if (current.length) batches.push(current);
+    return batches;
+  }
+
+  async function pushBulkStudentPhotosToSupabaseStorage(photoRows, options) {
+    const rows = Array.isArray(photoRows) ? photoRows.filter(row => row?.student && row?.dataUrl) : [];
+    if (!rows.length) throw new Error('No photos to save.');
+    const onProgress = options && typeof options.onProgress === 'function' ? options.onProgress : null;
+
+    cancelScheduledCloudPush();
+    window._erpCloudMemoryDirty = true;
+    window._erpCloudSyncState = 'syncing';
+
+    const batches = splitPhotoUploadBatches(rows);
+    let patched = 0;
+    let savedAt = '';
+
+    try {
+      for (let i = 0; i < batches.length; i += 1) {
+        const batch = batches[i];
+        if (onProgress) {
+          onProgress({
+            mode: 'storage',
+            batch: i + 1,
+            totalBatches: batches.length,
+            batchSize: batch.length,
+            totalPhotos: rows.length
+          });
+        }
+        const payload = batch.map(({ admissionNo, photo, photoDataUrl }) => ({ admissionNo, photo, photoDataUrl }));
+        const result = await pushStudentPhotoStorageBatchToCloud(payload);
+        const uploaded = Array.isArray(result.uploaded) ? result.uploaded : [];
+        uploaded.forEach((item) => {
+          const key = String(item.admissionNo || '').trim().toLowerCase();
+          const row = rows.find(r => String(r.student?.admissionNo || '').trim().toLowerCase() === key);
+          if (!row || !item.photoUrl) return;
+          row.student.photo = item.photoUrl;
+          row.student.photoDataUrl = item.photoUrl;
+        });
+        patched += Number(result.patched || uploaded.length);
+        savedAt = result.savedAt || savedAt;
+      }
+
+      if (typeof saveSchoolDataToStorage === 'function') {
+        saveSchoolDataToStorage({ skipCloudPush: true });
+      }
+      if (savedAt) {
+        localStorage.setItem(LS_LAST_CLOUD_AT, savedAt);
+        localStorage.setItem(LS_LAST_PULL, savedAt);
+        window._erpCloudLastPushAt = savedAt;
+      }
+      window._erpCloudLastPushCount = patched;
+      window._erpCloudLastPushError = '';
+      window._erpCloudSyncState = 'live';
+
+      if (typeof window.saveCloudDisplayCache === 'function' && typeof buildSchoolDataStoragePayload === 'function') {
+        try { window.saveCloudDisplayCache(buildSchoolDataStoragePayload()); } catch (e) {}
+      }
+
+      return { ok: true, patched, savedAt, storage: true };
+    } catch (err) {
+      window._erpCloudLastPushError = err.message;
+      window._erpCloudSyncState = 'error';
+      throw err;
+    } finally {
+      window._erpCloudMemoryDirty = false;
+    }
+  }
+
+  /** Save bulk-uploaded photos in small batches so refresh keeps them. */
+  async function pushBulkStudentPhotosToCloud(photoRows, options) {
+    const rows = Array.isArray(photoRows) ? photoRows.filter(row => row?.student && row?.dataUrl) : [];
+    if (!rows.length) throw new Error('No photos to save.');
+    const onProgress = options && typeof options.onProgress === 'function' ? options.onProgress : null;
+
+    cancelScheduledCloudPush();
+    window._erpCloudMemoryDirty = true;
+    window._erpCloudSyncState = 'syncing';
+
+    const batches = splitPhotoUploadBatches(rows);
+    let patched = 0;
+    let savedAt = '';
+
+    try {
+      for (let i = 0; i < batches.length; i += 1) {
+        const batch = batches[i];
+        if (onProgress) {
+          onProgress({
+            mode: 'patch',
+            batch: i + 1,
+            totalBatches: batches.length,
+            batchSize: batch.length,
+            totalPhotos: rows.length
+          });
+        }
+        const payload = batch.map(({ admissionNo, photo, photoDataUrl }) => ({ admissionNo, photo, photoDataUrl }));
+        const result = await pushStudentPhotoBatchToCloud(payload);
+        payload.forEach((item) => {
+          const key = String(item.admissionNo || '').trim().toLowerCase();
+          const row = rows.find(r => String(r.student?.admissionNo || '').trim().toLowerCase() === key);
+          if (row) {
+            row.student.photo = item.photo;
+            row.student.photoDataUrl = item.photo;
+          }
+        });
+        patched += Number(result.patched || payload.length);
+        savedAt = result.savedAt || savedAt;
+      }
+
+      if (savedAt) {
+        localStorage.setItem(LS_LAST_CLOUD_AT, savedAt);
+        localStorage.setItem(LS_LAST_PULL, savedAt);
+        window._erpCloudLastPushAt = savedAt;
+      }
+      window._erpCloudLastPushCount = patched;
+      window._erpCloudLastPushError = '';
+      window._erpCloudSyncState = 'live';
+
+      if (typeof saveSchoolDataToStorage === 'function') {
+        saveSchoolDataToStorage({ skipCloudPush: true });
+      }
+      if (typeof window.saveCloudDisplayCache === 'function' && typeof buildSchoolDataStoragePayload === 'function') {
+        try { window.saveCloudDisplayCache(buildSchoolDataStoragePayload()); } catch (e) {}
+      }
+
+      return { ok: true, patched, savedAt };
+    } catch (err) {
+      window._erpCloudLastPushError = err.message;
+      window._erpCloudSyncState = 'error';
+      throw err;
+    } finally {
+      window._erpCloudMemoryDirty = false;
+    }
   }
 
   function flushCloudPushNow() {
@@ -1048,6 +1533,8 @@
   }
 
   window.isErpCloudOnly = isCloudOnly;
+  window.isRealStudentPhoto = isRealStudentPhoto;
+  window.preferStudentPhoto = preferStudentPhoto;
   window.getCloudSchoolId = getCloudSchoolId;
   window.getCloudSecret = getCloudSecret;
   window.setCloudCredentials = setCloudCredentials;
@@ -1059,6 +1546,11 @@
   window.scheduleCloudPush = scheduleCloudPush;
   window.cancelScheduledCloudPush = cancelScheduledCloudPush;
   window.pushStaffAuthorityToCloud = pushStaffAuthorityToCloud;
+  window.pushBulkStudentPhotosToCloud = pushBulkStudentPhotosToCloud;
+  window.pushBulkStudentPhotosToSupabaseStorage = pushBulkStudentPhotosToSupabaseStorage;
+  window.splitPhotoUploadBatches = splitPhotoUploadBatches;
+  window.isPhotoApiUnavailableError = isPhotoApiUnavailableError;
+  window.pushBulkPhotoImportFromUrls = pushBulkPhotoImportFromUrls;
   window.flushCloudPushNow = flushCloudPushNow;
   window.getCloudSyncStatusText = getCloudSyncStatusText;
   window.mergeSchoolPayloadsForCloud = mergeSchoolPayloads;

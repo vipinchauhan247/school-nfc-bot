@@ -185,7 +185,88 @@ html, body {
   gap: 6px;
   font-size: 0.72rem;
   margin-top: 8px;
-  color: var(--text-muted);
+  color: #94a3b8;
+}
+
+.sidebar .sidebar-session-widget label {
+  color: #c7d2fe;
+}
+
+.sidebar .role-label,
+.sidebar .sidebar-footer,
+.sidebar .sidebar-footer small,
+.sidebar .sidebar-footer strong {
+  color: #e2e8f0;
+}
+
+input[type="date"],
+input[type="month"],
+input[type="time"],
+input[type="datetime-local"] {
+  color-scheme: dark;
+  accent-color: var(--accent-primary);
+}
+
+input[type="date"].session-dropdown,
+input[type="month"].session-dropdown,
+input[type="time"].session-dropdown,
+input[type="datetime-local"].session-dropdown {
+  background: #111827;
+  color: #ffffff;
+  border: 1px solid #475569;
+}
+
+[data-theme="light"] input[type="date"]:not(.sidebar input),
+[data-theme="light"] input[type="month"]:not(.sidebar input),
+[data-theme="light"] input[type="time"]:not(.sidebar input),
+[data-theme="light"] input[type="datetime-local"]:not(.sidebar input) {
+  color-scheme: light;
+  background: #ffffff;
+  color: #0f172a;
+  border-color: rgba(0, 0, 0, 0.12);
+}
+
+.exam-schedule-time-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.exam-schedule-clock-icon {
+  color: #fbbf24;
+  font-size: 0.95rem;
+  flex-shrink: 0;
+}
+
+[data-theme="light"] .exam-schedule-clock-icon {
+  color: #d97706;
+}
+
+.theme-panel-modal {
+  background: var(--bg-secondary) !important;
+  color: var(--text-main) !important;
+}
+
+.theme-panel-modal .theme-panel-muted {
+  color: var(--text-muted) !important;
+}
+
+.theme-panel-modal .theme-panel-table-wrap {
+  background: var(--bg-primary) !important;
+  border-color: var(--border-color) !important;
+}
+
+.theme-panel-modal .theme-panel-table-head {
+  background: var(--bg-card) !important;
+  color: var(--accent-primary) !important;
+}
+
+.theme-panel-modal .theme-panel-row {
+  border-bottom-color: var(--border-color) !important;
+}
+
+.theme-panel-modal .theme-panel-name {
+  color: var(--text-main) !important;
 }
 
 .status-dot {
@@ -206,9 +287,13 @@ html, body {
 .nav-section-title {
   font-size: 0.68rem;
   font-weight: 700;
-  color: var(--text-dim);
+  color: #94a3b8;
   padding: 12px 12px 6px 12px;
   letter-spacing: 1px;
+}
+
+.sidebar .nav-item {
+  color: #e2e8f0;
 }
 
 .nav-item {
@@ -216,7 +301,7 @@ html, body {
   align-items: center;
   gap: 12px;
   padding: 10px 14px;
-  color: var(--text-muted);
+  color: #e2e8f0;
   text-decoration: none;
   border-radius: var(--radius-sm);
   font-size: 0.9rem;
@@ -668,6 +753,72 @@ html, body {
 .badge-info { background: rgba(6, 182, 212, 0.15); color: var(--accent-cyan); border: 1px solid rgba(6, 182, 212, 0.3); }
 .badge-purple { background: rgba(139, 92, 246, 0.15); color: var(--accent-secondary); border: 1px solid rgba(139, 92, 246, 0.3); }
 
+/* Admission number — same chip in exams, fees ledger, student profile */
+.adm-no-chip {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 3px 9px;
+  border-radius: 8px;
+  font-size: 0.78rem;
+  font-weight: 800;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  letter-spacing: 0.02em;
+  color: #c7d2fe;
+  background: rgba(99, 102, 241, 0.22);
+  border: 1px solid rgba(129, 140, 248, 0.45);
+}
+
+[data-theme="light"] .adm-no-chip {
+  color: #312e81;
+  background: rgba(99, 102, 241, 0.12);
+  border-color: rgba(79, 70, 229, 0.35);
+}
+
+/* On dark profile banner — keep chip readable over purple gradient */
+.profile-header-adm.adm-no-chip,
+.adm-no-chip.profile-header-adm {
+  margin-top: 0;
+  color: #e0e7ff;
+  background: rgba(15, 23, 42, 0.35);
+  border-color: rgba(199, 210, 254, 0.45);
+}
+
+[data-theme="light"] .profile-header-adm.adm-no-chip,
+[data-theme="light"] .adm-no-chip.profile-header-adm {
+  color: #1e1b4b;
+  background: rgba(255, 255, 255, 0.92);
+  border-color: rgba(79, 70, 229, 0.25);
+}
+
+/* Staff role label — readable on light and dark page backgrounds */
+.erp-role-chip {
+  display: inline-block;
+  padding: 5px 11px;
+  border-radius: 8px;
+  font-size: 0.82rem;
+  font-weight: 700;
+  line-height: 1.25;
+  color: #e2e8f0;
+  background: rgba(51, 65, 85, 0.55);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+}
+
+[data-theme="light"] .erp-role-chip {
+  color: #0f172a;
+  background: #f1f5f9;
+  border-color: rgba(15, 23, 42, 0.14);
+}
+
+.exam-student-name {
+  font-weight: 800;
+  font-size: 1.02rem;
+  color: #38bdf8;
+}
+
+[data-theme="light"] .exam-student-name {
+  color: #1d4ed8;
+}
+
 /* Student Profile Modal & Drawer */
 .student-profile-header {
   display: flex;
@@ -1080,6 +1231,7 @@ body.sidebar-open .sidebar-overlay {
 .data-table-container.custom-matrix-scroll {
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
+  touch-action: pan-x pan-y;
 }
 
 .sticky-col-1,
@@ -1110,14 +1262,56 @@ thead .sticky-col-3 {
 
 .sticky-col-2 {
   left: 50px !important;
-  min-width: 180px !important;
+  width: 128px !important;
+  min-width: 128px !important;
+  max-width: 128px !important;
   border-right: 1px solid #334155 !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
 }
 
 .sticky-col-3 {
-  left: 230px !important;
-  min-width: 165px !important;
+  left: 178px !important;
+  width: 96px !important;
+  min-width: 96px !important;
+  max-width: 96px !important;
   border-right: 3px solid #6366f1 !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+}
+
+#subjectTableContainer .exam-student-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.84rem;
+  font-weight: 700;
+  color: #38bdf8;
+}
+
+[data-theme="light"] .sticky-col-1,
+[data-theme="light"] .sticky-col-2,
+[data-theme="light"] .sticky-col-3,
+[data-theme="light"] thead .sticky-col-1,
+[data-theme="light"] thead .sticky-col-2,
+[data-theme="light"] thead .sticky-col-3 {
+  background: #f1f5f9 !important;
+  box-shadow: 2px 0 0 rgba(148, 163, 184, 0.55);
+}
+
+[data-theme="light"] .users-permissions-matrix .users-sticky-name,
+[data-theme="light"] .users-permissions-matrix .users-sticky-role,
+[data-theme="light"] .users-permissions-matrix thead .users-sticky-name,
+[data-theme="light"] .users-permissions-matrix thead .users-sticky-role,
+[data-theme="light"] .users-permissions-matrix tbody tr .users-sticky-name,
+[data-theme="light"] .users-permissions-matrix tbody tr .users-sticky-role {
+  background-color: #f8fafc !important;
+}
+
+[data-theme="light"] .users-permissions-matrix tbody tr:hover .users-sticky-name,
+[data-theme="light"] .users-permissions-matrix tbody tr:hover .users-sticky-role {
+  background-color: #eef2f7 !important;
 }
 
 /* Slightly narrower frozen cols on phones so marks columns stay visible */
@@ -1138,22 +1332,18 @@ thead .sticky-col-3 {
 
   .sticky-col-2 {
     left: 36px !important;
-    width: 120px !important;
-    min-width: 120px !important;
-    max-width: 120px !important;
-    font-size: 0.88rem !important;
-    white-space: normal !important;
-    line-height: 1.2 !important;
+    width: 108px !important;
+    min-width: 108px !important;
+    max-width: 108px !important;
+    font-size: 0.78rem !important;
   }
 
   .sticky-col-3 {
-    left: 156px !important;
-    width: 100px !important;
-    min-width: 100px !important;
-    max-width: 100px !important;
-    font-size: 0.8rem !important;
-    white-space: normal !important;
-    line-height: 1.2 !important;
+    left: 144px !important;
+    width: 82px !important;
+    min-width: 82px !important;
+    max-width: 82px !important;
+    font-size: 0.74rem !important;
   }
 }
 
@@ -1374,4 +1564,54 @@ html[data-theme="light"] .login-input {
   }
   .login-hero h1 { font-size: 1.55rem; }
   .login-panel { padding: 32px 28px; }
+}
+
+/* User permissions matrix — freeze name + role while scrolling fee/report columns */
+.users-matrix-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+  -webkit-overflow-scrolling: touch;
+}
+
+.users-permissions-matrix .users-sticky-name,
+.users-permissions-matrix .users-sticky-role {
+  position: sticky;
+  z-index: 4;
+  background-color: #0f172a !important;
+  background-clip: padding-box;
+  isolation: isolate;
+  box-shadow: 2px 0 0 rgba(51, 65, 85, 0.65);
+}
+
+.users-permissions-matrix thead .users-sticky-name,
+.users-permissions-matrix thead .users-sticky-role {
+  z-index: 6;
+  top: 0;
+  background-color: #0f172a !important;
+}
+
+.users-permissions-matrix tbody tr .users-sticky-name,
+.users-permissions-matrix tbody tr .users-sticky-role {
+  background-color: #0f172a !important;
+}
+
+.users-permissions-matrix tbody tr:hover .users-sticky-name,
+.users-permissions-matrix tbody tr:hover .users-sticky-role {
+  background-color: #131c31 !important;
+}
+
+.users-permissions-matrix .users-sticky-name {
+  left: 0;
+  min-width: 170px;
+}
+
+.users-permissions-matrix .users-sticky-role {
+  left: 170px;
+  min-width: 210px;
+  border-right: 2px solid rgba(56, 189, 248, 0.45);
+}
+
+.users-permissions-matrix .users-sticky-role .erp-role-chip {
+  max-width: 190px;
+  white-space: normal;
 }
