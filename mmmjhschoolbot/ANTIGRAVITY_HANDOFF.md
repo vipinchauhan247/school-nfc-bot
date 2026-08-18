@@ -92,6 +92,8 @@ Prioritize merging/deploying in this order:
 
 | File | Contents |
 |------|----------|
+| `ANTIGRAVITY_HANDOFF.md` | Full architecture handoff for external agents |
+| `VERCEL_UPLOAD_CHECKLIST.md` | Step-by-step safe Vercel deploy + bandwidth check |
 | `CLOUD_ONLY.md` | Cloud-only mode, Vercel upload list, empty snapshot recovery |
 | `MOCKDATA.md` | Why `mockData.js` must exist |
 | `DATA_RECOVERY.md` | Restore after data loss |
