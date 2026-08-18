@@ -13062,6 +13062,8 @@ function pushSchoolMetaToCloudNow() {
     scheduleCloudPush(0);
   }
 }
+
+function openEditSubjectModal(subId) {
   if (!canCurrentUserModifySubjects()) {
     showNotification('Access denied: teachers cannot edit the Subjects Directory.', 'warning');
     return;
