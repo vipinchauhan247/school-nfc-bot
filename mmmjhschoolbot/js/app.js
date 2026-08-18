@@ -306,6 +306,49 @@ function formatReportCardAttendanceLine(summary) {
   return `Attendance: ${summary.daysPresent} / ${summary.workingDays} working days${lateNote} — ${summary.percentage}%`;
 }
 
+function getStudentPen(student) {
+  return String(student?.pen || student?.PEN || '').trim() || '—';
+}
+
+/** Shared student block for report cards — photo, PEN, and profile fields required on official documents. */
+function getReportCardStudentInfoHtml(student, meta = {}) {
+  const cls = meta.cls || student.currentClass || student.class || '';
+  const sec = meta.sec || student.currentSection || student.section || '';
+  const roll = meta.roll || student.currentRollNo || student.rollNo || '—';
+  const attendanceLine = meta.attendanceLine || '';
+  const classTeacherName = meta.classTeacherName || '';
+  const accent = meta.accent || '#4f46e5';
+  const photoSize = meta.photoSize || 58;
+  const pen = getStudentPen(student);
+  const caste = String(student?.caste || '').trim();
+  const address = String(student?.address || '').trim();
+  const shortAddress = address.length > 72 ? `${address.slice(0, 69)}…` : address;
+
+  return `
+    <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:12px 16px; margin-bottom:14px; display:flex; align-items:flex-start; justify-content:space-between; flex-wrap:wrap; gap:12px; font-size:0.92rem; line-height:1.55;">
+      <div style="display:flex; align-items:center; gap:12px; min-width:240px; flex:1;">
+        ${getStudentDirectoryPhotoHtml(student, photoSize)}
+        <div>
+          <h3 style="font-size:1.22rem; margin:0 0 4px 0; color:#0f172a; font-weight:800;">${escapeHtml(student.name || '')}</h3>
+          <div style="display:flex; flex-wrap:wrap; gap:8px 14px; font-size:0.9rem; color:#334155;">
+            <span><strong>Adm No:</strong> <code style="color:${accent}; font-weight:800;">${escapeHtml(String(student.admissionNo || ''))}</code></span>
+            <span><strong>PEN:</strong> <code style="color:#7c3aed; font-weight:800;">${escapeHtml(pen)}</code></span>
+            <span><strong>Class:</strong> <strong style="color:${accent};">${escapeHtml(cls)} - ${escapeHtml(sec)}</strong></span>
+            <span><strong>Roll:</strong> ${escapeHtml(String(roll))}</span>
+          </div>
+        </div>
+      </div>
+      <div style="font-size:0.9rem; color:#1e293b; min-width:220px; flex:1;">
+        <div><strong>Father:</strong> ${escapeHtml(student.parentName || '—')}</div>
+        <div><strong>Mother:</strong> ${escapeHtml(student.motherName || 'N/A')}</div>
+        <div><strong>DOB:</strong> <strong style="color:#0284c7;">${escapeHtml(formatDobToDDMMYYYY(student.dob))}</strong>${caste ? ` | <strong>Caste:</strong> ${escapeHtml(caste)}` : ''}</div>
+        ${shortAddress ? `<div><strong>Address:</strong> ${escapeHtml(shortAddress)}</div>` : ''}
+        ${attendanceLine ? `<div><strong>${escapeHtml(attendanceLine)}</strong></div>` : ''}
+        ${classTeacherName ? `<div><strong>Class Teacher:</strong> ${escapeHtml(classTeacherName)}</div>` : ''}
+      </div>
+    </div>`;
+}
+
 function getTeacherSignatureByName(teacherName) {
   const teacher = (SchoolData.teachers || []).find(t => String(t.name || '').trim().toLowerCase() === String(teacherName || '').trim().toLowerCase());
   return teacher?.signatureDataUrl || '';
@@ -3221,13 +3264,23 @@ function renderExamsPage(container, mode = 'entry') {
         }
         #subjectTableContainer .sticky-col-2 {
           left: 50px !important;
-          min-width: 180px !important;
+          width: 128px !important;
+          min-width: 128px !important;
+          max-width: 128px !important;
           border-right: 1px solid #334155 !important;
         }
         #subjectTableContainer .sticky-col-3 {
-          left: 230px !important;
-          min-width: 165px !important;
+          left: 178px !important;
+          width: 96px !important;
+          min-width: 96px !important;
+          max-width: 96px !important;
           border-right: 3px solid #6366f1 !important;
+        }
+        #subjectTableContainer .sticky-col-2 .exam-student-name,
+        #subjectTableContainer .sticky-col-3 {
+          overflow: hidden !important;
+          text-overflow: ellipsis !important;
+          white-space: nowrap !important;
         }
         @media (max-width: 1024px) {
           #subjectTableContainer {
@@ -3270,8 +3323,8 @@ function renderExamsPage(container, mode = 'entry') {
             <!-- TOP GROUP HEADER ROW -->
             <tr style="background:#0f172a; color:#ffffff;">
               <th rowspan="2" class="sticky-col-1" style="width:50px; border-bottom:2px solid #334155; padding:12px;">S.No</th>
-              <th rowspan="2" class="sticky-col-2" style="min-width:180px; text-align:left; border-bottom:2px solid #334155; padding:12px; color:#38bdf8;">Student &amp; Adm No</th>
-              <th rowspan="2" class="sticky-col-3" style="min-width:165px; text-align:left; border-bottom:2px solid #334155; padding:12px; color:#cbd5e1;">Father's Name</th>
+              <th rowspan="2" class="sticky-col-2" style="width:128px; max-width:128px; text-align:left; border-bottom:2px solid #334155; padding:8px; color:#38bdf8; font-size:0.82rem;">Student</th>
+              <th rowspan="2" class="sticky-col-3" style="width:96px; max-width:96px; text-align:left; border-bottom:2px solid #334155; padding:8px; color:#cbd5e1; font-size:0.82rem;">Father</th>
 
               ${allSubjects.map(sub => `
                 <th id="sub-header-${sub.code}" colspan="${examTerm === 'consolidated' ? '3' : '4'}" style="position:sticky; top:0; z-index:20; background:#1e293b; color:#fbbf24; border:1px solid #334155; padding:12px; font-size:1.1rem; letter-spacing:1px;">${sub.name}</th>
@@ -3421,11 +3474,11 @@ function renderExamsPage(container, mode = 'entry') {
               return `
                 <tr class="marks-entry-row" data-admission="${s.admissionNo}" style="border-bottom:1px solid #334155;">
                   <td class="sticky-col-1" style="border-bottom:1px solid #334155; padding:10px;"><code>${idx + 1}</code></td>
-                  <td class="sticky-col-2" style="text-align:left; border-bottom:1px solid #334155; padding:10px;">
-                    <div class="exam-student-name">${s.name}</div>
-                    <span class="adm-no-chip">Adm ${s.admissionNo}</span>
+                  <td class="sticky-col-2" style="text-align:left; border-bottom:1px solid #334155; padding:6px 8px;" title="${escapeHtml(s.name || '')} — Adm ${escapeHtml(String(s.admissionNo || ''))}">
+                    <div class="exam-student-name">${escapeHtml(s.name || '')}</div>
+                    <span class="adm-no-chip" style="font-size:0.68rem;">${escapeHtml(String(s.admissionNo || ''))}</span>
                   </td>
-                  <td class="sticky-col-3" style="text-align:left; border-bottom:1px solid #334155; color:#cbd5e1; font-size:0.95rem; padding:10px;">${s.parentName}</td>
+                  <td class="sticky-col-3" style="text-align:left; border-bottom:1px solid #334155; color:#cbd5e1; font-size:0.82rem; padding:6px 8px;" title="${escapeHtml(s.parentName || '')}">${escapeHtml(s.parentName || '')}</td>
 
                   ${subCells}
 
@@ -4643,13 +4696,17 @@ function buildAdmitCardHtml(student, term, schedule, options = {}) {
   const session = SchoolData.activeSession || '';
   const sigs = SchoolData.signatures || {};
   const principalSig = school.principalSignatureDataUrl || sigs.principalSig || '';
-  // Print window is about:blank — relative asset paths would not resolve there.
   const logo = getPrintLogoSource();
   const showPhoto = options.showPhoto !== false;
   const photo = showPhoto ? getStudentPhotoForAdmitCard(student) : '';
+  const pen = getStudentPen(student);
+  const scheduleRows = Array.isArray(schedule) ? schedule : [];
+  const maxRows = Number(options.maxRows) || scheduleRows.length;
+  const visibleSchedule = scheduleRows.slice(0, maxRows);
+  const hiddenCount = Math.max(0, scheduleRows.length - visibleSchedule.length);
 
-  const rowsHtml = schedule.length
-    ? schedule.map((r, i) => {
+  const rowsHtml = visibleSchedule.length
+    ? visibleSchedule.map((r, i) => {
         const d = formatExamDateWithDay(r.date);
         return `
           <tr>
@@ -4661,7 +4718,7 @@ function buildAdmitCardHtml(student, term, schedule, options = {}) {
             <td style="text-align:center;">${escapeHtml(String(r.maxMarks || ''))}</td>
           </tr>
         `;
-      }).join('')
+      }).join('') + (hiddenCount ? `<tr><td colspan="6" style="text-align:center; font-size:0.85em; font-style:italic;">+ ${hiddenCount} more subject(s) — see office copy</td></tr>` : '')
     : `<tr><td colspan="6" style="text-align:center; padding:14px; font-style:italic;">Date sheet not published yet.</td></tr>`;
 
   return `
@@ -4682,12 +4739,15 @@ function buildAdmitCardHtml(student, term, schedule, options = {}) {
             <td><span>Admission No</span><strong>${escapeHtml(String(student.admissionNo || ''))}</strong></td>
           </tr>
           <tr>
-            <td><span>Father's Name</span><strong>${escapeHtml(student.parentName || '')}</strong></td>
+            <td><span>PEN (Permanent Education No.)</span><strong>${escapeHtml(pen)}</strong></td>
             <td><span>Roll No</span><strong>${escapeHtml(String(student.currentRollNo || student.rollNo || '—'))}</strong></td>
           </tr>
           <tr>
-            <td><span>Class &amp; Section</span><strong>${escapeHtml(student.currentClass || '')} - ${escapeHtml(student.currentSection || '')}</strong></td>
+            <td><span>Father's Name</span><strong>${escapeHtml(student.parentName || '')}</strong></td>
             <td><span>Date of Birth</span><strong>${escapeHtml(typeof formatDobToDDMMYYYY === 'function' ? formatDobToDDMMYYYY(student.dob) : (student.dob || '—'))}</strong></td>
+          </tr>
+          <tr>
+            <td colspan="2"><span>Class &amp; Section</span><strong>${escapeHtml(student.currentClass || '')} - ${escapeHtml(student.currentSection || '')}</strong></td>
           </tr>
         </table>
         ${showPhoto ? `
@@ -4733,20 +4793,22 @@ function buildAdmitCardHtml(student, term, schedule, options = {}) {
  * 4-per-A4 was tried and dropped: a 6-subject date sheet does not fit in 67mm.
  */
 const ADMIT_CARD_LAYOUTS = {
-  2: { page: 'A4 portrait', margin: '7mm', minHeight: '0', gap: '6mm', scale: 1.22, maxRows: 10, label: '2 per A4 (large print)' },
-  3: { page: 'A4 portrait', margin: '7mm', minHeight: '0', gap: '5mm', scale: 1.02, maxRows: 7, label: '3 per A4 (compact)' },
-  a5: { page: 'A5 portrait', margin: '6mm', minHeight: '0', gap: '0mm', scale: 1.18, maxRows: 14, label: '1 per A5 sheet (large)' }
+  2: { page: 'A4 portrait', margin: '7mm', gap: '6mm', scale: 1.18, maxRows: 10, cardHeight: '136mm', label: '2 per A4 (large print)' },
+  3: { page: 'A4 portrait', margin: '7mm', gap: '4mm', scale: 0.74, maxRows: 6, cardHeight: '88mm', label: '3 per A4 (compact)' },
+  a5: { page: 'A5 portrait', margin: '6mm', gap: '0mm', scale: 1.15, maxRows: 14, cardHeight: 'auto', label: '1 per A5 sheet (large)' }
 };
 
 function getAdmitCardLayout(perPage) {
-  return ADMIT_CARD_LAYOUTS[perPage] || ADMIT_CARD_LAYOUTS[2];
+  const key = perPage === 'a5' ? 'a5' : Number(perPage) || 2;
+  return ADMIT_CARD_LAYOUTS[key] || ADMIT_CARD_LAYOUTS[2];
 }
 
 function getAdmitCardPrintStyles(perPage = 2) {
   const L = getAdmitCardLayout(perPage);
   const s = L.scale;
   const px = (n) => `${(n * s).toFixed(2)}px`;
-  const perSheet = perPage === 'a5' ? 1 : Number(perPage);
+  const perSheet = perPage === 'a5' ? 1 : (Number(perPage) || 2);
+  const cardHeight = L.cardHeight && L.cardHeight !== 'auto' ? `max-height:${L.cardHeight}; height:${L.cardHeight};` : '';
 
   return `
     @page { size: ${L.page}; margin: ${L.margin}; }
@@ -4754,7 +4816,7 @@ function getAdmitCardPrintStyles(perPage = 2) {
     body { font-family: 'Inter', Arial, sans-serif; margin:0; background:#fff; color:#0f172a;
       -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
     .admit-card { border:2px solid #0f172a; border-radius:6px; padding:${px(12)} ${px(14)};
-      margin-bottom:${L.gap}; min-height:${L.minHeight === '0' ? 'auto' : L.minHeight}; display:flex; flex-direction:column;
+      margin-bottom:${L.gap}; ${cardHeight} overflow:hidden; display:flex; flex-direction:column;
       page-break-inside:avoid; break-inside:avoid; }
     .admit-card:nth-child(${perSheet}n) { margin-bottom:0; page-break-after:always; break-after:page; }
     .admit-card:last-child { page-break-after:auto; break-after:auto; }
@@ -4844,8 +4906,10 @@ function printSingleAdmitCard(admissionNo) {
     return;
   }
   const schedule = getExamScheduleForClass(term, student.currentClass || student.class, student.currentSection || 'ALL');
-  const html = buildAdmitCardHtml(student, term, schedule, { showPhoto: admitCardPhotoEnabled() });
-  openAdmitCardPrintWindow(html, `Admit Card - ${student.name}`, getAdmitCardsPerPage());
+  const perPage = getAdmitCardsPerPage();
+  const layout = getAdmitCardLayout(perPage);
+  const html = buildAdmitCardHtml(student, term, schedule, { showPhoto: admitCardPhotoEnabled(), maxRows: layout.maxRows });
+  openAdmitCardPrintWindow(html, `Admit Card - ${student.name}`, perPage);
 }
 
 function printSelectedAdmitCards() {
@@ -4862,11 +4926,12 @@ function printSelectedAdmitCards() {
   }
 
   const all = getStudentsByActiveSession();
+  const layout = getAdmitCardLayout(perPage);
   const cards = picked.map((adm) => {
     const student = all.find(s => String(s.admissionNo) === String(adm));
     if (!student) return '';
     const schedule = getExamScheduleForClass(term, student.currentClass || student.class, student.currentSection || 'ALL');
-    return buildAdmitCardHtml(student, term, schedule, { showPhoto });
+    return buildAdmitCardHtml(student, term, schedule, { showPhoto, maxRows: layout.maxRows });
   }).filter(Boolean).join('');
 
   openAdmitCardPrintWindow(cards, `Admit Cards - ${term} - ${window.admitCardClass || ''}`, perPage);
@@ -7537,16 +7602,10 @@ function viewCombinedConsolidatedReportCard(admissionNo) {
           </div>
 
           <!-- STUDENT BIO COMPACT BANNER -->
-          <div style="background:#f8fafc; border:1px solid #cbd5e1; border-radius:8px; padding:8px 14px; margin-bottom:12px; display:flex; justify-content:space-between; font-size:0.78rem; flex-wrap:wrap; gap:8px;">
-            <div><strong>Student Name:</strong> <span style="color:#4f46e5; font-weight:700;">${student.name}</span></div>
-            <div><strong>Admission No:</strong> <code>${student.admissionNo}</code></div>
-            <div><strong>Class:</strong> ${cls} - ${sec} (Roll: ${roll})</div>
-            <div><strong>Father:</strong> ${student.parentName} | <strong>Mother:</strong> ${student.motherName || 'N/A'} | <strong>DOB:</strong> <span style="color:#0284c7; font-weight:700;">${formatDobToDDMMYYYY(student.dob)}</span></div>
-            <div><strong>${attendanceLine}</strong> | <strong>Class Teacher:</strong> ${classTeacherName}</div>
-          </div>
+          ${getReportCardStudentInfoHtml(student, { cls, sec, roll, attendanceLine, classTeacherName, accent: '#4f46e5', photoSize: 60 })}
 
           <!-- SIDE-BY-SIDE DUAL TERM COMBINED MARKS TABLE -->
-          <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.74rem; margin-bottom:12px; border:1px solid #0f172a;">
+          <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.88rem; margin-bottom:12px; border:1px solid #0f172a;">
             <thead>
               <tr style="background:#0f172a; color:#ffffff;">
                 <th rowspan="2" style="padding:5px; text-align:left;">Subject Name</th>
@@ -7774,40 +7833,19 @@ function viewHalfYearlyReportCard(admissionNo) {
           <button class="close-modal-btn no-print" onclick="document.getElementById('reportPreviewModal').remove()" style="color:#ffffff; font-size:1.6rem; opacity:0.8; cursor:pointer;" title="Close Preview"><i class="fa-solid fa-xmark"></i></button>
         </div>
 
-        <div id="printableSingleSheetArea" style="padding:20px 24px;">
-          <!-- STUDENT GRAPHIC INFO CARD -->
-          <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:12px 18px; margin-bottom:16px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
-            <div style="display:flex; align-items:center; gap:14px;">
-              ${getStudentDirectoryPhotoHtml(student, 55)}
-              <div>
-                <h3 style="font-size:1.15rem; margin:0 0 2px 0; color:#0f172a; font-weight:700;">${student.name}</h3>
-                <div style="display:flex; gap:8px; font-size:0.78rem; color:#475569;">
-                  <span><strong>Adm No:</strong> <code style="color:#4f46e5; font-weight:700;">${student.admissionNo}</code></span> |
-                  <span><strong>Class:</strong> <strong style="color:#6366f1;">${cls} - ${sec}</strong></span> |
-                  <span><strong>Roll No:</strong> ${roll}</span>
-                </div>
-              </div>
-            </div>
+        <div id="printableSingleSheetArea" style="padding:20px 24px; font-size:0.95rem;">
+          ${getReportCardStudentInfoHtml(student, { cls, sec, roll, attendanceLine, classTeacherName, accent: '#4f46e5', photoSize: 62 })}
 
-            <div style="font-size:0.78rem; color:#334155; line-height:1.5;">
-              <div><strong>Father Name:</strong> ${student.parentName}</div>
-              <div><strong>Mother Name:</strong> ${student.motherName || 'N/A'}</div>
-              <div><strong>Date of Birth:</strong> <strong style="color:#0284c7;">${formatDobToDDMMYYYY(student.dob)}</strong></div>
-              <div><strong>${attendanceLine}</strong></div>
-              <div><strong>Class Teacher:</strong> ${classTeacherName}</div>
+          <div style="display:flex; justify-content:flex-end; align-items:center; gap:12px; margin:-6px 0 14px 0;">
+            <div style="background:linear-gradient(135deg, #4f46e5 0%, #3730a3 100%); color:#ffffff; padding:8px 14px; border-radius:10px; font-weight:800; font-size:0.88rem; text-align:center; box-shadow:0 4px 6px -1px rgba(79, 70, 229, 0.3);">
+              CLASS RANK<br>
+              <span style="font-size:1.25rem; color:#fef08a;">#${studentRank}</span>
             </div>
-
-            <div style="display:flex; align-items:center; gap:12px;">
-              <div style="background:linear-gradient(135deg, #4f46e5 0%, #3730a3 100%); color:#ffffff; padding:6px 12px; border-radius:10px; font-weight:800; font-size:0.78rem; text-align:center; box-shadow:0 4px 6px -1px rgba(79, 70, 229, 0.3);">
-                Rank CLASS RANK<br>
-                <span style="font-size:1.15rem; color:#fef08a;">#${studentRank}</span>
-              </div>
-              <img src="https://api.qrserver.com/v1/create-qr-code/?size=55x55&data=STUDENT-HY-${student.admissionNo}" style="width:55px; height:55px; border-radius:6px; border:1px solid #cbd5e1;">
-            </div>
+            <img src="https://api.qrserver.com/v1/create-qr-code/?size=55x55&data=STUDENT-HY-${student.admissionNo}" style="width:58px; height:58px; border-radius:6px; border:1px solid #cbd5e1;">
           </div>
 
           <!-- MARKS TABLE WITH MODERN GRADE BADGES -->
-          <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.8rem; margin-bottom:16px; border-radius:8px; overflow:hidden; border:1px solid #cbd5e1;">
+          <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.92rem; margin-bottom:16px; border-radius:8px; overflow:hidden; border:1px solid #cbd5e1;">
             <thead>
               <tr style="background:#1e293b; color:#ffffff;">
                 <th style="padding:8px 10px; text-align:left; font-weight:600;">Subject Name</th>
@@ -8014,36 +8052,15 @@ function viewFinalAnnualReportCard(admissionNo) {
           <button class="close-modal-btn no-print" onclick="document.getElementById('reportPreviewModal').remove()" style="color:#ffffff; font-size:1.6rem; opacity:0.8; cursor:pointer;" title="Close Preview"><i class="fa-solid fa-xmark"></i></button>
         </div>
 
-        <div id="printableSingleSheetArea" style="padding:20px 24px;">
-          <!-- STUDENT GRAPHIC INFO CARD -->
-          <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:12px 18px; margin-bottom:16px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
-            <div style="display:flex; align-items:center; gap:14px;">
-              ${getStudentDirectoryPhotoHtml(student, 55)}
-              <div>
-                <h3 style="font-size:1.15rem; margin:0 0 2px 0; color:#0f172a; font-weight:700;">${student.name}</h3>
-                <div style="display:flex; gap:8px; font-size:0.78rem; color:#475569;">
-                  <span><strong>Adm No:</strong> <code style="color:#059669; font-weight:700;">${student.admissionNo}</code></span> |
-                  <span><strong>Class:</strong> <strong style="color:#047857;">${cls} - ${sec}</strong></span> |
-                  <span><strong>Roll No:</strong> ${roll}</span>
-                </div>
-              </div>
-            </div>
+        <div id="printableSingleSheetArea" style="padding:20px 24px; font-size:0.95rem;">
+          ${getReportCardStudentInfoHtml(student, { cls, sec, roll, attendanceLine, classTeacherName, accent: '#059669', photoSize: 62 })}
 
-            <div style="font-size:0.78rem; color:#334155; line-height:1.5;">
-              <div><strong>Father Name:</strong> ${student.parentName}</div>
-              <div><strong>Mother Name:</strong> ${student.motherName || 'N/A'}</div>
-              <div><strong>Date of Birth:</strong> <strong style="color:#059669;">${formatDobToDDMMYYYY(student.dob)}</strong></div>
-              <div><strong>${attendanceLine}</strong></div>
-              <div><strong>Class Teacher:</strong> ${classTeacherName}</div>
-            </div>
-
-            <div>
-              <img src="https://api.qrserver.com/v1/create-qr-code/?size=55x55&data=VERIFIED-PASSING-CARD-${student.admissionNo}" style="width:55px; height:55px; border-radius:6px; border:1px solid #cbd5e1;">
-            </div>
+          <div style="display:flex; justify-content:flex-end; margin:-6px 0 14px 0;">
+            <img src="https://api.qrserver.com/v1/create-qr-code/?size=55x55&data=VERIFIED-PASSING-CARD-${student.admissionNo}" style="width:58px; height:58px; border-radius:6px; border:1px solid #cbd5e1;">
           </div>
 
           <!-- SIDE-BY-SIDE DUAL TERM MARKS TABLE -->
-          <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.74rem; margin-bottom:16px; border-radius:8px; overflow:hidden; border:1px solid #cbd5e1;">
+          <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.88rem; margin-bottom:16px; border-radius:8px; overflow:hidden; border:1px solid #cbd5e1;">
             <thead>
               <tr style="background:#0f172a; color:#ffffff;">
                 <th rowspan="2" style="padding:6px; text-align:left;">Subject Name</th>

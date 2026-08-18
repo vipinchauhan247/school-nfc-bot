@@ -1261,14 +1261,32 @@ thead .sticky-col-3 {
 
 .sticky-col-2 {
   left: 50px !important;
-  min-width: 180px !important;
+  width: 128px !important;
+  min-width: 128px !important;
+  max-width: 128px !important;
   border-right: 1px solid #334155 !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
 }
 
 .sticky-col-3 {
-  left: 230px !important;
-  min-width: 165px !important;
+  left: 178px !important;
+  width: 96px !important;
+  min-width: 96px !important;
+  max-width: 96px !important;
   border-right: 3px solid #6366f1 !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+}
+
+#subjectTableContainer .exam-student-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.84rem;
+  font-weight: 700;
+  color: #38bdf8;
 }
 
 [data-theme="light"] .sticky-col-1,
@@ -1313,22 +1331,18 @@ thead .sticky-col-3 {
 
   .sticky-col-2 {
     left: 36px !important;
-    width: 120px !important;
-    min-width: 120px !important;
-    max-width: 120px !important;
-    font-size: 0.88rem !important;
-    white-space: normal !important;
-    line-height: 1.2 !important;
+    width: 108px !important;
+    min-width: 108px !important;
+    max-width: 108px !important;
+    font-size: 0.78rem !important;
   }
 
   .sticky-col-3 {
-    left: 156px !important;
-    width: 100px !important;
-    min-width: 100px !important;
-    max-width: 100px !important;
-    font-size: 0.8rem !important;
-    white-space: normal !important;
-    line-height: 1.2 !important;
+    left: 144px !important;
+    width: 82px !important;
+    min-width: 82px !important;
+    max-width: 82px !important;
+    font-size: 0.74rem !important;
   }
 }
 
