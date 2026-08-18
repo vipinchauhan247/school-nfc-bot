@@ -67,6 +67,16 @@ body {
 
 .brand-icon { font-size: 1.5rem; }
 
+.brand-logo {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    object-fit: contain;
+    background: transparent;
+    display: block;
+    flex-shrink: 0;
+}
+
 .brand-text {
     max-width: 280px;
     overflow: hidden;

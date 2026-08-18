@@ -114,6 +114,17 @@ html, body {
   -webkit-text-fill-color: transparent;
 }
 
+.school-logo-img {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  object-fit: contain;
+  object-position: center center;
+  background: transparent;
+  display: block;
+  flex-shrink: 0;
+}
+
 .school-name {
   font-family: var(--font-heading);
   font-size: 1.25rem;

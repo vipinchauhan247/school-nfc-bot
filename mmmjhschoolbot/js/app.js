@@ -177,8 +177,8 @@ function absoluteAssetUrl(relativePath) {
 }
 
 /**
- * Logo for printed documents. school_logo.png carries a solid dark background,
- * so the transparent _tc variant is used when no custom logo is uploaded.
+ * Logo for printed documents. Default assets are a circular PNG with
+ * transparent corners (no square plate). Uploading a logo under School Profile overrides it.
  */
 function getPrintLogoSource() {
   const uploaded = String(getSchoolProfile().logoDataUrl || '').trim();
@@ -188,11 +188,11 @@ function getPrintLogoSource() {
 function getSchoolLogoHtml(size = 62) {
   const profile = getSchoolProfile();
   const logoSrc = profile.logoDataUrl || 'assets/school_logo.png';
-  return `<img src="${logoSrc}" alt="School Logo" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center; border:2px solid #d4af37; background:#ffffff; padding:2px;">`;
+  return `<img src="${logoSrc}" alt="School Logo" class="school-logo-img" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center; background:transparent; display:block;">`;
 }
 
 function getTransferCertificateLogoHtml(size = 78) {
-  return `<img src="assets/school_logo_tc.png" alt="School Logo" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center;">`;
+  return `<img src="assets/school_logo_tc.png" alt="School Logo" class="school-logo-img" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center; background:transparent; display:block;">`;
 }
 
 function applySchoolProfileToShell() {
@@ -202,6 +202,20 @@ function applySchoolProfileToShell() {
   if (nameEl) nameEl.textContent = profile.shortName;
   if (taglineEl) taglineEl.textContent = profile.address;
   document.title = `${profile.name} ERP | School Management System`;
+  const logoWrap = document.querySelector('.school-logo');
+  if (logoWrap) {
+    const src = profile.logoDataUrl || 'assets/school_logo.png';
+    let img = logoWrap.querySelector('img.school-logo-img');
+    if (!img) {
+      img = document.createElement('img');
+      img.className = 'school-logo-img';
+      img.alt = 'School Logo';
+      const icon = logoWrap.querySelector('.logo-icon');
+      if (icon) icon.replaceWith(img);
+      else logoWrap.prepend(img);
+    }
+    img.src = src;
+  }
 }
 
 function getClassTeacherForStudent(student) {
