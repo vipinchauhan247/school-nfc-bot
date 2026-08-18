@@ -819,6 +819,25 @@ function normalizeAdmission(value) {
   return s;
 }
 
+function normalizeSubjectsPayloadServer(subjects) {
+  if (Array.isArray(subjects)) return subjects.filter((s) => s && typeof s === 'object');
+  if (subjects && typeof subjects === 'object') {
+    return Object.values(subjects).filter((s) => s && typeof s === 'object' && (s.code || s.name || s.id));
+  }
+  return [];
+}
+
+function normalizePeriodSettingsPayloadServer(periodSettings) {
+  if (Array.isArray(periodSettings) && periodSettings.length) {
+    return periodSettings.filter((p) => p && typeof p === 'object');
+  }
+  if (periodSettings && typeof periodSettings === 'object') {
+    const vals = Object.values(periodSettings).filter((p) => p && typeof p === 'object' && (p.name || p.periodNo));
+    if (vals.length) return vals;
+  }
+  return [];
+}
+
 function nativeRowFromStudent(row, schoolId) {
   if (!row || typeof row !== 'object') return null;
   const admissionNo = normalizeAdmission(row.admissionNo || row.AdmissionNo);
@@ -1259,11 +1278,11 @@ async function rebuildPayloadFromNative(schoolId, basePayload) {
     signatures: (basePayload && basePayload.signatures) || {},
     sessions: (basePayload && basePayload.sessions) || {},
     teachers: Array.isArray(basePayload?.teachers) ? basePayload.teachers : [],
-    subjects: (basePayload && basePayload.subjects) || {},
+    subjects: normalizeSubjectsPayloadServer(basePayload?.subjects),
     staffUsers: Array.isArray(basePayload?.staffUsers) ? basePayload.staffUsers : [],
     examSubjectConfigs: (basePayload && basePayload.examSubjectConfigs) || {},
     schoolProfile: (basePayload && basePayload.schoolProfile) || {},
-    periodSettings: (basePayload && basePayload.periodSettings) || {},
+    periodSettings: normalizePeriodSettingsPayloadServer(basePayload?.periodSettings),
     telegramLogs: (basePayload && basePayload.telegramLogs) || [],
     cancelledReceipts: (basePayload && basePayload.cancelledReceipts) || [],
     printSettings: (basePayload && basePayload.printSettings) || {},

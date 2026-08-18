@@ -379,8 +379,8 @@ function previewSelectedImage(input, previewId) {
   reader.readAsDataURL(file);
 }
 
-// DEFAULT SCHOOL PERIOD TIMING CONFIGURATION
-if (!SchoolData.periodSettings) {
+// DEFAULT SCHOOL PERIOD TIMING CONFIGURATION ({} from cloud is invalid — must be array)
+if (!Array.isArray(SchoolData.periodSettings) || !SchoolData.periodSettings.length) {
   SchoolData.periodSettings = [
     { periodNo: 1, name: "Period 1", startTime: "08:30 AM", endTime: "09:15 AM", durationMins: 45, isBreak: false },
     { periodNo: 2, name: "Period 2", startTime: "09:15 AM", endTime: "10:00 AM", durationMins: 45, isBreak: false },
@@ -1754,6 +1754,8 @@ async function initApp() {
     console.warn('Photo cache load skipped:', err);
   }
   ensureSchoolDataClasses();
+  ensureSchoolDataPeriodSettings();
+  ensureSchoolDataSubjects();
   window.SchoolData = SchoolData;
   window.processIncomingTelegramBotCommand = processIncomingTelegramBotCommand;
   window.repairKnownRealAdmissionConflicts = repairKnownRealAdmissionConflicts;
@@ -2716,6 +2718,93 @@ function getDefaultSchoolClasses() {
   ];
 }
 
+function getDefaultPeriodSettings() {
+  return [
+    { periodNo: 1, name: 'Period 1', startTime: '08:30 AM', endTime: '09:15 AM', durationMins: 45, isBreak: false },
+    { periodNo: 2, name: 'Period 2', startTime: '09:15 AM', endTime: '10:00 AM', durationMins: 45, isBreak: false },
+    { periodNo: 3, name: 'Period 3', startTime: '10:00 AM', endTime: '10:45 AM', durationMins: 45, isBreak: false },
+    { periodNo: 4, name: 'RECESS / LUNCH', startTime: '10:45 AM', endTime: '11:15 AM', durationMins: 30, isBreak: true },
+    { periodNo: 5, name: 'Period 4', startTime: '11:15 AM', endTime: '12:00 PM', durationMins: 45, isBreak: false },
+    { periodNo: 6, name: 'Period 5', startTime: '12:00 PM', endTime: '12:45 PM', durationMins: 45, isBreak: false },
+    { periodNo: 7, name: 'Period 6', startTime: '12:45 PM', endTime: '01:30 PM', durationMins: 45, isBreak: false },
+    { periodNo: 8, name: 'Period 7', startTime: '01:30 PM', endTime: '02:15 PM', durationMins: 45, isBreak: false }
+  ];
+}
+
+/** Cloud/API sometimes stores periodSettings as {} — normalize to array. */
+function normalizePeriodSettingsPayload(periodSettings) {
+  if (Array.isArray(periodSettings) && periodSettings.length) {
+    return periodSettings.filter((p) => p && typeof p === 'object');
+  }
+  if (periodSettings && typeof periodSettings === 'object') {
+    const vals = Object.values(periodSettings).filter((p) => p && typeof p === 'object' && (p.name || p.periodNo));
+    if (vals.length) return vals;
+  }
+  return [];
+}
+
+function ensureSchoolDataPeriodSettings() {
+  let list = normalizePeriodSettingsPayload(SchoolData.periodSettings);
+  let restored = false;
+  if (!list.length) {
+    list = getDefaultPeriodSettings();
+    restored = true;
+  }
+  SchoolData.periodSettings = list;
+  if (restored && typeof scheduleCloudPush === 'function') {
+    try { scheduleCloudPush(); } catch (e) {}
+  }
+  return list;
+}
+
+function getDefaultSchoolSubjects() {
+  const all = ['ALL CLASSES'];
+  const upper = ['Class 3', 'Class 4', 'Class 5', 'Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10'];
+  const mid = ['Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10'];
+  return [
+    { id: 'sub_eng', code: 'ENG', name: 'English', teacher: 'Unassigned', periodsPerWeek: 6, category: 'Core Academic', class: 'ALL CLASSES', classes: all },
+    { id: 'sub_hin', code: 'HIN', name: 'Hindi', teacher: 'Unassigned', periodsPerWeek: 5, category: 'Core Academic', class: 'ALL CLASSES', classes: all },
+    { id: 'sub_mat', code: 'MAT', name: 'Mathematics', teacher: 'Unassigned', periodsPerWeek: 6, category: 'Core Academic', class: 'ALL CLASSES', classes: all },
+    { id: 'sub_sci', code: 'SCI', name: 'Science', teacher: 'Unassigned', periodsPerWeek: 5, category: 'Core Academic', class: upper.join(', '), classes: upper },
+    { id: 'sub_sst', code: 'SST', name: 'Social Studies', teacher: 'Unassigned', periodsPerWeek: 4, category: 'Core Academic', class: upper.join(', '), classes: upper },
+    { id: 'sub_evs', code: 'EVS', name: 'EVS', teacher: 'Unassigned', periodsPerWeek: 4, category: 'Core Academic', class: 'Class 1, Class 2, Class 3', classes: ['Class 1', 'Class 2', 'Class 3'] },
+    { id: 'sub_com', code: 'COM', name: 'Computer', teacher: 'Unassigned', periodsPerWeek: 2, category: 'Practical Skill', class: mid.join(', '), classes: mid },
+    { id: 'sub_art', code: 'ART', name: 'Art & Craft', teacher: 'Unassigned', periodsPerWeek: 2, category: 'Co-Curricular', class: 'ALL CLASSES', classes: all },
+    { id: 'sub_gk', code: 'GK', name: 'G.K.', teacher: 'Unassigned', periodsPerWeek: 1, category: 'General Studies', class: 'ALL CLASSES', classes: all },
+    { id: 'sub_pe', code: 'PE', name: 'Physical Education', teacher: 'Unassigned', periodsPerWeek: 2, category: 'Co-Curricular', class: 'ALL CLASSES', classes: all }
+  ];
+}
+
+/** Recover subjects from saved exam weightage configs when the directory was wiped. */
+function deriveSubjectsFromExamConfigs() {
+  const configs = SchoolData.examSubjectConfigs || {};
+  const byCode = new Map();
+  Object.values(configs).forEach((classTerms) => {
+    if (!classTerms || typeof classTerms !== 'object') return;
+    Object.values(classTerms).forEach((termList) => {
+      if (!Array.isArray(termList)) return;
+      termList.forEach((sub) => {
+        const code = String(sub?.code || '').trim();
+        const name = String(sub?.name || sub?.subjectName || '').trim();
+        if (!code && !name) return;
+        const key = (code || name).toLowerCase();
+        if (byCode.has(key)) return;
+        byCode.set(key, {
+          id: `sub_${key.replace(/[^a-z0-9]+/g, '_')}`,
+          code: code || name.substring(0, 3).toUpperCase(),
+          name: name || code,
+          teacher: 'Unassigned',
+          periodsPerWeek: 5,
+          category: 'Core Academic',
+          class: 'ALL CLASSES',
+          classes: ['ALL CLASSES']
+        });
+      });
+    });
+  });
+  return Array.from(byCode.values());
+}
+
 function normalizeClassesPayload(classes) {
   if (Array.isArray(classes)) {
     return classes.filter((c) => c && typeof c === 'object' && (c.name || c.id));
@@ -2782,6 +2871,38 @@ function ensureSchoolDataSubjectsArray() {
     SchoolData.subjects = normalized;
   }
   return SchoolData.subjects;
+}
+
+/** Cloud wipe left subjects:[] — restore from exam configs or standard Nursery–10 list. */
+function ensureSchoolDataSubjects() {
+  let list = normalizeSubjectsPayload(SchoolData.subjects);
+  let restored = false;
+  if (!list.length) {
+    const fromExams = deriveSubjectsFromExamConfigs();
+    list = fromExams.length ? fromExams : getDefaultSchoolSubjects();
+    restored = true;
+  }
+  SchoolData.subjects = list;
+  if (restored && typeof scheduleCloudPush === 'function') {
+    try { scheduleCloudPush(); } catch (e) {}
+  }
+  return list;
+}
+
+function restoreSchoolSubjectsFromDefaults(forceDefaults) {
+  const fromExams = deriveSubjectsFromExamConfigs();
+  SchoolData.subjects = (forceDefaults || !fromExams.length) ? getDefaultSchoolSubjects() : fromExams;
+  saveSchoolDataToStorage();
+  if (typeof pushSchoolMetaToCloudNow === 'function') {
+    pushSchoolMetaToCloudNow();
+  }
+  renderSubjectsPage(document.getElementById('contentBody'));
+  showNotification(
+    fromExams.length && !forceDefaults
+      ? `Restored ${SchoolData.subjects.length} subjects from saved exam configs.`
+      : `Restored ${SchoolData.subjects.length} standard subjects (English, Hindi, Maths, Science, …).`,
+    'success'
+  );
 }
 
 /**
@@ -8201,6 +8322,7 @@ function viewFinalAnnualReportCard(admissionNo) {
 function buildSchoolDataStoragePayload() {
   ensureSchoolDataSubjectsArray();
   ensureSchoolDataClasses();
+  ensureSchoolDataPeriodSettings();
   const activeSession = SchoolData.activeSession || "2026-27";
   (SchoolData.students || []).forEach(student => {
     removeCancelledPaymentsFromStudent(student);
@@ -8336,7 +8458,11 @@ function applySchoolDataStoragePayload(parsed, options) {
       paymentQrDataUrl: next.paymentQrDataUrl || prev.paymentQrDataUrl || ''
     };
   }
-  if (parsed.periodSettings) SchoolData.periodSettings = parsed.periodSettings;
+  if (parsed.periodSettings !== undefined) {
+    const incoming = normalizePeriodSettingsPayload(parsed.periodSettings);
+    const current = normalizePeriodSettingsPayload(SchoolData.periodSettings);
+    SchoolData.periodSettings = incoming.length ? incoming : (current.length ? current : getDefaultPeriodSettings());
+  }
   if (parsed.printSettings && typeof parsed.printSettings === 'object') {
     SchoolData.printSettings = { ...(SchoolData.printSettings || {}), ...parsed.printSettings };
   }
@@ -8843,9 +8969,12 @@ function confirmRestoreDatabase() {
       if (data.signatures) SchoolData.signatures = data.signatures;
       if (data.sessions) SchoolData.sessions = data.sessions;
       if (data.teachers) SchoolData.teachers = data.teachers;
-      if (data.subjects) SchoolData.subjects = normalizeSubjectsPayload(data.subjects);
+      if (data.subjects) SchoolData.subjects = mergeSubjectsPreferNonEmpty(SchoolData.subjects, data.subjects);
       if (data.examSubjectConfigs) SchoolData.examSubjectConfigs = data.examSubjectConfigs;
-      if (data.periodSettings) SchoolData.periodSettings = data.periodSettings;
+      if (data.periodSettings !== undefined) {
+        const incoming = normalizePeriodSettingsPayload(data.periodSettings);
+        if (incoming.length) SchoolData.periodSettings = incoming;
+      }
       if (data.telegramLogs) SchoolData.telegramLogs = data.telegramLogs;
       if (data.activeSession) SchoolData.activeSession = data.activeSession;
 
@@ -12617,7 +12746,7 @@ function deleteTeacher(tchId) {
    SUB-DIRECTORY MODULE: PERIOD TIMINGS SETTINGS (#period-settings)
    ============================================================================ */
 function renderPeriodSettingsPage(container) {
-  const periods = SchoolData.periodSettings;
+  const periods = ensureSchoolDataPeriodSettings();
 
   container.innerHTML = `
     <div class="page-header">
@@ -12711,7 +12840,7 @@ function savePeriodSettingsFromPage() {
    SUB-DIRECTORY MODULES: CLASS TIMETABLE (#timetable-class) & TEACHER TIMETABLE (#timetable-teacher)
    ============================================================================ */
 function renderTimetableClassPage(container) {
-  const periodSettings = SchoolData.periodSettings;
+  const periodSettings = ensureSchoolDataPeriodSettings();
   const classNames = getSchoolClassNames();
   const defaultClass = classNames[0] || "Nursery";
 
@@ -12785,7 +12914,7 @@ function renderTimetableClassPage(container) {
 }
 
 function renderTimetableTeacherPage(container) {
-  const periodSettings = SchoolData.periodSettings;
+  const periodSettings = ensureSchoolDataPeriodSettings();
 
   container.innerHTML = `
     <div class="page-header">
@@ -12863,7 +12992,7 @@ function renderSubjectsPage(container) {
   if (typeof sanitizeSubjectsTeachersMustBeUsers === 'function' && sanitizeSubjectsTeachersMustBeUsers()) {
     saveSchoolDataToStorage();
   }
-  const subjects = ensureSchoolDataSubjectsArray();
+  const subjects = ensureSchoolDataSubjects();
   const teacherUsers = getTeacherRoleUsersForSubjectAssign();
   const canAdd = canCurrentUserAddSubjects();
   const canModify = canCurrentUserModifySubjects();
@@ -12875,6 +13004,7 @@ function renderSubjectsPage(container) {
         <p class="page-subtitle">Subject scope can be All Classes; teachers are assigned <strong>per class</strong> in Teachers Directory (English school-wide ≠ one teacher everywhere). Marks stay in Exams. Only Super Admin / Principal can delete subjects.</p>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="restoreSchoolSubjectsFromDefaults()"><i class="fa-solid fa-rotate-left"></i> Restore Subjects</button>
         <button class="btn btn-secondary" onclick="window.location.hash='exams-entry'"><i class="fa-solid fa-table-cells"></i> Open Exams &amp; Marks</button>
         ${canAdd ? `<button class="btn btn-primary" onclick="openCreateSubjectModal()"><i class="fa-solid fa-plus"></i> Add New Subject</button>` : ''}
       </div>

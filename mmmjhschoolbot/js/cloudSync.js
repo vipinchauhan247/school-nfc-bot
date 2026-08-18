@@ -36,6 +36,23 @@
     return [];
   }
 
+  function normalizePeriodSettingsList(periodSettings) {
+    if (Array.isArray(periodSettings) && periodSettings.length) {
+      return periodSettings.filter((p) => p && typeof p === 'object');
+    }
+    if (periodSettings && typeof periodSettings === 'object') {
+      const vals = Object.values(periodSettings).filter((p) => p && typeof p === 'object' && (p.name || p.periodNo));
+      if (vals.length) return vals;
+    }
+    return [];
+  }
+
+  function mergePeriodSettingsLists(localPeriods, remotePeriods) {
+    const local = normalizePeriodSettingsList(localPeriods);
+    const remote = normalizePeriodSettingsList(remotePeriods);
+    return remote.length ? remote : local;
+  }
+
   function subjectMergeKey(subject) {
     return String(subject?.code || subject?.id || subject?.name || '').trim().toLowerCase();
   }
@@ -566,7 +583,7 @@
       classFeeMaster: mergePlainObjectsPreferNonEmpty(olderMeta.classFeeMaster, newerMeta.classFeeMaster),
       feeScheduleRules: mergePlainObjectsPreferNonEmpty(olderMeta.feeScheduleRules, newerMeta.feeScheduleRules),
       examSubjectConfigs: mergePlainObjectsPreferNonEmpty(olderMeta.examSubjectConfigs, newerMeta.examSubjectConfigs),
-      periodSettings: newerMeta.periodSettings || olderMeta.periodSettings,
+      periodSettings: mergePeriodSettingsLists(olderMeta.periodSettings, newerMeta.periodSettings),
       activeSession: newerMeta.activeSession || olderMeta.activeSession
     };
   }
@@ -843,6 +860,7 @@
           examSubjectConfigs: mergePlainObjectsPreferNonEmpty(localPayload.examSubjectConfigs, cloudPayload.examSubjectConfigs),
           classFeeMaster: mergePlainObjectsPreferNonEmpty(localPayload.classFeeMaster, cloudPayload.classFeeMaster),
           feeScheduleRules: mergePlainObjectsPreferNonEmpty(localPayload.feeScheduleRules, cloudPayload.feeScheduleRules),
+          periodSettings: mergePeriodSettingsLists(localPayload.periodSettings, cloudPayload.periodSettings),
           cancelledReceipts: mergeCancelledReceipts(localPayload.cancelledReceipts, cloudPayload.cancelledReceipts),
           savedAt: cloudPayload.savedAt || snapshot.saved_at || new Date().toISOString()
         };
