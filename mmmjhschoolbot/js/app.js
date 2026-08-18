@@ -9211,7 +9211,7 @@ function openBulkStudentPhotoModal() {
           <strong style="color:#c084fc;">Real photos are not stored in cloud anymore — you must upload them again.</strong><br>
           Name each file after admission number: <code>1813.jpg</code>, <code>1186 Harshita.jpg</code>, etc.<br>
           Photos save to <strong>Supabase Storage</strong> (best) or cloud directly — both survive refresh on all PCs.<br>
-          Select one class at a time (max ~25 per save batch).
+          You can select <strong>100+ photos at once</strong> — the app uploads them in small automatic batches (about 12 at a time).
         </div>
 
         <div style="background:rgba(16,185,129,0.08); border:1px solid rgba(16,185,129,0.35); border-radius:12px; padding:14px 16px; margin-bottom:18px;">
@@ -9406,10 +9406,37 @@ function applyStagedBulkStudentPhotos() {
   void applyStagedBulkStudentPhotosAsync(queue);
 }
 
+function formatBulkPhotoUploadProgress(progress) {
+  if (!progress) return 'Uploading photos…';
+  const modeLabel = progress.mode === 'storage' ? 'Supabase Storage' : 'cloud';
+  return `Uploading batch ${progress.batch} of ${progress.totalBatches} to ${modeLabel} (${progress.batchSize} photo${progress.batchSize === 1 ? '' : 's'} in this batch, ${progress.totalPhotos} total)…`;
+}
+
+function formatBulkPhotoSaveError(err) {
+  const msg = escapeHtml(String(err?.message || err || 'Unknown error'));
+  const lower = String(err?.message || err || '').toLowerCase();
+  if (/maximum \d+ photos|one class at a time/i.test(lower)) {
+    return `${msg}<br><br><strong>Fix:</strong> Upload the latest <code>js/cloudSync.js</code> from GitHub (it splits large uploads automatically). Hard-refresh the page (Ctrl+F5) and try again.`;
+  }
+  if (/413|payload too large|body.*limit|http 413/i.test(lower)) {
+    return `${msg}<br><br>Photos were too large for one server request. The latest app splits them automatically — update <code>cloudSync.js</code>, hard-refresh, and try again.`;
+  }
+  if (/bucket.*missing|student-photos/i.test(lower)) {
+    return `${msg}<br><br>Create a public Supabase Storage bucket named <code>student-photos</code> (see SUPABASE_PHOTO_STORAGE.md), then redeploy <code>api/erp-cloud.js</code> on Vercel.`;
+  }
+  if (/not deployed|404|cloud api not found/i.test(lower)) {
+    return `${msg}<br><br>Deploy <code>api/erp-cloud.js</code> and <code>api/mmmjhs-bot.js</code> on Vercel (Git push), not only JS files via Vercel Drop.`;
+  }
+  return msg;
+}
+
 async function applyStagedBulkStudentPhotosAsync(queue) {
   const applyBtn = document.getElementById('bulkPhotoApplyBtn');
   const statusEl = document.getElementById('bulkPhotoStatus');
   const knownCloudAt = String(localStorage.getItem('MMM_ERP_CLOUD_LAST_CLOUD_AT') || '');
+  const batchCount = typeof splitPhotoUploadBatches === 'function'
+    ? splitPhotoUploadBatches(queue).length
+    : Math.max(1, Math.ceil(queue.length / 12));
 
   saveSchoolDataToStorage({ skipCloudPush: true });
   window._erpCloudMemoryDirty = true;
@@ -9419,45 +9446,55 @@ async function applyStagedBulkStudentPhotosAsync(queue) {
     applyBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving to cloud…';
   }
   if (statusEl) {
-    statusEl.innerHTML = `<div style="color:#c084fc;"><i class="fa-solid fa-cloud-arrow-up fa-beat"></i> Uploading ${queue.length} photo(s) — please wait…</div>`;
+    statusEl.innerHTML = `<div style="color:#c084fc;"><i class="fa-solid fa-cloud-arrow-up fa-beat"></i> Preparing ${queue.length} photo(s) in ${batchCount} automatic batch${batchCount === 1 ? '' : 'es'}…</div>`;
   }
+
+  const onProgress = (progress) => {
+    if (!statusEl) return;
+    statusEl.innerHTML = `<div style="color:#c084fc;"><i class="fa-solid fa-spinner fa-spin"></i> ${escapeHtml(formatBulkPhotoUploadProgress(progress))}</div>`;
+  };
 
   try {
     let savedAt = '';
     let usedStorage = false;
     let usedCloudPatch = false;
+    let storageErr = null;
+    let patchErr = null;
 
     if (typeof pushBulkStudentPhotosToSupabaseStorage === 'function') {
       try {
-        if (statusEl) {
-          statusEl.innerHTML = `<div style="color:#c084fc;"><i class="fa-solid fa-database fa-beat"></i> Uploading ${queue.length} photo(s) to Supabase Storage…</div>`;
-        }
-        const storageResult = await pushBulkStudentPhotosToSupabaseStorage(queue);
+        const storageResult = await pushBulkStudentPhotosToSupabaseStorage(queue, { onProgress });
         savedAt = String(storageResult?.savedAt || window._erpCloudLastPushAt || '').trim();
         usedStorage = true;
-      } catch (storageErr) {
-        console.warn('Supabase Storage upload unavailable, trying cloud photo patch:', storageErr);
+      } catch (err) {
+        storageErr = err;
+        console.warn('Supabase Storage upload failed:', err);
+        if (!isPhotoApiUnavailableError(err)) {
+          throw err;
+        }
       }
     }
 
     if (!usedStorage && typeof pushBulkStudentPhotosToCloud === 'function') {
       try {
-        if (statusEl) {
-          statusEl.innerHTML = `<div style="color:#c084fc;"><i class="fa-solid fa-cloud-arrow-up fa-beat"></i> Saving ${queue.length} real photo(s) to cloud…</div>`;
-        }
         queue.forEach(row => {
           row.student.photo = row.dataUrl;
           row.student.photoDataUrl = row.dataUrl;
         });
-        const patchResult = await pushBulkStudentPhotosToCloud(queue);
+        const patchResult = await pushBulkStudentPhotosToCloud(queue, { onProgress });
         savedAt = String(patchResult?.savedAt || window._erpCloudLastPushAt || '').trim();
         usedCloudPatch = true;
-      } catch (patchErr) {
-        console.warn('Cloud photo patch unavailable, falling back to assets folder:', patchErr);
+      } catch (err) {
+        patchErr = err;
+        console.warn('Cloud photo patch failed:', err);
+        if (!isPhotoApiUnavailableError(err)) {
+          throw err;
+        }
       }
     }
 
     if (!usedStorage && !usedCloudPatch) {
+      const fallbackReason = storageErr?.message || patchErr?.message || 'Photo API not available on server.';
       queue.forEach(row => {
         const assetPath = studentPhotoAssetPath(row.student.admissionNo);
         row.assetPath = assetPath;
@@ -9466,7 +9503,7 @@ async function applyStagedBulkStudentPhotosAsync(queue) {
       });
 
       if (statusEl) {
-        statusEl.innerHTML = `<div style="color:#c084fc;"><i class="fa-solid fa-cloud-arrow-up fa-beat"></i> Saving ${queue.length} photo link(s) to cloud…</div>`;
+        statusEl.innerHTML = `<div style="color:#f59e0b;"><i class="fa-solid fa-triangle-exclamation"></i> Photo API unavailable (${escapeHtml(String(fallbackReason))}). Saving file links only…</div>`;
       }
 
       let pushResult = null;
@@ -9480,7 +9517,7 @@ async function applyStagedBulkStudentPhotosAsync(queue) {
 
       savedAt = String(pushResult?.savedAt || window._erpCloudLastPushAt || '').trim();
       if (!pushResult?.ok || !savedAt) {
-        throw new Error('Cloud did not confirm the save. Your server API may need an update.');
+        throw new Error('Cloud did not confirm the save. Deploy api/erp-cloud.js on Vercel for automatic photo storage.');
       }
     }
 
@@ -9519,7 +9556,7 @@ async function applyStagedBulkStudentPhotosAsync(queue) {
       applyBtn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> Save Matched Photos';
     }
     if (statusEl) {
-      statusEl.innerHTML = `<div style="color:#f87171; line-height:1.6;"><strong>Save failed.</strong><br>${escapeHtml(String(err.message || err))}<br>Try one class at a time, then Save again.</div>`;
+      statusEl.innerHTML = `<div style="color:#f87171; line-height:1.6;"><strong>Save failed.</strong><br>${formatBulkPhotoSaveError(err)}</div>`;
     }
     showNotification(`Photo save failed: ${err.message || err}`, 'error');
   }
@@ -11616,15 +11653,17 @@ function saveNewClass() {
     showNotification('Class Name and Teacher Name are required!', 'error');
     return;
   }
-  if (!validateUniqueClassTeacher(teacher)) return;
+  if (!validateUniqueClassTeacher(teacher, '', 'A')) return;
 
   const newClassObj = {
     id: "cls_" + Date.now(),
     name: name,
-    sections: sections,
+    sections: sections.filter(Boolean).length ? sections : ['A'],
     teacher: teacher,
+    sectionTeachers: {},
     room: room
   };
+  setClassSectionTeacher(newClassObj, 'A', teacher);
 
   SchoolData.classes.push(newClassObj);
   const modal = document.getElementById('classEditModal');

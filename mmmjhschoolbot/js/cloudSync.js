@@ -108,12 +108,17 @@
     return headers;
   }
 
+  function isPhotoApiUnavailableError(err) {
+    const msg = String(err?.message || err || '').toLowerCase();
+    return /not deployed|not found \(404\)|unknown action|cloud api not found|fake ok/i.test(msg);
+  }
+
   async function fetchWithRetry(url, options, retries) {
     const max = retries == null ? 2 : retries;
     let lastErr;
     for (let attempt = 0; attempt <= max; attempt++) {
       const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-      const timeoutMs = 20000;
+      const timeoutMs = Number(options?.timeoutMs) || 20000;
       const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
       try {
         const opts = Object.assign({}, options || {});
@@ -960,7 +965,8 @@
     const res = await fetchWithRetry(cloudPhotoPatchUrl(), {
       method: 'POST',
       headers: { ...cloudHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ schoolId, photos, savedBy })
+      body: JSON.stringify({ schoolId, photos, savedBy }),
+      timeoutMs: 90000
     });
     const data = await parseCloudResponse(res);
     if (!data.ok) throw new Error(data.error || 'Photo cloud save failed.');
@@ -976,7 +982,8 @@
     const res = await fetchWithRetry(cloudPhotoStorageUrl(), {
       method: 'POST',
       headers: { ...cloudHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ schoolId, photos, savedBy })
+      body: JSON.stringify({ schoolId, photos, savedBy }),
+      timeoutMs: 120000
     });
     const data = await parseCloudResponse(res);
     if (!data.ok) throw new Error(data.error || 'Photo storage upload failed.');
@@ -1011,7 +1018,7 @@
     window._erpCloudMemoryDirty = true;
     window._erpCloudSyncState = 'syncing';
 
-    const BATCH_SIZE = 20;
+    const BATCH_SIZE = 15;
     let imported = 0;
     let savedAt = '';
     const allUploaded = [];
@@ -1067,27 +1074,70 @@
     }
   }
 
-  /** Option C — upload images to Supabase Storage; cloud roster stores public URLs only. */
-  async function pushBulkStudentPhotosToSupabaseStorage(photoRows) {
+  function estimatePhotoPayloadBytes(photos) {
+    return (photos || []).reduce((sum, row) => {
+      const photo = String(row?.photo || row?.photoDataUrl || row?.dataUrl || '');
+      return sum + photo.length + 96;
+    }, 200);
+  }
+
+  /** Keep each API request under Vercel ~4.5MB body limit (use 2MB safety cap). */
+  function splitPhotoUploadBatches(photoRows, options) {
+    const opts = options || {};
+    const maxBytes = Number(opts.maxBytes) || 2000000;
+    const maxCount = Number(opts.maxCount) || 12;
+    const rows = Array.isArray(photoRows) ? photoRows.filter(row => row?.student && row?.dataUrl) : [];
+    const batches = [];
+    let current = [];
+    let currentBytes = 0;
+
+    rows.forEach((row) => {
+      const item = {
+        admissionNo: row.student.admissionNo || row.student.AdmissionNo,
+        photo: row.dataUrl,
+        photoDataUrl: row.dataUrl,
+        _sourceRow: row
+      };
+      const itemBytes = estimatePhotoPayloadBytes([item]);
+      if (current.length && (current.length >= maxCount || currentBytes + itemBytes > maxBytes)) {
+        batches.push(current);
+        current = [];
+        currentBytes = 0;
+      }
+      current.push(item);
+      currentBytes += itemBytes;
+    });
+    if (current.length) batches.push(current);
+    return batches;
+  }
+
+  async function pushBulkStudentPhotosToSupabaseStorage(photoRows, options) {
     const rows = Array.isArray(photoRows) ? photoRows.filter(row => row?.student && row?.dataUrl) : [];
     if (!rows.length) throw new Error('No photos to save.');
+    const onProgress = options && typeof options.onProgress === 'function' ? options.onProgress : null;
 
     cancelScheduledCloudPush();
     window._erpCloudMemoryDirty = true;
     window._erpCloudSyncState = 'syncing';
 
-    const BATCH_SIZE = 25;
+    const batches = splitPhotoUploadBatches(rows);
     let patched = 0;
     let savedAt = '';
 
     try {
-      for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-        const batch = rows.slice(i, i + BATCH_SIZE).map(row => ({
-          admissionNo: row.student.admissionNo || row.student.AdmissionNo,
-          photo: row.dataUrl,
-          photoDataUrl: row.dataUrl
-        }));
-        const result = await pushStudentPhotoStorageBatchToCloud(batch);
+      for (let i = 0; i < batches.length; i += 1) {
+        const batch = batches[i];
+        if (onProgress) {
+          onProgress({
+            mode: 'storage',
+            batch: i + 1,
+            totalBatches: batches.length,
+            batchSize: batch.length,
+            totalPhotos: rows.length
+          });
+        }
+        const payload = batch.map(({ admissionNo, photo, photoDataUrl }) => ({ admissionNo, photo, photoDataUrl }));
+        const result = await pushStudentPhotoStorageBatchToCloud(payload);
         const uploaded = Array.isArray(result.uploaded) ? result.uploaded : [];
         uploaded.forEach((item) => {
           const key = String(item.admissionNo || '').trim().toLowerCase();
@@ -1127,48 +1177,43 @@
   }
 
   /** Save bulk-uploaded photos in small batches so refresh keeps them. */
-  async function pushBulkStudentPhotosToCloud(photoRows) {
+  async function pushBulkStudentPhotosToCloud(photoRows, options) {
     const rows = Array.isArray(photoRows) ? photoRows.filter(row => row?.student && row?.dataUrl) : [];
     if (!rows.length) throw new Error('No photos to save.');
+    const onProgress = options && typeof options.onProgress === 'function' ? options.onProgress : null;
 
     cancelScheduledCloudPush();
     window._erpCloudMemoryDirty = true;
     window._erpCloudSyncState = 'syncing';
 
-    const BATCH_SIZE = 25;
+    const batches = splitPhotoUploadBatches(rows);
     let patched = 0;
     let savedAt = '';
 
     try {
-      for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-        const batch = rows.slice(i, i + BATCH_SIZE).map(row => ({
-          admissionNo: row.student.admissionNo || row.student.AdmissionNo,
-          photo: row.dataUrl,
-          photoDataUrl: row.dataUrl
-        }));
-        try {
-          const result = await pushStudentPhotoBatchToCloud(batch);
-          batch.forEach((item) => {
-            const key = String(item.admissionNo || '').trim().toLowerCase();
-            const row = rows.find(r => String(r.student?.admissionNo || '').trim().toLowerCase() === key);
-            if (row) {
-              row.student.photo = item.photo;
-              row.student.photoDataUrl = item.photo;
-            }
+      for (let i = 0; i < batches.length; i += 1) {
+        const batch = batches[i];
+        if (onProgress) {
+          onProgress({
+            mode: 'patch',
+            batch: i + 1,
+            totalBatches: batches.length,
+            batchSize: batch.length,
+            totalPhotos: rows.length
           });
-          patched += Number(result.patched || batch.length);
-          savedAt = result.savedAt || savedAt;
-        } catch (batchErr) {
-          const msg = String(batchErr.message || batchErr);
-          const patchUnavailable = /404|not found|unknown|Method not allowed/i.test(msg);
-          if (patchUnavailable && typeof pushStaffAuthorityToCloud === 'function') {
-            const fallback = await pushStaffAuthorityToCloud();
-            patched = rows.length;
-            savedAt = fallback?.savedAt || savedAt;
-            break;
-          }
-          throw batchErr;
         }
+        const payload = batch.map(({ admissionNo, photo, photoDataUrl }) => ({ admissionNo, photo, photoDataUrl }));
+        const result = await pushStudentPhotoBatchToCloud(payload);
+        payload.forEach((item) => {
+          const key = String(item.admissionNo || '').trim().toLowerCase();
+          const row = rows.find(r => String(r.student?.admissionNo || '').trim().toLowerCase() === key);
+          if (row) {
+            row.student.photo = item.photo;
+            row.student.photoDataUrl = item.photo;
+          }
+        });
+        patched += Number(result.patched || payload.length);
+        savedAt = result.savedAt || savedAt;
       }
 
       if (savedAt) {
@@ -1394,6 +1439,8 @@
   window.pushStaffAuthorityToCloud = pushStaffAuthorityToCloud;
   window.pushBulkStudentPhotosToCloud = pushBulkStudentPhotosToCloud;
   window.pushBulkStudentPhotosToSupabaseStorage = pushBulkStudentPhotosToSupabaseStorage;
+  window.splitPhotoUploadBatches = splitPhotoUploadBatches;
+  window.isPhotoApiUnavailableError = isPhotoApiUnavailableError;
   window.pushBulkPhotoImportFromUrls = pushBulkPhotoImportFromUrls;
   window.flushCloudPushNow = flushCloudPushNow;
   window.getCloudSyncStatusText = getCloudSyncStatusText;

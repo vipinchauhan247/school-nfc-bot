@@ -1575,8 +1575,8 @@ async function handlePhotoStorageUpload(req, res, schoolId) {
   if (!Array.isArray(photos) || !photos.length) {
     return json(res, 400, { ok: false, error: 'POST body must include photos array.' });
   }
-  if (photos.length > 25) {
-    return json(res, 400, { ok: false, error: 'Maximum 25 photos per request. Upload one class at a time.' });
+  if (photos.length > 15) {
+    return json(res, 400, { ok: false, error: 'Maximum 15 photos per request (server limit). Update js/cloudSync.js — it sends smaller automatic batches.' });
   }
 
   const snapshot = await readSnapshot(schoolId);
@@ -1639,8 +1639,8 @@ async function handlePhotoImportFromUrls(req, res, schoolId) {
   if (!Array.isArray(items) || !items.length) {
     return json(res, 400, { ok: false, error: 'POST body must include items array with admissionNo and url.' });
   }
-  if (items.length > 20) {
-    return json(res, 400, { ok: false, error: 'Maximum 20 photos per request. Import one class at a time.' });
+  if (items.length > 15) {
+    return json(res, 400, { ok: false, error: 'Maximum 15 URLs per request. The app imports in automatic batches — update js/cloudSync.js if you see this.' });
   }
 
   const snapshot = await readSnapshot(schoolId);
@@ -1718,8 +1718,8 @@ async function handlePhotoPatch(req, res, schoolId) {
   if (!Array.isArray(photos) || !photos.length) {
     return json(res, 400, { ok: false, error: 'POST body must include photos array.' });
   }
-  if (photos.length > 50) {
-    return json(res, 400, { ok: false, error: 'Maximum 50 photos per request. Upload one class at a time.' });
+  if (photos.length > 15) {
+    return json(res, 400, { ok: false, error: 'Maximum 15 photos per request (server limit). Update js/cloudSync.js — it sends smaller automatic batches.' });
   }
 
   const snapshot = await readSnapshot(schoolId);
