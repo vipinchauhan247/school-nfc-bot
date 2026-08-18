@@ -11455,9 +11455,12 @@ function renderClassesPage(container) {
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-chalkboard-user" style="color:var(--accent-primary)"></i> Classes & Sections Directory (Nursery to 10th)</h2>
-        <p class="page-subtitle">Create New Classes, Edit Class Names & Assign Class Teachers</p>
+        <p class="page-subtitle">Create classes and sections here. Assign <strong>one class teacher per section</strong> from Class Teacher Assignments.</p>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="window.location.hash='teacher-class-assignments'" style="background:#38bdf8; color:#0f172a; border:none; font-weight:800;">
+          <i class="fa-solid fa-user-tie"></i> Assign Class Teachers (by Section)
+        </button>
         <button class="btn btn-secondary" onclick="ensureSchoolDataClasses(); saveSchoolDataToStorage(); renderClassesPage(document.getElementById('contentBody')); showNotification('Classes list restored from student roster / defaults.', 'success');"><i class="fa-solid fa-rotate-left"></i> Restore Classes</button>
         <button class="btn btn-primary" onclick="openCreateClassModal()"><i class="fa-solid fa-plus"></i> Add New Class</button>
       </div>
@@ -11469,6 +11472,12 @@ function renderClassesPage(container) {
           const detail = s.sessionDetails?.[SchoolData.activeSession];
           return (detail && detail.class === c.name) || (!detail && (s.currentClass || s.class) === c.name);
         }).length;
+        const sectionTeacherMap = getClassSectionTeachers(c);
+        const sectionTeacherLines = (c.sections || ['A']).map((section) => {
+          const key = normalizeClassSectionKey(section);
+          const teacher = sectionTeacherMap[key] || 'Not assigned';
+          return `<div style="padding-left:8px;"><span class="badge badge-purple" style="margin-right:6px;">Sec ${section}</span> ${escapeHtml(teacher)}</div>`;
+        }).join('');
 
         return `
           <div class="glass-card" style="display:flex; flex-direction:column; justify-content:space-between;">
@@ -11480,7 +11489,10 @@ function renderClassesPage(container) {
               
               <div style="font-size:0.88rem; color:var(--text-muted); display:flex; flex-direction:column; gap:8px; margin-bottom:16px;">
                 <div><i class="fa-solid fa-layer-group"></i> <strong>Sections:</strong> ${c.sections.join(', ')}</div>
-                <div><i class="fa-solid fa-user-tie" style="color:var(--accent-primary);"></i> <strong>Class Teacher:</strong> <span style="color:var(--text-main); font-weight:600;">${c.teacher}</span></div>
+                <div>
+                  <div><i class="fa-solid fa-user-tie" style="color:var(--accent-primary);"></i> <strong>Class Teachers:</strong></div>
+                  <div style="margin-top:6px; display:flex; flex-direction:column; gap:4px; color:var(--text-main); font-weight:600;">${sectionTeacherLines}</div>
+                </div>
                 <div><i class="fa-solid fa-door-open"></i> <strong>Room Allocation:</strong> ${c.room || 'Room 101'}</div>
               </div>
             </div>
@@ -11646,11 +11658,12 @@ function openEditClassModal(classId) {
               <input type="text" id="editClassName" class="session-dropdown" value="${clsObj.name}">
             </div>
             <div>
-              <label style="font-size:0.8rem; font-weight:600;">Assigned Class Teacher *</label>
+              <label style="font-size:0.8rem; font-weight:600;">Default Class Teacher (Section A)</label>
               <select id="editClassTeacher" class="session-dropdown">
                 <option value="">Select class teacher</option>
-                ${getClassTeacherOptionsHtml(clsObj.teacher, clsObj.id)}
+                ${getClassTeacherOptionsHtml(getClassSectionTeachers(clsObj)['A'] || clsObj.teacher, clsObj.id, 'A')}
               </select>
+              <small style="color:#94a3b8; display:block; margin-top:6px;">For different teachers per section (A, B, C), use <a href="#teacher-class-assignments" style="color:#38bdf8;">Class Teacher Assignments</a>.</small>
             </div>
             <div>
               <label style="font-size:0.8rem; font-weight:600;">Sections (Comma Separated)</label>
@@ -11689,11 +11702,11 @@ function saveClassEdit(classId) {
     showNotification('Class Name and Teacher Name are required!', 'error');
     return;
   }
-  if (!validateUniqueClassTeacher(teacher, classId)) return;
+  if (!validateUniqueClassTeacher(teacher, classId, 'A')) return;
   clsObj.name = name;
-  clsObj.teacher = teacher;
-  clsObj.sections = document.getElementById('editClassSections').value.split(',').map(s => s.trim());
+  clsObj.sections = document.getElementById('editClassSections').value.split(',').map(s => s.trim()).filter(Boolean);
   clsObj.room = document.getElementById('editClassRoom').value.trim();
+  setClassSectionTeacher(clsObj, 'A', teacher);
 
   const modal = document.getElementById('classEditModal');
   if (modal) modal.remove();
