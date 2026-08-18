@@ -3240,6 +3240,7 @@ function renderExamsPage(container, mode = 'entry') {
         #subjectTableContainer {
           -webkit-overflow-scrolling: touch;
           overscroll-behavior: contain;
+          touch-action: pan-x pan-y;
         }
         #subjectTableContainer .sticky-col-1,
         #subjectTableContainer .sticky-col-2,
@@ -3297,21 +3298,17 @@ function renderExamsPage(container, mode = 'entry') {
           }
           #subjectTableContainer .sticky-col-2 {
             left: 36px !important;
-            width: 120px !important;
-            min-width: 120px !important;
-            max-width: 120px !important;
-            font-size: 0.88rem !important;
-            white-space: normal !important;
-            line-height: 1.2 !important;
+            width: 108px !important;
+            min-width: 108px !important;
+            max-width: 108px !important;
+            font-size: 0.78rem !important;
           }
           #subjectTableContainer .sticky-col-3 {
-            left: 156px !important;
-            width: 100px !important;
-            min-width: 100px !important;
-            max-width: 100px !important;
-            font-size: 0.8rem !important;
-            white-space: normal !important;
-            line-height: 1.2 !important;
+            left: 144px !important;
+            width: 82px !important;
+            min-width: 82px !important;
+            max-width: 82px !important;
+            font-size: 0.74rem !important;
           }
         }
       </style>
@@ -7014,6 +7011,8 @@ function switchActiveSubjectView(subCode) {
 function setupTableTrackpadAndMouseDragScroll() {
   const el = document.getElementById('subjectTableContainer');
   if (!el) return;
+  if (el._matrixScrollBound) return;
+  el._matrixScrollBound = true;
 
   function syncSlider() {
     const slider = document.getElementById('subjectRangeSlider');
@@ -7023,10 +7022,8 @@ function setupTableTrackpadAndMouseDragScroll() {
     }
   }
 
-  // 1. Sync slider bar on native browser scroll
   el.addEventListener('scroll', syncSlider, { passive: true });
 
-  // 1b. Smooth Horizontal Trackpad & Shift+Wheel Handling (Eliminates Chrome Rubber-Band Physics)
   el.addEventListener('wheel', (e) => {
     if (Math.abs(e.deltaX) > Math.abs(e.deltaY) || e.shiftKey) {
       el.scrollLeft += (e.deltaX || e.deltaY);
@@ -7034,7 +7031,24 @@ function setupTableTrackpadAndMouseDragScroll() {
     }
   }, { passive: false });
 
-  // 2. Keyboard Focus: keep active cell visible
+  // Mobile + touch laptops: drag horizontally to slide subjects
+  let touchStartX = 0;
+  let touchScrollLeft = 0;
+  let touchDragging = false;
+  el.addEventListener('touchstart', (e) => {
+    if (!e.touches || e.touches.length !== 1) return;
+    touchDragging = true;
+    touchStartX = e.touches[0].clientX;
+    touchScrollLeft = el.scrollLeft;
+  }, { passive: true });
+  el.addEventListener('touchmove', (e) => {
+    if (!touchDragging || !e.touches || e.touches.length !== 1) return;
+    const dx = touchStartX - e.touches[0].clientX;
+    el.scrollLeft = touchScrollLeft + dx;
+    syncSlider();
+  }, { passive: true });
+  el.addEventListener('touchend', () => { touchDragging = false; }, { passive: true });
+
   el.addEventListener('focusin', (e) => {
     if (e.target.tagName.toLowerCase() !== 'input') return;
     const cRect = e.target.getBoundingClientRect(), wRect = el.getBoundingClientRect();
@@ -8216,6 +8230,61 @@ function buildSchoolDataStoragePayload() {
   };
 }
 
+function mergeSubjectsPreferNonEmpty(currentSubjects, incomingSubjects) {
+  const current = normalizeSubjectsPayload(currentSubjects);
+  const incoming = normalizeSubjectsPayload(incomingSubjects);
+  if (!incoming.length) return current;
+  if (!current.length) return incoming;
+  const byKey = new Map();
+  current.forEach((item) => {
+    const key = String(item?.code || item?.id || item?.name || '').trim().toLowerCase();
+    if (key) byKey.set(key, item);
+  });
+  incoming.forEach((item) => {
+    const key = String(item?.code || item?.id || item?.name || '').trim().toLowerCase();
+    if (!key) return;
+    byKey.set(key, { ...(byKey.get(key) || {}), ...item });
+  });
+  return Array.from(byKey.values());
+}
+
+function mergeStaffUsersPreferNonEmpty(currentUsers, incomingUsers) {
+  const current = Array.isArray(currentUsers) ? currentUsers.filter(Boolean) : [];
+  const incoming = Array.isArray(incomingUsers) ? incomingUsers.filter(Boolean) : [];
+  if (!incoming.length) return current;
+  if (!current.length) return incoming;
+  const byKey = new Map();
+  current.forEach((item) => {
+    const key = String(item?.username || item?.id || '').trim().toLowerCase();
+    if (key) byKey.set(key, item);
+  });
+  incoming.forEach((item) => {
+    const key = String(item?.username || item?.id || '').trim().toLowerCase();
+    if (!key) return;
+    const prev = byKey.get(key) || {};
+    byKey.set(key, { ...prev, ...item, password: item.password || prev.password || '' });
+  });
+  return Array.from(byKey.values());
+}
+
+function mergeTeachersPreferNonEmpty(currentTeachers, incomingTeachers) {
+  const current = Array.isArray(currentTeachers) ? currentTeachers.filter(Boolean) : [];
+  const incoming = Array.isArray(incomingTeachers) ? incomingTeachers.filter(Boolean) : [];
+  if (!incoming.length) return current;
+  if (!current.length) return incoming;
+  const byKey = new Map();
+  current.forEach((item) => {
+    const key = String(item?.id || item?.name || '').trim().toLowerCase();
+    if (key) byKey.set(key, item);
+  });
+  incoming.forEach((item) => {
+    const key = String(item?.id || item?.name || '').trim().toLowerCase();
+    if (!key) return;
+    byKey.set(key, { ...(byKey.get(key) || {}), ...item });
+  });
+  return Array.from(byKey.values());
+}
+
 function applySchoolDataStoragePayload(parsed, options) {
   const allowEmpty = !!(options && options.allowEmpty);
   if (!parsed || !Array.isArray(parsed.students)) return false;
@@ -8240,21 +8309,22 @@ function applySchoolDataStoragePayload(parsed, options) {
     });
   }
   if (parsed.sessions) SchoolData.sessions = parsed.sessions;
-  if (Array.isArray(parsed.teachers) || parsed.teachers) SchoolData.teachers = parsed.teachers || [];
-  if (parsed.subjects) SchoolData.subjects = normalizeSubjectsPayload(parsed.subjects);
-  if (Array.isArray(parsed.staffUsers)) {
-    const prevByKey = new Map(
-      (SchoolData.staffUsers || []).map((u) => [String(u.username || u.id || '').toLowerCase(), u])
-    );
-    SchoolData.staffUsers = parsed.staffUsers.map((u) => {
-      const key = String(u.username || u.id || '').toLowerCase();
-      const prev = prevByKey.get(key);
-      // Never blank an existing password just because cloud row omitted it
-      if (prev && prev.password && !u.password) return { ...u, password: prev.password };
-      return u;
-    });
+  if (parsed.teachers !== undefined) {
+    SchoolData.teachers = mergeTeachersPreferNonEmpty(SchoolData.teachers, parsed.teachers);
   }
-  if (parsed.examSubjectConfigs) SchoolData.examSubjectConfigs = parsed.examSubjectConfigs;
+  if (parsed.subjects !== undefined) {
+    SchoolData.subjects = mergeSubjectsPreferNonEmpty(SchoolData.subjects, parsed.subjects);
+  }
+  if (Array.isArray(parsed.staffUsers)) {
+    SchoolData.staffUsers = mergeStaffUsersPreferNonEmpty(SchoolData.staffUsers, parsed.staffUsers);
+  }
+  if (parsed.examSubjectConfigs !== undefined) {
+    const incoming = parsed.examSubjectConfigs && typeof parsed.examSubjectConfigs === 'object' ? parsed.examSubjectConfigs : {};
+    const current = SchoolData.examSubjectConfigs && typeof SchoolData.examSubjectConfigs === 'object' ? SchoolData.examSubjectConfigs : {};
+    if (Object.keys(incoming).length || !Object.keys(current).length) {
+      SchoolData.examSubjectConfigs = { ...current, ...incoming };
+    }
+  }
   if (parsed.schoolProfile) {
     const prev = SchoolData.schoolProfile || {};
     const next = parsed.schoolProfile;
@@ -12981,9 +13051,17 @@ function saveNewSubject() {
   renderSubjectsPage(document.getElementById('contentBody'));
 
   saveSchoolDataToStorage();
+  pushSchoolMetaToCloudNow();
 }
 
-function openEditSubjectModal(subId) {
+function pushSchoolMetaToCloudNow() {
+  window._erpCloudMemoryDirty = true;
+  if (typeof flushCloudPushNow === 'function') {
+    flushCloudPushNow();
+  } else if (typeof scheduleCloudPush === 'function') {
+    scheduleCloudPush(0);
+  }
+}
   if (!canCurrentUserModifySubjects()) {
     showNotification('Access denied: teachers cannot edit the Subjects Directory.', 'warning');
     return;
@@ -13085,6 +13163,7 @@ function saveSubjectEdit(subId) {
   renderSubjectsPage(document.getElementById('contentBody'));
 
   saveSchoolDataToStorage();
+  pushSchoolMetaToCloudNow();
 }
 
 function deleteSubject(subId) {

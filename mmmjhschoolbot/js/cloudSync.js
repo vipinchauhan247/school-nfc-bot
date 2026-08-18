@@ -36,6 +36,88 @@
     return [];
   }
 
+  function subjectMergeKey(subject) {
+    return String(subject?.code || subject?.id || subject?.name || '').trim().toLowerCase();
+  }
+
+  /** Never let an empty cloud array wipe subjects saved on another PC. */
+  function mergeSubjectsLists(localSubjects, remoteSubjects) {
+    const local = normalizeSubjectsList(localSubjects);
+    const remote = normalizeSubjectsList(remoteSubjects);
+    if (!remote.length) return local;
+    if (!local.length) return remote;
+    const byKey = new Map();
+    local.forEach((item) => {
+      const key = subjectMergeKey(item);
+      if (key) byKey.set(key, item);
+    });
+    remote.forEach((item) => {
+      const key = subjectMergeKey(item);
+      if (!key) return;
+      byKey.set(key, { ...(byKey.get(key) || {}), ...item });
+    });
+    return Array.from(byKey.values());
+  }
+
+  function staffUserMergeKey(user) {
+    return String(user?.username || user?.id || '').trim().toLowerCase();
+  }
+
+  function mergeStaffUsersLists(localUsers, remoteUsers) {
+    const local = Array.isArray(localUsers) ? localUsers.filter(Boolean) : [];
+    const remote = Array.isArray(remoteUsers) ? remoteUsers.filter(Boolean) : [];
+    if (!remote.length) return local;
+    if (!local.length) return remote;
+    const byKey = new Map();
+    local.forEach((item) => {
+      const key = staffUserMergeKey(item);
+      if (key) byKey.set(key, item);
+    });
+    remote.forEach((item) => {
+      const key = staffUserMergeKey(item);
+      if (!key) return;
+      const prev = byKey.get(key) || {};
+      byKey.set(key, {
+        ...prev,
+        ...item,
+        password: item.password || prev.password || ''
+      });
+    });
+    return Array.from(byKey.values());
+  }
+
+  function teacherMergeKey(teacher) {
+    return String(teacher?.id || teacher?.name || '').trim().toLowerCase();
+  }
+
+  function mergeTeachersLists(localTeachers, remoteTeachers) {
+    const local = Array.isArray(localTeachers) ? localTeachers.filter(Boolean) : [];
+    const remote = Array.isArray(remoteTeachers) ? remoteTeachers.filter(Boolean) : [];
+    if (!remote.length) return local;
+    if (!local.length) return remote;
+    const byKey = new Map();
+    local.forEach((item) => {
+      const key = teacherMergeKey(item);
+      if (key) byKey.set(key, item);
+    });
+    remote.forEach((item) => {
+      const key = teacherMergeKey(item);
+      if (!key) return;
+      byKey.set(key, { ...(byKey.get(key) || {}), ...item });
+    });
+    return Array.from(byKey.values());
+  }
+
+  function mergePlainObjectsPreferNonEmpty(localObj, remoteObj) {
+    const local = localObj && typeof localObj === 'object' ? localObj : {};
+    const remote = remoteObj && typeof remoteObj === 'object' ? remoteObj : {};
+    const localKeys = Object.keys(local);
+    const remoteKeys = Object.keys(remote);
+    if (!remoteKeys.length) return local;
+    if (!localKeys.length) return remote;
+    return { ...local, ...remote };
+  }
+
   function isCloudOnly() {
     // Default ON for MMM JHS. Set window.ERP_CLOUD_ONLY = false only to re-enable hybrid.
     return window.ERP_CLOUD_ONLY !== false;
@@ -448,17 +530,20 @@
     let staffUsers;
     let teachers;
     if (localStudentsAuthoritative) {
-      staffUsers = Array.isArray(local.staffUsers) ? local.staffUsers : (remote.staffUsers || []);
-      teachers = Array.isArray(local.teachers) ? local.teachers : (remote.teachers || []);
+      staffUsers = mergeStaffUsersLists(local.staffUsers, remote.staffUsers);
+      teachers = mergeTeachersLists(local.teachers, remote.teachers);
     } else if (remoteStudentsAuthoritative) {
-      staffUsers = Array.isArray(remote.staffUsers) ? remote.staffUsers : (local.staffUsers || []);
-      teachers = Array.isArray(remote.teachers) ? remote.teachers : (local.teachers || []);
+      staffUsers = mergeStaffUsersLists(remote.staffUsers, local.staffUsers);
+      teachers = mergeTeachersLists(remote.teachers, local.teachers);
     } else {
-      staffUsers = Array.isArray(newerMeta.staffUsers) ? newerMeta.staffUsers
-        : (Array.isArray(olderMeta.staffUsers) ? olderMeta.staffUsers : []);
-      teachers = Array.isArray(newerMeta.teachers) ? newerMeta.teachers
-        : (Array.isArray(olderMeta.teachers) ? olderMeta.teachers : []);
+      staffUsers = mergeStaffUsersLists(olderMeta.staffUsers, newerMeta.staffUsers);
+      teachers = mergeTeachersLists(olderMeta.teachers, newerMeta.teachers);
     }
+
+    const mergedSubjects = mergeSubjectsLists(
+      localStudentsAuthoritative ? local.subjects : remote.subjects,
+      localStudentsAuthoritative ? remote.subjects : local.subjects
+    );
 
     return {
       ...olderMeta,
@@ -468,19 +553,19 @@
       students,
       cancelledReceipts,
       classes: (() => {
-        const remoteClasses = normalizeClassesList(cloudPayload.classes);
-        const localClasses = normalizeClassesList(localPayload.classes);
+        const remoteClasses = normalizeClassesList(remote.classes);
+        const localClasses = normalizeClassesList(local.classes);
         return remoteClasses.length ? remoteClasses : localClasses;
       })(),
       staffUsers,
       schoolProfile: newerMeta.schoolProfile || olderMeta.schoolProfile,
       signatures: newerMeta.signatures || olderMeta.signatures,
       teachers,
-      subjects: normalizeSubjectsList(newerMeta.subjects || olderMeta.subjects),
+      subjects: mergedSubjects,
       sessions: newerMeta.sessions || olderMeta.sessions,
-      classFeeMaster: newerMeta.classFeeMaster || olderMeta.classFeeMaster,
-      feeScheduleRules: newerMeta.feeScheduleRules || olderMeta.feeScheduleRules,
-      examSubjectConfigs: newerMeta.examSubjectConfigs || olderMeta.examSubjectConfigs,
+      classFeeMaster: mergePlainObjectsPreferNonEmpty(olderMeta.classFeeMaster, newerMeta.classFeeMaster),
+      feeScheduleRules: mergePlainObjectsPreferNonEmpty(olderMeta.feeScheduleRules, newerMeta.feeScheduleRules),
+      examSubjectConfigs: mergePlainObjectsPreferNonEmpty(olderMeta.examSubjectConfigs, newerMeta.examSubjectConfigs),
       periodSettings: newerMeta.periodSettings || olderMeta.periodSettings,
       activeSession: newerMeta.activeSession || olderMeta.activeSession
     };
@@ -752,6 +837,12 @@
           ...cloudPayload,
           students: mergeCloudOnlyStudents(localPayload.students, cloudPayload.students),
           classes: remoteClasses.length ? remoteClasses : localClasses,
+          subjects: mergeSubjectsLists(localPayload.subjects, cloudPayload.subjects),
+          staffUsers: mergeStaffUsersLists(localPayload.staffUsers, cloudPayload.staffUsers),
+          teachers: mergeTeachersLists(localPayload.teachers, cloudPayload.teachers),
+          examSubjectConfigs: mergePlainObjectsPreferNonEmpty(localPayload.examSubjectConfigs, cloudPayload.examSubjectConfigs),
+          classFeeMaster: mergePlainObjectsPreferNonEmpty(localPayload.classFeeMaster, cloudPayload.classFeeMaster),
+          feeScheduleRules: mergePlainObjectsPreferNonEmpty(localPayload.feeScheduleRules, cloudPayload.feeScheduleRules),
           cancelledReceipts: mergeCancelledReceipts(localPayload.cancelledReceipts, cloudPayload.cancelledReceipts),
           savedAt: cloudPayload.savedAt || snapshot.saved_at || new Date().toISOString()
         };

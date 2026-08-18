@@ -1231,6 +1231,7 @@ body.sidebar-open .sidebar-overlay {
 .data-table-container.custom-matrix-scroll {
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
+  touch-action: pan-x pan-y;
 }
 
 .sticky-col-1,
