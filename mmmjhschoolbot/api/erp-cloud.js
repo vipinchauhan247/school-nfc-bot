@@ -176,10 +176,12 @@ async function readStaffCredential(schoolId, usernameOrId) {
 async function saveStaffCredential(schoolId, user, password) {
   const salt = crypto.randomBytes(16).toString('hex');
   const iterations = 210000;
+  const userId = String(user.id || user.username || '').trim();
+  const usernameLower = normalizeUsername(user.username || user.id);
   const row = {
     school_id: schoolId,
-    user_id: String(user.id || user.username || '').trim(),
-    username_lower: normalizeUsername(user.username || user.id),
+    user_id: userId,
+    username_lower: usernameLower,
     user_name: String(user.name || '').trim(),
     role: String(user.role || '').trim(),
     password_salt: salt,
@@ -188,6 +190,24 @@ async function saveStaffCredential(schoolId, user, password) {
     active: user.active !== false && String(user.status || '').toLowerCase() !== 'inactive',
     updated_at: new Date().toISOString()
   };
+  // Roster rebuilds can change user_id while username stays the same — clear stale row.
+  try {
+    const stale = await supabaseRequest(
+      'GET',
+      `erp_staff_credentials?school_id=eq.${encodeURIComponent(schoolId)}&username_lower=eq.${encodeURIComponent(usernameLower)}&select=id,user_id&limit=1`
+    );
+    const prev = Array.isArray(stale) && stale.length ? stale[0] : null;
+    if (prev && String(prev.user_id || '') !== userId) {
+      await supabaseRequest(
+        'DELETE',
+        `erp_staff_credentials?id=eq.${encodeURIComponent(prev.id)}`,
+        undefined,
+        'return=minimal'
+      );
+    }
+  } catch (err) {
+    console.error('[ERP-AUTH] stale credential cleanup failed:', err.message);
+  }
   const rows = await supabaseRequest(
     'POST',
     'erp_staff_credentials?on_conflict=school_id,user_id',
@@ -676,11 +696,99 @@ async function handleTcGet(req, res, schoolId) {
 async function handleTcList(req, res, schoolId) {
   const session = await requireErpSession(req, res);
   if (!session) return;
+  const certificates = await listTcCertificatesInternal(schoolId);
+  return json(res, 200, { ok: true, certificates });
+}
+
+async function listTcCertificatesInternal(schoolId) {
   const rows = await supabaseRequest(
     'GET',
     `erp_tc_certificates?school_id=eq.${encodeURIComponent(schoolId)}&select=id,student_id,admission_no,certificate_no,academic_session,student_snapshot,issued_at,issued_by_name,status,revoked_at&order=issued_at.desc&limit=2000`
   );
-  return json(res, 200, { ok: true, certificates: Array.isArray(rows) ? rows : [] });
+  return Array.isArray(rows) ? rows : [];
+}
+
+/** Merge permanent TC register back into roster — restores left/inactive students after a bad rebuild. */
+function applyTcCertificatesToPayload(payload, certificates) {
+  if (!payload || !Array.isArray(payload.students) || !Array.isArray(certificates) || !certificates.length) {
+    return { payload, restored: 0, markedLeft: 0 };
+  }
+
+  const byAdmission = new Map();
+  payload.students.forEach((student) => {
+    const key = normalizeAdmission(student?.admissionNo || student?.AdmissionNo);
+    if (key) byAdmission.set(key, student);
+  });
+
+  let restored = 0;
+  let markedLeft = 0;
+  certificates.forEach((cert) => {
+    const adm = normalizeAdmission(cert?.admission_no);
+    if (!adm) return;
+    const snap = cert.student_snapshot && typeof cert.student_snapshot === 'object' ? cert.student_snapshot : {};
+    let student = byAdmission.get(adm);
+    if (!student) {
+      student = {
+        ...snap,
+        admissionNo: adm,
+        name: String(snap.name || '').trim() || `Student ${adm}`,
+        currentClass: snap.currentClass || snap.class || '',
+        currentSection: snap.currentSection || snap.section || '',
+        parentName: snap.parentName || '',
+        status: 'Left',
+        feeRecords: snap.feeRecords && typeof snap.feeRecords === 'object' ? snap.feeRecords : {}
+      };
+      payload.students.push(student);
+      byAdmission.set(adm, student);
+      restored += 1;
+    }
+
+    const wasActive = String(student.status || '').toLowerCase() === 'active'
+      || !['left', 'inactive', 'withdrawn', 'transferred'].includes(String(student.status || '').toLowerCase());
+    student.status = 'Left';
+    student.tcCertificateNo = cert.certificate_no || student.tcCertificateNo || '';
+    student.tcNo = cert.certificate_no || student.tcNo || '';
+    student.leftAt = student.leftAt || cert.issued_at || new Date().toISOString();
+    student.leftReason = student.leftReason || 'Transfer certificate issued';
+    if (snap.name && !student.name) student.name = snap.name;
+    if (snap.parentName && !student.parentName) student.parentName = snap.parentName;
+    if (wasActive) markedLeft += 1;
+  });
+
+  return { payload, restored, markedLeft };
+}
+
+async function handleRecoverFromTcRegister(req, res, schoolId) {
+  if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST required.' });
+  const session = await requireErpSession(req, res);
+  if (!session) return;
+  if (!isTcAdministrator(session)) {
+    return json(res, 403, { ok: false, error: 'Super Admin / Principal access is required.' });
+  }
+
+  const snapshot = await readSnapshot(schoolId);
+  if (!snapshot?.payload || !Array.isArray(snapshot.payload.students)) {
+    return json(res, 404, { ok: false, error: 'School cloud roster not found.' });
+  }
+
+  const certificates = await listTcCertificatesInternal(schoolId);
+  const merged = applyTcCertificatesToPayload({ ...snapshot.payload, students: snapshot.payload.students.slice() }, certificates);
+  if (!certificates.length) {
+    return json(res, 200, { ok: true, configured: true, tcCount: 0, restored: 0, markedLeft: 0, message: 'No issued TCs in cloud register.' });
+  }
+
+  merged.payload.savedAt = new Date().toISOString();
+  const written = await writeSnapshot(schoolId, merged.payload, `recover-tc:${session.username}`);
+  return json(res, 200, {
+    ok: true,
+    configured: true,
+    schoolId,
+    tcCount: certificates.length,
+    restored: merged.restored,
+    markedLeft: merged.markedLeft,
+    studentCount: merged.payload.students.length,
+    savedAt: written?.snapshot?.saved_at || merged.payload.savedAt
+  });
 }
 
 async function handleTcRevoke(req, res, schoolId) {
@@ -1150,9 +1258,9 @@ async function rebuildPayloadFromNative(schoolId, basePayload) {
     userPermissions: (basePayload && basePayload.userPermissions) || {},
     signatures: (basePayload && basePayload.signatures) || {},
     sessions: (basePayload && basePayload.sessions) || {},
-    teachers: (basePayload && basePayload.teachers) || [],
+    teachers: Array.isArray(basePayload?.teachers) ? basePayload.teachers : [],
     subjects: (basePayload && basePayload.subjects) || {},
-    staffUsers: (basePayload && basePayload.staffUsers) || [],
+    staffUsers: Array.isArray(basePayload?.staffUsers) ? basePayload.staffUsers : [],
     examSubjectConfigs: (basePayload && basePayload.examSubjectConfigs) || {},
     schoolProfile: (basePayload && basePayload.schoolProfile) || {},
     periodSettings: (basePayload && basePayload.periodSettings) || {},
@@ -1217,7 +1325,21 @@ async function ensureSnapshotHasStudents(schoolId) {
     return { snapshot, rebuilt: false, studentCount: count };
   }
 
-  const rebuilt = await rebuildPayloadFromNative(schoolId, snapshot?.payload || {});
+  // Never rebuild from native if staff/teachers exist — native table is students-only
+  // and a rebuild would wipe staff logins, Telegram links, and left-student history.
+  const basePayload = snapshot?.payload || {};
+  const hasStaffMeta = (Array.isArray(basePayload.staffUsers) && basePayload.staffUsers.length > 0)
+    || (Array.isArray(basePayload.teachers) && basePayload.teachers.length > 0);
+  if (hasStaffMeta) {
+    return {
+      snapshot: snapshot || null,
+      rebuilt: false,
+      studentCount: 0,
+      error: 'Snapshot is empty but staff/teachers metadata exists — refusing native rebuild. Contact admin or restore from Supabase backup.'
+    };
+  }
+
+  const rebuilt = await rebuildPayloadFromNative(schoolId, basePayload);
   if (!rebuilt.ok || !rebuilt.payload) {
     return {
       snapshot: snapshot || null,
@@ -1263,6 +1385,19 @@ async function readSnapshotVersion(schoolId) {
   return Array.isArray(rows) && rows.length ? rows[0] : null;
 }
 
+async function syncStaffCredentialsFromPayload(schoolId, payload) {
+  const staff = Array.isArray(payload?.staffUsers) ? payload.staffUsers : [];
+  for (const user of staff) {
+    const plain = String(user?.password || '').trim();
+    if (plain.length < 8) continue;
+    try {
+      await saveStaffCredential(schoolId, user, plain);
+    } catch (err) {
+      console.error('[ERP-AUTH] credential sync failed:', user?.username || user?.id, err.message);
+    }
+  }
+}
+
 async function writeSnapshot(schoolId, payload, savedBy) {
   payload = await preserveSnapshotStaffPasswords(schoolId, payload);
   const row = {
@@ -1306,6 +1441,11 @@ async function writeSnapshot(schoolId, payload, savedBy) {
   }
 
   const saved = Array.isArray(data) ? data[0] : data;
+  try {
+    await syncStaffCredentialsFromPayload(schoolId, payload);
+  } catch (err) {
+    console.error('[ERP-AUTH] bulk credential sync failed:', err.message);
+  }
   return { snapshot: saved, fees };
 }
 
@@ -1338,6 +1478,300 @@ async function handleCloudConfig(req, res) {
   return json(res, 200, cloudConfigBody(req));
 }
 
+function studentPhotoStorageBucket() {
+  return getEnv('ERP_STUDENT_PHOTO_BUCKET') || 'student-photos';
+}
+
+function decodeDataUrlImage(dataUrl) {
+  const match = String(dataUrl || '').match(/^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i);
+  if (!match) return null;
+  const mime = match[1].toLowerCase();
+  const buffer = Buffer.from(match[2], 'base64');
+  if (!buffer.length) return null;
+  let ext = 'jpg';
+  if (mime.includes('png')) ext = 'png';
+  else if (mime.includes('webp')) ext = 'webp';
+  return { buffer, mime, ext };
+}
+
+function studentPhotoStorageObjectPath(schoolId, admissionNo, ext) {
+  return `${schoolId}/${normalizeAdmission(admissionNo)}.${ext || 'jpg'}`;
+}
+
+function studentPhotoPublicUrl(schoolId, admissionNo, ext) {
+  const cfg = supabaseConfig();
+  const bucket = studentPhotoStorageBucket();
+  const objectPath = studentPhotoStorageObjectPath(schoolId, admissionNo, ext);
+  return `${cfg.url}/storage/v1/object/public/${bucket}/${objectPath}`;
+}
+
+async function uploadStudentPhotoBufferToStorage(schoolId, admissionNo, buffer, mime) {
+  const cfg = supabaseConfig();
+  if (!cfg) throw new Error('Supabase is not configured on the server.');
+  if (!buffer || !buffer.length) throw new Error(`Empty image for admission ${admissionNo}.`);
+  const normalizedMime = String(mime || 'image/jpeg').toLowerCase();
+  let ext = 'jpg';
+  if (normalizedMime.includes('png')) ext = 'png';
+  else if (normalizedMime.includes('webp')) ext = 'webp';
+  const bucket = studentPhotoStorageBucket();
+  const objectPath = studentPhotoStorageObjectPath(schoolId, admissionNo, ext);
+  const response = await fetch(`${cfg.url}/storage/v1/object/${bucket}/${objectPath}`, {
+    method: 'POST',
+    headers: {
+      apikey: cfg.key,
+      Authorization: `Bearer ${cfg.key}`,
+      'Content-Type': normalizedMime || 'image/jpeg',
+      'x-upsert': 'true'
+    },
+    body: buffer
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    let message = text.slice(0, 240);
+    try {
+      const parsed = JSON.parse(text);
+      message = parsed.message || parsed.error || message;
+    } catch (err) {}
+    if (/bucket/i.test(message)) {
+      throw new Error(`Supabase Storage bucket "${bucket}" is missing. Create a public bucket with that exact name (see SUPABASE_PHOTO_STORAGE.md).`);
+    }
+    throw new Error(`Photo upload failed for ${admissionNo}: ${message}`);
+  }
+  return studentPhotoPublicUrl(schoolId, admissionNo, ext);
+}
+
+async function uploadStudentPhotoToStorage(schoolId, admissionNo, dataUrl) {
+  const decoded = decodeDataUrlImage(dataUrl);
+  if (!decoded) throw new Error(`Invalid image data for admission ${admissionNo}.`);
+  return uploadStudentPhotoBufferToStorage(schoolId, admissionNo, decoded.buffer, decoded.mime);
+}
+
+async function downloadRemoteStudentPhoto(url, cookie) {
+  const cleanUrl = String(url || '').trim();
+  if (!/^https?:\/\//i.test(cleanUrl)) throw new Error('Invalid photo URL.');
+  const headers = {
+    'User-Agent': 'MMM-ERP-PhotoImport/1.0',
+    Accept: 'image/*,*/*'
+  };
+  const sessionCookie = String(cookie || '').trim();
+  if (sessionCookie) headers.Cookie = sessionCookie;
+  const response = await fetch(cleanUrl, { headers, redirect: 'follow' });
+  if (!response.ok) throw new Error(`Download failed HTTP ${response.status}`);
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (!buffer.length) throw new Error('Empty image file.');
+  if (buffer.length > 2 * 1024 * 1024) throw new Error('Image too large (max 2 MB).');
+  const mime = (response.headers.get('content-type') || 'image/jpeg').split(';')[0].trim();
+  if (!/^image\//i.test(mime)) throw new Error(`Not an image (${mime || 'unknown type'}).`);
+  return { buffer, mime };
+}
+
+/**
+ * Option C — upload JPEG/PNG to Supabase Storage, store public URL in cloud snapshot.
+ * Small JSON requests; images live outside the roster payload.
+ */
+async function handlePhotoStorageUpload(req, res, schoolId) {
+  if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST required.' });
+  const photos = req.body?.photos;
+  if (!Array.isArray(photos) || !photos.length) {
+    return json(res, 400, { ok: false, error: 'POST body must include photos array.' });
+  }
+  if (photos.length > 15) {
+    return json(res, 400, { ok: false, error: 'Maximum 15 photos per request (server limit). Update js/cloudSync.js — it sends smaller automatic batches.' });
+  }
+
+  const snapshot = await readSnapshot(schoolId);
+  if (!snapshot?.payload || !Array.isArray(snapshot.payload.students) || !snapshot.payload.students.length) {
+    return json(res, 404, { ok: false, error: 'School cloud roster not found.' });
+  }
+
+  const byAdmission = new Map();
+  snapshot.payload.students.forEach((student) => {
+    const key = normalizeAdmission(student?.admissionNo || student?.AdmissionNo);
+    if (key) byAdmission.set(key, student);
+  });
+
+  const uploaded = [];
+  for (const row of photos) {
+    if (!row || typeof row !== 'object') continue;
+    const key = normalizeAdmission(row.admissionNo || row.AdmissionNo);
+    if (!key) continue;
+    const student = byAdmission.get(key);
+    if (!student) continue;
+    const dataUrl = String(row.photo || row.photoDataUrl || '').trim();
+    if (!dataUrl.startsWith('data:image')) continue;
+    const publicUrl = await uploadStudentPhotoToStorage(schoolId, key, dataUrl);
+    student.photo = publicUrl;
+    student.photoDataUrl = publicUrl;
+    uploaded.push({ admissionNo: key, photoUrl: publicUrl });
+  }
+
+  if (!uploaded.length) {
+    return json(res, 400, { ok: false, error: 'No matching students or valid photo data in this batch.' });
+  }
+
+  const payload = {
+    ...snapshot.payload,
+    savedAt: new Date().toISOString()
+  };
+  const savedBy = String(req.body?.savedBy || 'bulk-photo-storage').trim();
+  const written = await writeSnapshot(schoolId, payload, savedBy);
+  const savedAt = written?.snapshot?.saved_at || payload.savedAt;
+
+  return json(res, 200, {
+    ok: true,
+    configured: true,
+    schoolId,
+    storage: true,
+    patched: uploaded.length,
+    uploaded,
+    savedAt,
+    studentCount: payload.students.length
+  });
+}
+
+/**
+ * Import student photos from external URLs (old ERP /uploads/ links).
+ * Server downloads each image and stores it in Supabase Storage.
+ */
+async function handlePhotoImportFromUrls(req, res, schoolId) {
+  if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST required.' });
+  const items = req.body?.items;
+  if (!Array.isArray(items) || !items.length) {
+    return json(res, 400, { ok: false, error: 'POST body must include items array with admissionNo and url.' });
+  }
+  if (items.length > 15) {
+    return json(res, 400, { ok: false, error: 'Maximum 15 URLs per request. The app imports in automatic batches — update js/cloudSync.js if you see this.' });
+  }
+
+  const snapshot = await readSnapshot(schoolId);
+  if (!snapshot?.payload || !Array.isArray(snapshot.payload.students) || !snapshot.payload.students.length) {
+    return json(res, 404, { ok: false, error: 'School cloud roster not found.' });
+  }
+
+  const byAdmission = new Map();
+  snapshot.payload.students.forEach((student) => {
+    const key = normalizeAdmission(student?.admissionNo || student?.AdmissionNo);
+    if (key) byAdmission.set(key, student);
+  });
+
+  const cookie = String(req.body?.cookie || '').trim();
+  const uploaded = [];
+  const failed = [];
+
+  for (const row of items) {
+    if (!row || typeof row !== 'object') continue;
+    const key = normalizeAdmission(row.admissionNo || row.AdmissionNo);
+    const sourceUrl = String(row.url || row.photoUrl || row.photo || '').trim();
+    if (!key || !sourceUrl) continue;
+    const student = byAdmission.get(key);
+    if (!student) {
+      failed.push({ admissionNo: key, error: 'Student not found in cloud roster.' });
+      continue;
+    }
+    try {
+      const downloaded = await downloadRemoteStudentPhoto(sourceUrl, cookie);
+      const publicUrl = await uploadStudentPhotoBufferToStorage(schoolId, key, downloaded.buffer, downloaded.mime);
+      student.photo = publicUrl;
+      student.photoDataUrl = publicUrl;
+      uploaded.push({ admissionNo: key, photoUrl: publicUrl, sourceUrl });
+    } catch (err) {
+      failed.push({ admissionNo: key, error: err.message || String(err), sourceUrl });
+    }
+  }
+
+  if (!uploaded.length) {
+    return json(res, 400, {
+      ok: false,
+      error: failed.length
+        ? `No photos imported. First error: ${failed[0].error}`
+        : 'No matching students or valid photo URLs in this batch.',
+      failed
+    });
+  }
+
+  const payload = {
+    ...snapshot.payload,
+    savedAt: new Date().toISOString()
+  };
+  const savedBy = String(req.body?.savedBy || 'old-erp-photo-import').trim();
+  const written = await writeSnapshot(schoolId, payload, savedBy);
+  const savedAt = written?.snapshot?.saved_at || payload.savedAt;
+
+  return json(res, 200, {
+    ok: true,
+    configured: true,
+    schoolId,
+    storage: true,
+    imported: uploaded.length,
+    patched: uploaded.length,
+    uploaded,
+    failed,
+    savedAt,
+    studentCount: payload.students.length
+  });
+}
+
+/** Patch student passport photos in small batches (avoids Vercel 4.5MB body limit on full roster push). */
+async function handlePhotoPatch(req, res, schoolId) {
+  if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'POST required.' });
+  const photos = req.body?.photos;
+  if (!Array.isArray(photos) || !photos.length) {
+    return json(res, 400, { ok: false, error: 'POST body must include photos array.' });
+  }
+  if (photos.length > 15) {
+    return json(res, 400, { ok: false, error: 'Maximum 15 photos per request (server limit). Update js/cloudSync.js — it sends smaller automatic batches.' });
+  }
+
+  const snapshot = await readSnapshot(schoolId);
+  if (!snapshot?.payload || !Array.isArray(snapshot.payload.students) || !snapshot.payload.students.length) {
+    return json(res, 404, { ok: false, error: 'School cloud roster not found.' });
+  }
+
+  const byAdmission = new Map();
+  snapshot.payload.students.forEach((student) => {
+    const key = normalizeAdmission(student?.admissionNo || student?.AdmissionNo);
+    if (key) byAdmission.set(key, student);
+  });
+
+  let patched = 0;
+  const touchedStudents = [];
+  photos.forEach((row) => {
+    if (!row || typeof row !== 'object') return;
+    const key = normalizeAdmission(row.admissionNo || row.AdmissionNo);
+    if (!key) return;
+    const student = byAdmission.get(key);
+    if (!student) return;
+    const photo = String(row.photo || row.photoDataUrl || '').trim();
+    const isAssetPhoto = photo.startsWith('assets/students/') && /\.(jpe?g|png|webp)$/i.test(photo);
+    if (!photo.startsWith('data:image') && !isAssetPhoto) return;
+    student.photo = photo;
+    student.photoDataUrl = photo;
+    touchedStudents.push(student);
+    patched += 1;
+  });
+
+  if (!patched) {
+    return json(res, 400, { ok: false, error: 'No matching students or valid photo data in this batch.' });
+  }
+
+  const payload = {
+    ...snapshot.payload,
+    savedAt: new Date().toISOString()
+  };
+  const savedBy = String(req.body?.savedBy || 'bulk-photo-upload').trim();
+  const written = await writeSnapshot(schoolId, payload, savedBy);
+  const savedAt = written?.snapshot?.saved_at || payload.savedAt;
+
+  return json(res, 200, {
+    ok: true,
+    configured: true,
+    schoolId,
+    patched,
+    savedAt,
+    studentCount: payload.students.length
+  });
+}
+
 async function route(req, res, action) {
   const act = String(action || req.query?.action || '').trim();
   if (act === 'cloudConfig') {
@@ -1345,8 +1779,8 @@ async function route(req, res, action) {
     return true;
   }
   if ([
-    'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments',
-    'rebuildSnapshot', 'wipeRoster', 'authLogin', 'authLogout', 'authSession', 'authChangePassword',
+    'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'photoPatch', 'photoStorageUpload', 'photoImportFromUrls', 'nativeStudents', 'nativeMigrate', 'nativePayments',
+    'rebuildSnapshot', 'wipeRoster', 'recoverFromTcRegister', 'authLogin', 'authLogout', 'authSession', 'authChangePassword',
     'authAdminResetPassword', 'authAudit', 'tcIssue', 'tcGet', 'tcList', 'tcVerify', 'tcRevoke'
   ].includes(act)) {
     await erpCloudHandler(req, res);
@@ -1527,6 +1961,13 @@ async function erpCloudHandler(req, res) {
         } catch (err) {
           console.error('[ERP-CLOUD] native payment overlay failed:', err.message);
         }
+        try {
+          const certificates = await listTcCertificatesInternal(schoolId);
+          const tcMerged = applyTcCertificatesToPayload(snapshot.payload, certificates);
+          snapshot.payload = tcMerged.payload;
+        } catch (err) {
+          console.error('[ERP-CLOUD] TC register overlay failed:', err.message);
+        }
       }
       return json(res, 200, {
         ok: true,
@@ -1537,6 +1978,22 @@ async function erpCloudHandler(req, res) {
         native: true,
         feesNative: true
       });
+    }
+
+    if (req.method === 'POST' && action === 'recoverFromTcRegister') {
+      return handleRecoverFromTcRegister(req, res, schoolId);
+    }
+
+    if (req.method === 'POST' && action === 'photoPatch') {
+      return handlePhotoPatch(req, res, schoolId);
+    }
+
+    if (req.method === 'POST' && action === 'photoStorageUpload') {
+      return handlePhotoStorageUpload(req, res, schoolId);
+    }
+
+    if (req.method === 'POST' && action === 'photoImportFromUrls') {
+      return handlePhotoImportFromUrls(req, res, schoolId);
     }
 
     if (req.method === 'POST') {

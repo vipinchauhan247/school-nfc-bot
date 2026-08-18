@@ -15,7 +15,7 @@ const SHEET_HEADERS = {
   Students: [
     'AdmissionNo', 'StudentName', 'Class', 'Section', 'ParentName', 'ParentPhone',
     'NfcUid', 'SchoolBotChatId', 'TelegramUserName', 'Status', 'DueMonths',
-    'TuitionDue', 'ExamFeeDue', 'ComputerFeeDue', 'AnnualFeeDue', 'PreviousSessionDue', 'TotalDue'
+    'TuitionDue', 'ExamFeeDue', 'AnnualFeeDue', 'PreviousSessionDue', 'TotalDue'
   ],
   Registrations: [
     'DateTime', 'AdmissionNo', 'StudentName', 'Class', 'Section', 'ParentName',
@@ -23,7 +23,7 @@ const SHEET_HEADERS = {
   ],
   Fee_Due_Messages: [
     'DateTime', 'AdmissionNo', 'StudentName', 'Class', 'Section', 'SchoolBotChatId',
-    'DueMonths', 'TuitionDue', 'ExamFeeDue', 'ComputerFeeDue', 'AnnualFeeDue',
+    'DueMonths', 'TuitionDue', 'ExamFeeDue', 'AnnualFeeDue',
     'PreviousSessionDue', 'TotalDue', 'SentBy', 'Status', 'TelegramMessageId'
   ],
   Fee_Receipt_Messages: [
@@ -300,6 +300,38 @@ async function scriptRequest(action, payload = {}) {
 
 function getScriptUrl() {
   return String(getEnv('GOOGLE_SCRIPT_URL') || '').trim().replace(/\s+/g, '');
+}
+
+function hasSheetSyncCredentials() {
+  const hasServiceAccount = !!(
+    getEnv('GOOGLE_SERVICE_ACCOUNT_EMAIL') &&
+    getEnv('GOOGLE_PRIVATE_KEY') &&
+    getEnv('GOOGLE_SHEET_ID')
+  );
+  if (hasServiceAccount) return true;
+  return !!getScriptUrl();
+}
+
+function parseRequestBody(req) {
+  if (typeof req.body === 'string') {
+    try {
+      req.body = req.body ? JSON.parse(req.body) : {};
+    } catch (error) {
+      req.body = {};
+    }
+  }
+  if (!req.body || typeof req.body !== 'object') req.body = {};
+}
+
+function ensureRequestQuery(req) {
+  if (req.query && typeof req.query === 'object') return;
+  try {
+    const raw = req.url || '/';
+    const u = new URL(raw, 'http://localhost');
+    req.query = Object.fromEntries(u.searchParams.entries());
+  } catch (error) {
+    req.query = {};
+  }
 }
 
 function useGoogleScript() {
@@ -628,7 +660,6 @@ async function handleFees(chatId, admissionNo) {
   if (s.DueMonths) lines.push(`Due Months: ${s.DueMonths}`);
   if (s.TuitionDue) lines.push(`Tuition Due: Rs ${s.TuitionDue}`);
   if (s.ExamFeeDue) lines.push(`Exam Fee Due: Rs ${s.ExamFeeDue}`);
-  if (s.ComputerFeeDue) lines.push(`Computer Fee Due: Rs ${s.ComputerFeeDue}`);
   if (s.AnnualFeeDue) lines.push(`Annual Fee Due: Rs ${s.AnnualFeeDue}`);
   if (s.PreviousSessionDue) lines.push(`Previous Session Due: Rs ${s.PreviousSessionDue}`);
   if (s.TotalDue) lines.push(`Total Due: Rs ${s.TotalDue}`);
@@ -907,7 +938,7 @@ async function getLinkedStudents() {
     }));
 }
 
-const FEE_SHEET_KEYS = ['DueMonths', 'TuitionDue', 'ExamFeeDue', 'ComputerFeeDue', 'AnnualFeeDue', 'PreviousSessionDue', 'TotalDue'];
+const FEE_SHEET_KEYS = ['DueMonths', 'TuitionDue', 'ExamFeeDue', 'AnnualFeeDue', 'PreviousSessionDue', 'TotalDue'];
 
 async function syncStudentFeesOnSheet(students, dryRun = false) {
   const items = Array.isArray(students) ? students : [];
@@ -967,21 +998,31 @@ async function syncStudentFeesOnSheet(students, dryRun = false) {
 }
 
 async function syncStudentFees(req, res) {
-  const body = req.body || {};
-  const dryRun = body.dryRun === true;
-  const students = Array.isArray(body.students) ? body.students : (body.AdmissionNo ? [body] : []);
-  if (!students.length) {
-    return json(res, 400, { ok: false, error: 'POST body must include students[] or a single AdmissionNo payload.' });
+  try {
+    if (!hasSheetSyncCredentials()) {
+      return json(res, 200, {
+        ok: false,
+        error: 'Google Sheet not configured on this server. In Vercel → Settings → Environment Variables, add GOOGLE_SCRIPT_URL (Apps Script Web App URL ending in /exec — copy the same value from Render).'
+      });
+    }
+    const body = req.body || {};
+    const dryRun = body.dryRun === true;
+    const students = Array.isArray(body.students) ? body.students : (body.AdmissionNo ? [body] : []);
+    if (!students.length) {
+      return json(res, 400, { ok: false, error: 'POST body must include students[] or a single AdmissionNo payload.' });
+    }
+    const result = await syncStudentFeesOnSheet(students, dryRun);
+    const missing = (result.results || []).filter(r => !r.ok).length;
+    return json(res, 200, {
+      ok: true,
+      dryRun,
+      updated: result.updated,
+      missing,
+      results: result.results
+    });
+  } catch (error) {
+    return json(res, 200, { ok: false, error: error.message });
   }
-  const result = await syncStudentFeesOnSheet(students, dryRun);
-  const missing = result.results.filter(r => !r.ok).length;
-  return json(res, 200, {
-    ok: true,
-    dryRun,
-    updated: result.updated,
-    missing,
-    results: result.results
-  });
 }
 
 async function logErpMessage(req, res) {
@@ -1001,7 +1042,6 @@ async function logErpMessage(req, res) {
       payload.DueMonths || '',
       payload.TuitionDue || '',
       payload.ExamFeeDue || '',
-      payload.ComputerFeeDue || '',
       payload.AnnualFeeDue || '',
       payload.PreviousSessionDue || '',
       payload.TotalDue || '',
@@ -1184,12 +1224,14 @@ async function setupSheet(req, res) {
 
 module.exports = async function handler(req, res) {
   try {
+    parseRequestBody(req);
+    ensureRequestQuery(req);
     if (req.method === 'OPTIONS') return empty(res);
 
     const action = String(req.query?.action || '').trim();
 
     // Cloud-native + snapshot compat (Supabase). Never touches @Vipinbellbot.
-    if (erpCloud && ['cloudConfig', 'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments', 'rebuildSnapshot', 'wipeRoster', 'authLogin', 'authLogout', 'authSession', 'authChangePassword', 'authAdminResetPassword', 'authAudit', 'tcIssue', 'tcGet', 'tcList', 'tcVerify', 'tcRevoke'].includes(action)) {
+    if (erpCloud && ['cloudConfig', 'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'photoPatch', 'photoStorageUpload', 'photoImportFromUrls', 'nativeStudents', 'nativeMigrate', 'nativePayments', 'rebuildSnapshot', 'wipeRoster', 'recoverFromTcRegister', 'authLogin', 'authLogout', 'authSession', 'authChangePassword', 'authAdminResetPassword', 'authAudit', 'tcIssue', 'tcGet', 'tcList', 'tcVerify', 'tcRevoke'].includes(action)) {
       if (typeof erpCloud.route === 'function') {
         const handled = await erpCloud.route(req, res, action);
         if (handled !== false) return;
@@ -1201,6 +1243,18 @@ module.exports = async function handler(req, res) {
       if (action === 'setupWebhook') return setupWebhook(req, res);
       if (action === 'setupSheet') return setupSheet(req, res);
       if (action === 'checkScript') return checkGoogleScript(req, res);
+      if (action === 'sheetSyncConfig') {
+        return json(res, 200, {
+          ok: hasSheetSyncCredentials(),
+          mode: useGoogleScript() ? 'google_script' : 'service_account',
+          hasScriptUrl: !!getScriptUrl(),
+          hasServiceAccount: !!(
+            getEnv('GOOGLE_SERVICE_ACCOUNT_EMAIL') &&
+            getEnv('GOOGLE_PRIVATE_KEY') &&
+            getEnv('GOOGLE_SHEET_ID')
+          )
+        });
+      }
       if (action === 'registrations') return json(res, 200, { ok: true, registrations: await getRegistrations() });
       if (action === 'linkedStudents') return json(res, 200, { ok: true, students: await getLinkedStudents() });
       return json(res, 200, { ok: true, service: '@mmmjhschoolbot webhook' });
@@ -1211,7 +1265,7 @@ module.exports = async function handler(req, res) {
     if (action === 'sendDocument') return sendErpTelegramDocument(req, res);
     if (action === 'getChat') return getTelegramChatInfo(req, res);
     if (action === 'logMessage') return logErpMessage(req, res);
-    if (action === 'syncStudentFees') return syncStudentFees(req, res);
+    if (action === 'syncStudentFees') return await syncStudentFees(req, res);
     await handleTelegramUpdate(req.body || {});
     return json(res, 200, { ok: true });
   } catch (error) {
