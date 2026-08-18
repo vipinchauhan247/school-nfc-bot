@@ -1705,6 +1705,12 @@ async function initApp() {
   ensureStaffUserIds();
   repairUnsafeSampleContactData();
   repairDuplicateNfcUidAssignments();
+  try {
+    await loadStudentPhotoCacheFromIdb();
+  } catch (err) {
+    console.warn('Photo cache load skipped:', err);
+  }
+  ensureSchoolDataClasses();
   window.SchoolData = SchoolData;
   window.processIncomingTelegramBotCommand = processIncomingTelegramBotCommand;
   window.repairKnownRealAdmissionConflicts = repairKnownRealAdmissionConflicts;
@@ -2647,6 +2653,82 @@ function normalizeSubjectsPayload(subjects) {
     return Object.values(subjects).filter((s) => s && typeof s === 'object' && (s.code || s.name || s.id));
   }
   return [];
+}
+
+function getDefaultSchoolClasses() {
+  return [
+    { id: 'nursery', name: 'Nursery', sections: ['A'], teacher: 'Unassigned', room: '' },
+    { id: 'lkg', name: 'LKG', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'ukg', name: 'UKG', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-1', name: 'Class 1', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-2', name: 'Class 2', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-3', name: 'Class 3', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-4', name: 'Class 4', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-5', name: 'Class 5', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-6', name: 'Class 6', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-7', name: 'Class 7', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-8', name: 'Class 8', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-9', name: 'Class 9', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-10', name: 'Class 10', sections: ['A', 'B'], teacher: 'Unassigned', room: '' }
+  ];
+}
+
+function normalizeClassesPayload(classes) {
+  if (Array.isArray(classes)) {
+    return classes.filter((c) => c && typeof c === 'object' && (c.name || c.id));
+  }
+  if (classes && typeof classes === 'object') {
+    return Object.values(classes).filter((c) => c && typeof c === 'object' && (c.name || c.id));
+  }
+  return [];
+}
+
+function deriveClassesFromStudentRoster() {
+  const byClass = new Map();
+  (SchoolData.students || []).forEach((student) => {
+    const name = String(student.currentClass || student.class || '').trim();
+    if (!name) return;
+    const section = String(student.currentSection || student.section || 'A').trim() || 'A';
+    if (!byClass.has(name)) byClass.set(name, new Set());
+    byClass.get(name).add(section);
+  });
+  return Array.from(byClass.entries()).map(([name, sectionSet]) => ({
+    id: name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || `class-${name}`,
+    name,
+    sections: Array.from(sectionSet).sort(),
+    teacher: 'Unassigned',
+    room: ''
+  }));
+}
+
+function mergeClassSectionsFromRoster(classList) {
+  const rosterClasses = deriveClassesFromStudentRoster();
+  const byName = new Map(rosterClasses.map((c) => [String(c.name).trim().toLowerCase(), c]));
+  return classList.map((cls) => {
+    const key = String(cls.name || '').trim().toLowerCase();
+    const fromRoster = byName.get(key);
+    if (!fromRoster) return cls;
+    const sections = Array.from(new Set([...(cls.sections || []), ...fromRoster.sections])).sort();
+    return { ...cls, sections: sections.length ? sections : ['A'] };
+  });
+}
+
+/** Cloud sometimes saves classes:[] — restore Nursery–10 without touching students. */
+function ensureSchoolDataClasses() {
+  let list = normalizeClassesPayload(SchoolData.classes);
+  let restored = false;
+  if (!list.length) {
+    const fromRoster = deriveClassesFromStudentRoster();
+    list = fromRoster.length ? fromRoster : getDefaultSchoolClasses().map((c) => ({ ...c }));
+    restored = true;
+  } else {
+    list = mergeClassSectionsFromRoster(list);
+  }
+  SchoolData.classes = list;
+  if (restored && typeof scheduleCloudPush === 'function') {
+    try { scheduleCloudPush(); } catch (e) {}
+  }
+  return list;
 }
 
 function ensureSchoolDataSubjectsArray() {
@@ -8086,6 +8168,8 @@ function viewFinalAnnualReportCard(admissionNo) {
    DATA PERSISTENCE & AUTO-SAVE ENGINE
    ============================================================================ */
 function buildSchoolDataStoragePayload() {
+  ensureSchoolDataSubjectsArray();
+  ensureSchoolDataClasses();
   const activeSession = SchoolData.activeSession || "2026-27";
   (SchoolData.students || []).forEach(student => {
     removeCancelledPaymentsFromStudent(student);
@@ -8120,7 +8204,13 @@ function applySchoolDataStoragePayload(parsed, options) {
   if (!parsed || !Array.isArray(parsed.students)) return false;
   if (parsed.students.length === 0 && !allowEmpty) return false;
   if (parsed.students) SchoolData.students = parsed.students;
-  if (parsed.classes) SchoolData.classes = parsed.classes;
+  if (parsed.classes !== undefined) {
+    const incoming = normalizeClassesPayload(parsed.classes);
+    if (incoming.length) {
+      SchoolData.classes = incoming;
+    }
+  }
+  ensureSchoolDataClasses();
   if (parsed.classFeeMaster) SchoolData.classFeeMaster = parsed.classFeeMaster;
   if (parsed.feeScheduleRules) SchoolData.feeScheduleRules = parsed.feeScheduleRules;
   if (parsed.weightageRules) SchoolData.weightageRules = parsed.weightageRules;
@@ -8187,7 +8277,9 @@ const ERP_IDB_NAME = 'MMM_ERP_DB';
 const ERP_IDB_STORE = 'kv';
 const ERP_IDB_SNAPSHOT_KEY = 'snapshot';
 const ERP_IDB_DISPLAY_KEY = 'cloudDisplay';
+const ERP_IDB_PHOTOS_KEY = 'studentPhotoCache';
 let _storageSaveToastAt = 0;
+window._erpStudentPhotoCache = window._erpStudentPhotoCache || {};
 
 function isHeavyDataUrl(value) {
   return typeof value === 'string' && value.indexOf('data:') === 0 && value.length > 4096;
@@ -8935,7 +9027,9 @@ function isStudentPhotoAssetPath(value) {
 }
 
 function resolveStudentPhotoSrc(student) {
-  const photo = String(student?.photo || student?.photoDataUrl || '').trim();
+  const adm = String(student?.admissionNo || '').replace(/\.0$/, '').trim();
+  const cached = adm && window._erpStudentPhotoCache ? String(window._erpStudentPhotoCache[adm] || '').trim() : '';
+  const photo = String(cached || student?.photo || student?.photoDataUrl || '').trim();
   if (!photo) return '';
   if (photo.startsWith('data:image')) return photo;
   if (/unsplash|placeholder|dicebear|gravatar/i.test(photo)) return '';
@@ -8943,6 +9037,40 @@ function resolveStudentPhotoSrc(student) {
   if (/supabase\.co\/storage\/v1\/object\/public\//i.test(photo)) return photo;
   if (/^https?:\/\//i.test(photo)) return photo;
   return photo;
+}
+
+function loadStudentPhotoCacheFromIdb() {
+  return openErpIndexedDb().then((db) => new Promise((resolve) => {
+    const tx = db.transaction(ERP_IDB_STORE, 'readonly');
+    const req = tx.objectStore(ERP_IDB_STORE).get(ERP_IDB_PHOTOS_KEY);
+    req.onsuccess = () => {
+      const cache = req.result && typeof req.result === 'object' ? req.result : {};
+      window._erpStudentPhotoCache = { ...cache, ...(window._erpStudentPhotoCache || {}) };
+      resolve(window._erpStudentPhotoCache);
+    };
+    req.onerror = () => resolve(window._erpStudentPhotoCache || {});
+  })).catch(() => window._erpStudentPhotoCache || {});
+}
+
+function cacheStudentPhotosLocally(photoRows) {
+  const rows = Array.isArray(photoRows) ? photoRows : [];
+  if (!rows.length) return Promise.resolve(false);
+  rows.forEach((row) => {
+    const adm = String(row.admissionNo || row.student?.admissionNo || '').replace(/\.0$/, '').trim();
+    const dataUrl = String(row.dataUrl || row.photo || '').trim();
+    if (adm && dataUrl.startsWith('data:image')) {
+      window._erpStudentPhotoCache[adm] = dataUrl;
+    }
+  });
+  return openErpIndexedDb().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(ERP_IDB_STORE, 'readwrite');
+    tx.objectStore(ERP_IDB_STORE).put({ ...(window._erpStudentPhotoCache || {}) }, ERP_IDB_PHOTOS_KEY);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error || new Error('photo cache write failed'));
+  })).catch((err) => {
+    console.warn('Photo cache save skipped:', err);
+    return false;
+  });
 }
 
 function getStudentInitials(name) {
@@ -9356,9 +9484,11 @@ async function applyStagedBulkStudentPhotosAsync(queue) {
       }
     }
 
-    if (knownCloudAt && savedAt && savedAt === knownCloudAt) {
+    if (knownCloudAt && savedAt && savedAt === knownCloudAt && !usedStorage && !usedCloudPatch) {
       throw new Error('Cloud timestamp did not change — photos were not saved. Try again or contact admin.');
     }
+
+    await cacheStudentPhotosLocally(queue);
 
     if (usedStorage) {
       document.getElementById('bulkPhotoModal')?.remove();
@@ -9373,8 +9503,8 @@ async function applyStagedBulkStudentPhotosAsync(queue) {
       await downloadStudentPhotosAssetZip(queue);
       document.getElementById('bulkPhotoModal')?.remove();
       showNotification(
-        `Saved ${queue.length} photo link(s) to cloud. ZIP downloaded — copy the students folder to assets/students/ on your PC and upload to Vercel.`,
-        'success'
+        `Photos saved on this PC and will show here after refresh. Cloud has file links only — upload the downloaded ZIP folder to assets/students/ on Vercel for all PCs, OR deploy api/erp-cloud.js for automatic Supabase Storage.`,
+        'warning'
       );
     }
 
@@ -11320,17 +11450,21 @@ function openClassStudentsModal(className, targetSection = null) {
 }
 
 function renderClassesPage(container) {
+  const classes = ensureSchoolDataClasses();
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-chalkboard-user" style="color:var(--accent-primary)"></i> Classes & Sections Directory (Nursery to 10th)</h2>
         <p class="page-subtitle">Create New Classes, Edit Class Names & Assign Class Teachers</p>
       </div>
-      <button class="btn btn-primary" onclick="openCreateClassModal()"><i class="fa-solid fa-plus"></i> Add New Class</button>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="ensureSchoolDataClasses(); saveSchoolDataToStorage(); renderClassesPage(document.getElementById('contentBody')); showNotification('Classes list restored from student roster / defaults.', 'success');"><i class="fa-solid fa-rotate-left"></i> Restore Classes</button>
+        <button class="btn btn-primary" onclick="openCreateClassModal()"><i class="fa-solid fa-plus"></i> Add New Class</button>
+      </div>
     </div>
 
     <div class="grid-3">
-      ${SchoolData.classes.map(c => {
+      ${classes.map(c => {
         const studentCount = getStudentsByActiveSession().filter(s => {
           const detail = s.sessionDetails?.[SchoolData.activeSession];
           return (detail && detail.class === c.name) || (!detail && (s.currentClass || s.class) === c.name);

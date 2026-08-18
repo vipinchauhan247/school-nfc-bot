@@ -326,6 +326,14 @@
     return photo.length > 120;
   }
 
+  function normalizeClassesList(classes) {
+    if (Array.isArray(classes)) return classes.filter((c) => c && typeof c === 'object' && (c.name || c.id));
+    if (classes && typeof classes === 'object') {
+      return Object.values(classes).filter((c) => c && typeof c === 'object' && (c.name || c.id));
+    }
+    return [];
+  }
+
   function preferStudentPhoto(localValue, remoteValue) {
     const localPhoto = String(localValue || '').trim();
     const remotePhoto = String(remoteValue || '').trim();
@@ -335,6 +343,20 @@
     if (remoteReal && !localReal) return remotePhoto;
     if (localReal && remoteReal) return localPhoto.length >= remotePhoto.length ? localPhoto : remotePhoto;
     return localPhoto || remotePhoto;
+  }
+
+  function mergeCloudOnlyStudents(localStudents, remoteStudents) {
+    const localByAdm = new Map((localStudents || []).map((s) => [admissionKey(s), s]));
+    return (remoteStudents || []).map((remoteStudent) => {
+      const key = admissionKey(remoteStudent);
+      const localStudent = localByAdm.get(key);
+      if (!localStudent) return remoteStudent;
+      const photo = preferStudentPhoto(
+        localStudent.photo || localStudent.photoDataUrl,
+        remoteStudent.photo || remoteStudent.photoDataUrl
+      );
+      return { ...remoteStudent, photo, photoDataUrl: photo };
+    });
   }
 
   function mergeStudent(localStudent, remoteStudent) {
@@ -440,7 +462,11 @@
       savedAt: new Date().toISOString(),
       students,
       cancelledReceipts,
-      classes: (newerMeta.classes && newerMeta.classes.length) ? newerMeta.classes : (olderMeta.classes || []),
+      classes: (() => {
+        const remoteClasses = normalizeClassesList(cloudPayload.classes);
+        const localClasses = normalizeClassesList(localPayload.classes);
+        return remoteClasses.length ? remoteClasses : localClasses;
+      })(),
       staffUsers,
       schoolProfile: newerMeta.schoolProfile || olderMeta.schoolProfile,
       signatures: newerMeta.signatures || olderMeta.signatures,
@@ -715,8 +741,12 @@
       if (cloudOnly && memoryDirty) {
         merged = mergeSchoolPayloads(localPayload, cloudPayload, { localStudentsAuthoritative: true });
       } else if (cloudOnly) {
+        const remoteClasses = normalizeClassesList(cloudPayload.classes);
+        const localClasses = normalizeClassesList(localPayload.classes);
         merged = {
           ...cloudPayload,
+          students: mergeCloudOnlyStudents(localPayload.students, cloudPayload.students),
+          classes: remoteClasses.length ? remoteClasses : localClasses,
           cancelledReceipts: mergeCancelledReceipts(localPayload.cancelledReceipts, cloudPayload.cancelledReceipts),
           savedAt: cloudPayload.savedAt || snapshot.saved_at || new Date().toISOString()
         };
@@ -765,6 +795,12 @@
       if (!applied) throw new Error('Cloud snapshot could not be applied.');
       if (typeof repairCrossDeviceStudentIdentityDrift === 'function') {
         repairCrossDeviceStudentIdentityDrift();
+      }
+      if (typeof ensureSchoolDataClasses === 'function') {
+        ensureSchoolDataClasses();
+      }
+      if (typeof loadStudentPhotoCacheFromIdb === 'function') {
+        try { await loadStudentPhotoCacheFromIdb(); } catch (e) {}
       }
 
       const cloudStamp = snapshot.saved_at || cloudPayload.savedAt || new Date().toISOString();
