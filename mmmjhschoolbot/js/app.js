@@ -306,6 +306,78 @@ function formatReportCardAttendanceLine(summary) {
   return `Attendance: ${summary.daysPresent} / ${summary.workingDays} working days${lateNote} — ${summary.percentage}%`;
 }
 
+function getStudentAttendanceSummaryForDateRange(student, fromKey, toKey, session = SchoolData.activeSession) {
+  const logs = student?.attendanceLogs || {};
+  let daysPresent = 0;
+  let daysAbsent = 0;
+  let daysLate = 0;
+  Object.entries(logs).forEach(([dateKey, log]) => {
+    if (!isDateInSession(dateKey, session)) return;
+    if (!dateKeyInReportsRange(dateKey, fromKey, toKey)) return;
+    const status = String(log?.status || '').trim().toLowerCase();
+    if (status === 'present') daysPresent += 1;
+    else if (status === 'late') { daysPresent += 1; daysLate += 1; }
+    else if (status === 'absent') daysAbsent += 1;
+  });
+  const workingDays = daysPresent + daysAbsent;
+  const percentage = workingDays ? Math.round((daysPresent / workingDays) * 100) : null;
+  return { daysPresent, daysAbsent, daysLate, workingDays, percentage, session, fromKey, toKey };
+}
+
+function dateKeyInReportsRange(dateKey, fromKey, toKey) {
+  const d = String(dateKey || '').slice(0, 10);
+  if (!d) return false;
+  if (fromKey && d < fromKey) return false;
+  if (toKey && d > toKey) return false;
+  return true;
+}
+
+window.reportCardPrintOrientation = window.reportCardPrintOrientation || 'portrait';
+
+function getReportCardPrintFooterHtml(buttonLabel, buttonStyle) {
+  const orient = window.reportCardPrintOrientation || 'portrait';
+  return `
+    <div style="display:flex; justify-content:space-between; align-items:center; padding:14px 24px; background:#f8fafc; border-top:1px solid #e2e8f0; flex-wrap:wrap; gap:12px;" class="no-print">
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="document.getElementById('reportPreviewModal').remove()" style="padding:10px 18px; font-weight:800; background:#475569; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-xmark"></i> Close Preview</button>
+        <button class="btn btn-secondary" onclick="openUploadSignaturesModal()" style="padding:10px 18px; font-weight:800; background:#0284c7; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-signature"></i> Upload Signatures / Stamp</button>
+      </div>
+      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+        <label style="font-weight:700; font-size:0.85rem; color:#334155;">Print layout:</label>
+        <select id="reportCardOrientationSelect" class="session-dropdown" style="width:170px; font-weight:700;" onchange="window.reportCardPrintOrientation=this.value">
+          <option value="portrait" ${orient === 'portrait' ? 'selected' : ''}>A4 Portrait</option>
+          <option value="landscape" ${orient === 'landscape' ? 'selected' : ''}>A4 Landscape</option>
+        </select>
+        <button class="btn btn-primary" onclick="printReportCard('printableSingleSheetArea')" style="padding:10px 24px; font-weight:800; ${buttonStyle} border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-print"></i> ${buttonLabel}</button>
+      </div>
+    </div>`;
+}
+
+function getReportCardPrintWindowCss(orientation) {
+  const isLandscape = orientation === 'landscape';
+  return `
+    @page { size: A4 ${isLandscape ? 'landscape' : 'portrait'}; margin: ${isLandscape ? '5mm 6mm' : '6mm 8mm'}; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Inter', sans-serif;
+      margin: 0;
+      padding: 0;
+      background: #ffffff !important;
+      color: #0f172a !important;
+      -webkit-print-color-adjust: exact !important;
+      print-color-adjust: exact !important;
+    }
+    img { max-width: 100%; }
+    .no-print { display: none !important; }
+    ${isLandscape ? `
+      #printableSingleSheetArea { font-size: 0.88rem; }
+      #printableSingleSheetArea table { font-size: 0.82rem; }
+      #printableSingleSheetArea .rc-student-info-panel > div:first-child { flex: 1 1 55%; }
+      #printableSingleSheetArea .rc-student-info-panel > div:last-child { flex: 1 1 40%; }
+    ` : ''}
+  `;
+}
+
 function getStudentPen(student) {
   return String(student?.pen || student?.PEN || '').trim() || '—';
 }
@@ -325,7 +397,7 @@ function getReportCardStudentInfoHtml(student, meta = {}) {
   const shortAddress = address.length > 72 ? `${address.slice(0, 69)}…` : address;
 
   return `
-    <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:12px 16px; margin-bottom:14px; display:flex; align-items:flex-start; justify-content:space-between; flex-wrap:wrap; gap:12px; font-size:0.92rem; line-height:1.55;">
+    <div class="rc-student-info-panel" style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:12px 16px; margin-bottom:14px; display:flex; align-items:flex-start; justify-content:space-between; flex-wrap:wrap; gap:12px; font-size:0.92rem; line-height:1.55;">
       <div style="display:flex; align-items:center; gap:12px; min-width:240px; flex:1;">
         ${getStudentDirectoryPhotoHtml(student, photoSize)}
         <div>
@@ -7480,7 +7552,11 @@ function printReportCard(containerId) {
     return;
   }
 
-  const printWindow = window.open('', '_blank', 'width=900,height=1200');
+  const orientationSelect = document.getElementById('reportCardOrientationSelect');
+  const orientation = orientationSelect?.value || window.reportCardPrintOrientation || 'portrait';
+  window.reportCardPrintOrientation = orientation;
+
+  const printWindow = window.open('', '_blank', orientation === 'landscape' ? 'width=1200,height=900' : 'width=900,height=1200');
   if (!printWindow) {
     window.print();
     return;
@@ -7493,27 +7569,10 @@ function printReportCard(containerId) {
         <title>Official Report Card - Madan Mohan Malviya School</title>
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Playfair+Display:wght@700&family=Caveat:wght@700&display=swap" rel="stylesheet">
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-        <style>
-          @page {
-            size: A4 portrait;
-            margin: 6mm 8mm;
-          }
-          * { box-sizing: border-box; }
-          body {
-            font-family: 'Inter', sans-serif;
-            margin: 0;
-            padding: 0;
-            background: #ffffff !important;
-            color: #0f172a !important;
-            -webkit-print-color-adjust: exact !important;
-            print-color-adjust: exact !important;
-          }
-          img { max-width: 100%; }
-          .no-print { display: none !important; }
-        </style>
+        <style>${getReportCardPrintWindowCss(orientation)}</style>
       </head>
       <body>
-        <div style="padding: 10px;">
+        <div style="padding: ${orientation === 'landscape' ? '6px' : '10px'};">
           ${printArea.innerHTML}
         </div>
         <script>
@@ -7849,14 +7908,7 @@ function viewCombinedConsolidatedReportCard(admissionNo) {
           </div>
         </div>
 
-        <!-- ACTION FOOTER BAR -->
-        <div style="display:flex; justify-content:space-between; align-items:center; padding:14px 24px; background:#f8fafc; border-top:1px solid #e2e8f0;" class="no-print">
-          <div style="display:flex; gap:10px;">
-            <button class="btn btn-secondary" onclick="document.getElementById('reportPreviewModal').remove()" style="padding:10px 18px; font-weight:800; background:#475569; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-xmark"></i> Close Preview</button>
-            <button class="btn btn-secondary" onclick="openUploadSignaturesModal()" style="padding:10px 18px; font-weight:800; background:#0284c7; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-signature"></i> Upload Signatures / Stamp</button>
-          </div>
-          <button class="btn btn-primary" onclick="printReportCard('printableSingleSheetArea')" style="padding:10px 24px; font-weight:800; background:linear-gradient(135deg, #6366f1 0%, #4f46e5 100%); color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-print"></i> Print 1-Page A4 Report Card</button>
-        </div>
+        ${getReportCardPrintFooterHtml('Print Report Card', 'background:linear-gradient(135deg, #6366f1 0%, #4f46e5 100%); color:#ffffff;')}
 
       </div>
     </div>
@@ -8065,14 +8117,7 @@ function viewHalfYearlyReportCard(admissionNo) {
           </div>
         </div>
 
-        <!-- ACTION FOOTER BAR -->
-        <div style="display:flex; justify-content:space-between; align-items:center; padding:14px 24px; background:#f8fafc; border-top:1px solid #e2e8f0;" class="no-print">
-          <div style="display:flex; gap:10px;">
-            <button class="btn btn-secondary" onclick="document.getElementById('reportPreviewModal').remove()" style="padding:10px 18px; font-weight:800; background:#475569; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-xmark"></i> Close Preview</button>
-            <button class="btn btn-secondary" onclick="openUploadSignaturesModal()" style="padding:10px 18px; font-weight:800; background:#0284c7; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-signature"></i> Upload Signatures / Stamp</button>
-          </div>
-          <button class="btn btn-primary" onclick="printReportCard('printableSingleSheetArea')" style="padding:10px 24px; font-weight:800; background:linear-gradient(135deg, #6366f1 0%, #4f46e5 100%); color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-print"></i> Print 1-Page A4 Report Card</button>
-        </div>
+        ${getReportCardPrintFooterHtml('Print Report Card', 'background:linear-gradient(135deg, #6366f1 0%, #4f46e5 100%); color:#ffffff;')}
 
       </div>
     </div>
@@ -8301,14 +8346,7 @@ function viewFinalAnnualReportCard(admissionNo) {
           </div>
         </div>
 
-        <!-- ACTION FOOTER BAR -->
-        <div style="display:flex; justify-content:space-between; align-items:center; padding:14px 24px; background:#f8fafc; border-top:1px solid #e2e8f0;" class="no-print">
-          <div style="display:flex; gap:10px;">
-            <button class="btn btn-secondary" onclick="document.getElementById('reportPreviewModal').remove()" style="padding:10px 18px; font-weight:800; background:#475569; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-xmark"></i> Close Preview</button>
-            <button class="btn btn-secondary" onclick="openUploadSignaturesModal()" style="padding:10px 18px; font-weight:800; background:#0284c7; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-signature"></i> Upload Signatures / Stamp</button>
-          </div>
-          <button class="btn btn-primary" onclick="printReportCard('printableSingleSheetArea')" style="padding:10px 24px; font-weight:800; background:linear-gradient(135deg, #10b981 0%, #059669 100%); color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-print"></i> Print Passing Report Card</button>
-        </div>
+        ${getReportCardPrintFooterHtml('Print Passing Report Card', 'background:linear-gradient(135deg, #10b981 0%, #059669 100%); color:#ffffff;')}
 
       </div>
     </div>
@@ -11280,6 +11318,18 @@ function saveNewAdmission() {
 
 window.activeAttendanceFilterClass = window.activeAttendanceFilterClass || 'ALL';
 window.activeAttendanceSearchQuery = window.activeAttendanceSearchQuery || '';
+window.activeAttendanceDate = window.activeAttendanceDate || toLocalDateKey();
+
+function getActiveAttendanceDateKey() {
+  const input = document.getElementById('attendanceDatePicker');
+  if (input && input.value) return toLocalDateKey(input.value);
+  return window.activeAttendanceDate || toLocalDateKey();
+}
+
+function changeAttendanceRegisterDate(value) {
+  window.activeAttendanceDate = toLocalDateKey(value);
+  renderAttendancePage(document.getElementById('contentBody'));
+}
 
 function filterAttendancePageByClass(cls) {
   window.activeAttendanceFilterClass = cls;
@@ -11326,11 +11376,13 @@ function renderAttendancePage(container) {
   }, 15000);
   const allStudents = getStudentsByActiveSession();
   const currentSession = SchoolData.activeSession;
-  const todayStr = toLocalDateKey();
+  const registerDate = getActiveAttendanceDateKey();
+  const isToday = registerDate === toLocalDateKey();
   const selectedClass = window.activeAttendanceFilterClass || 'ALL';
   const searchQuery = (window.activeAttendanceSearchQuery || '').toLowerCase().trim();
 
-  const classOptions = ["ALL", "Nursery", "LKG", "UKG", "Class 1", "Class 2", "Class 3", "Class 4", "Class 5", "Class 6", "Class 7", "Class 8", "Class 9", "Class 10"];
+  const classOptions = getSchoolClassNames();
+  if (!classOptions.includes('ALL')) classOptions.unshift('ALL');
 
   let students = selectedClass === 'ALL' 
     ? allStudents 
@@ -11349,9 +11401,11 @@ function renderAttendancePage(container) {
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-clipboard-user" style="color:var(--accent-primary)"></i> Daily Attendance Register</h2>
-        <p class="page-subtitle">Manual Roll-Call & Live Hardware NFC Card Tap Logs (${currentSession})</p>
+        <p class="page-subtitle">Manual roll-call, NFC tap logs, and sheet sync (${currentSession})</p>
       </div>
-      <div style="display:flex; gap:10px;">
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="syncAttendanceFromGoogleSheets()" style="background:#0284c7; color:#fff; border:none; font-weight:700;"><i class="fa-solid fa-cloud-arrow-down"></i> Sync from NFC Sheet</button>
+        <button class="btn btn-secondary" onclick="window.location.hash='reports'"><i class="fa-solid fa-chart-column"></i> Fee &amp; Attendance Reports</button>
         <button class="btn btn-nfc-tap" onclick="openNfcModal()"><i class="fa-solid fa-wifi"></i> Launch Gate NFC Scanner</button>
       </div>
     </div>
@@ -11360,10 +11414,15 @@ function renderAttendancePage(container) {
       <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px;">
         <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; flex:1;">
           <div style="display:flex; align-items:center; gap:8px;">
+            <label style="font-size:0.88rem; font-weight:700; color:#fbbf24;">Register Date:</label>
+            <input type="date" id="attendanceDatePicker" class="session-dropdown" style="width:170px; font-weight:800;" value="${registerDate}" onchange="changeAttendanceRegisterDate(this.value)">
+            ${!isToday ? `<button class="btn btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="changeAttendanceRegisterDate('${toLocalDateKey()}')">Today</button>` : ''}
+          </div>
+          <div style="display:flex; align-items:center; gap:8px;">
             <label style="font-size:0.88rem; font-weight:700; color:#38bdf8;">Class & Section:</label>
             <select class="session-dropdown" style="width:200px; font-weight:800;" onchange="filterAttendancePageByClass(this.value)">
               ${classOptions.map(c => `
-                <option value="${c}" ${c === selectedClass ? 'selected' : ''}>${c === 'ALL' ? 'All Classes' : `School ${c}`}</option>
+                <option value="${c}" ${c === selectedClass ? 'selected' : ''}>${c === 'ALL' ? 'All Classes' : c}</option>
               `).join('')}
             </select>
           </div>
@@ -11377,7 +11436,7 @@ function renderAttendancePage(container) {
         </div>
         <div style="display:flex; gap:10px;">
           <button class="btn btn-primary" onclick="markAllPresent()"><i class="fa-solid fa-check-double"></i> Mark All Present</button>
-          <button class="btn btn-secondary" onclick="showNotification('Done: Attendance Logs Saved to School Database!', 'success')"><i class="fa-solid fa-floppy-disk"></i> Save Register</button>
+          <button class="btn btn-secondary" onclick="saveSchoolDataToStorage(); showNotification('Attendance register saved.', 'success');"><i class="fa-solid fa-floppy-disk"></i> Save Register</button>
         </div>
       </div>
     </div>
@@ -11392,7 +11451,7 @@ function renderAttendancePage(container) {
               <th>Admission No</th>
               <th>Class & Sec</th>
               <th>NFC Hardware UID</th>
-              <th>Today Status</th>
+              <th>Status (${registerDate})</th>
               <th>IN Time (Arrival)</th>
               <th>OUT Time (Departure)</th>
               <th>Mark Attendance</th>
@@ -11402,8 +11461,8 @@ function renderAttendancePage(container) {
             ${students.length === 0 ? `
               <tr><td colspan="9" style="text-align:center; padding:30px; color:#cbd5e1; font-weight:700;">No matching student records found.</td></tr>
             ` : students.map((s, idx) => {
-              const hasLog = s.attendanceLogs && s.attendanceLogs[todayStr];
-              const log = hasLog ? s.attendanceLogs[todayStr] : null;
+              const hasLog = s.attendanceLogs && s.attendanceLogs[registerDate];
+              const log = hasLog ? s.attendanceLogs[registerDate] : null;
 
               const statusStr = log ? log.status : 'Not Marked';
               const inTimeDisplay = (log && log.inTime) ? log.inTime : ((log && log.time) ? log.time : '--:--');
@@ -11502,13 +11561,13 @@ async function syncAttendanceFromGoogleSheets() {
 
 async function setAtt(admNo, status) {
   const student = SchoolData.students.find(s => s.admissionNo === admNo);
-  const todayStr = toLocalDateKey();
+  const dateStr = getActiveAttendanceDateKey();
   const timeStr = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
 
   if (student) {
     if (!student.attendanceLogs) student.attendanceLogs = {};
-    const existingLog = student.attendanceLogs[todayStr] || {};
-    student.attendanceLogs[todayStr] = {
+    const existingLog = student.attendanceLogs[dateStr] || {};
+    student.attendanceLogs[dateStr] = {
       ...existingLog,
       status: status,
       time: status === 'Absent' ? (existingLog.time || '') : timeStr,
@@ -11553,12 +11612,17 @@ async function setAtt(admNo, status) {
 }
 
 function markAllPresent() {
-  const todayStr = toLocalDateKey();
+  const dateStr = getActiveAttendanceDateKey();
   const timeStr = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
-  getStudentsByActiveSession().forEach(student => {
+  const selectedClass = window.activeAttendanceFilterClass || 'ALL';
+  let students = getStudentsByActiveSession();
+  if (selectedClass !== 'ALL') {
+    students = students.filter(s => (s.currentClass || s.class) === selectedClass);
+  }
+  students.forEach(student => {
     if (!student.attendanceLogs) student.attendanceLogs = {};
-    const existingLog = student.attendanceLogs[todayStr] || {};
-    student.attendanceLogs[todayStr] = {
+    const existingLog = student.attendanceLogs[dateStr] || {};
+    student.attendanceLogs[dateStr] = {
       ...existingLog,
       status: 'Present',
       inTime: existingLog.inTime && existingLog.inTime !== '--:--' ? existingLog.inTime : timeStr,
@@ -11569,7 +11633,7 @@ function markAllPresent() {
     };
   });
   saveSchoolDataToStorage();
-  showNotification('All visible students marked Present for today.', 'success');
+  showNotification(`All visible students marked Present for ${dateStr}.`, 'success');
   if (document.getElementById('contentBody')) renderAttendancePage(document.getElementById('contentBody'));
 }
 
@@ -13500,7 +13564,7 @@ function openTeacherPeriodMatrixModal(tchId) {
   if (!tch) return;
 
   const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-  const periods = SchoolData.periodSettings.filter(p => !p.isBreak);
+  const periods = ensureSchoolDataPeriodSettings().filter(p => !p.isBreak);
   const classNames = getSchoolClassNames();
 
   const modalHtml = `
@@ -13762,7 +13826,10 @@ function exportFeeBifurcationReport(sourceRows, fileLabel) {
 
 function exportAllStudentsFeeReport() {
   const currentSession = SchoolData.activeSession;
-  const rows = getStudentsByActiveSession().map(s => {
+  const students = typeof getStudentsForReportsFilter === 'function' && document.getElementById('reportsClassFilter')
+    ? getStudentsForReportsFilter()
+    : getStudentsByActiveSession();
+  const rows = students.map(s => {
     const fee = s.currentFeeInfo || {};
     const status = getStudentFeeCategoryStatus(s);
     const payments = s.feeRecords?.[currentSession]?.payments || [];
@@ -13776,7 +13843,10 @@ function exportAllStudentsFeeReport() {
       dueAmount: status.totalDue
     };
   });
-  exportFeeBifurcationReport(rows, 'All_Students');
+  const label = document.getElementById('reportsClassFilter')?.value && document.getElementById('reportsClassFilter').value !== 'ALL'
+    ? document.getElementById('reportsClassFilter').value.replace(/\s+/g, '_')
+    : 'All_Students';
+  exportFeeBifurcationReport(rows, label);
 }
 
 function getPaymentPaidBreakdown(payment) {
@@ -20547,35 +20617,223 @@ function toggleSessionStatus(sessId) {
   saveSchoolDataToStorage();
 }
 
+function getReportsFilterValues() {
+  const className = document.getElementById('reportsClassFilter')?.value || window.reportsFilterClass || 'ALL';
+  const fromVal = document.getElementById('reportsFromDate')?.value || window.reportsFilterFrom || '';
+  const toVal = document.getElementById('reportsToDate')?.value || window.reportsFilterTo || '';
+  window.reportsFilterClass = className;
+  window.reportsFilterFrom = fromVal;
+  window.reportsFilterTo = toVal;
+  const fromDate = fromVal ? parseReceiptDateValue(fromVal) : null;
+  const toDate = toVal ? parseReceiptDateValue(toVal) : null;
+  if (fromDate) fromDate.setHours(0, 0, 0, 0);
+  if (toDate) toDate.setHours(23, 59, 59, 999);
+  return {
+    className,
+    fromKey: fromVal ? toLocalDateKey(fromVal) : '',
+    toKey: toVal ? toLocalDateKey(toVal) : '',
+    fromDate,
+    toDate
+  };
+}
+
+function getStudentsForReportsFilter() {
+  const { className } = getReportsFilterValues();
+  let students = getStudentsByActiveSession();
+  if (className && className !== 'ALL') {
+    students = students.filter(s => (s.currentClass || s.class) === className);
+  }
+  return students;
+}
+
+function buildReportsFilterLabel() {
+  const { className, fromKey, toKey } = getReportsFilterValues();
+  const parts = [`Session ${SchoolData.activeSession}`];
+  if (className && className !== 'ALL') parts.push(className);
+  if (fromKey || toKey) parts.push(`${fromKey || 'start'} to ${toKey || 'today'}`);
+  return parts.join(' | ');
+}
+
+function exportAttendanceRangeReport() {
+  const { fromKey, toKey } = getReportsFilterValues();
+  const students = getStudentsForReportsFilter();
+  const headers = ['Admission No', 'PEN', 'Student Name', 'Class', 'Section', 'Present Days', 'Absent Days', 'Late Days', 'Working Days', 'Attendance %', 'From Date', 'To Date'];
+  const lines = [headers.join(',')];
+  students.forEach((s) => {
+    const summary = getStudentAttendanceSummaryForDateRange(s, fromKey, toKey);
+    lines.push([
+      csvEscape(s.admissionNo),
+      csvEscape(getStudentPen(s)),
+      csvEscape(s.name),
+      csvEscape(s.currentClass || s.class || ''),
+      csvEscape(s.currentSection || s.section || ''),
+      summary.daysPresent,
+      summary.daysAbsent,
+      summary.daysLate,
+      summary.workingDays,
+      summary.percentage != null ? summary.percentage : '',
+      csvEscape(fromKey || 'all'),
+      csvEscape(toKey || 'all')
+    ].join(','));
+  });
+  downloadReportsCsvFile(`Attendance_Report_${buildReportsFilterLabel().replace(/[^a-z0-9]+/gi, '_')}.csv`, lines.join('\n'));
+  showNotification(`Exported attendance report for ${students.length} student(s).`, 'success');
+}
+
+function exportFeePaymentsRangeReport() {
+  const { fromKey, toKey, fromDate, toDate } = getReportsFilterValues();
+  const students = getStudentsForReportsFilter();
+  const session = SchoolData.activeSession;
+  const headers = ['Admission No', 'PEN', 'Student Name', 'Class', 'Section', 'Receipt No', 'Date', 'Amount', 'Tuition', 'Annual', 'Exam', 'Mode', 'Current Due'];
+  const lines = [headers.join(',')];
+  let count = 0;
+  students.forEach((s) => {
+    const status = getStudentFeeCategoryStatus(s);
+    const payments = (s.feeRecords?.[session]?.payments || []).filter((p) => {
+      if (!fromDate && !toDate) return true;
+      const d = parseReceiptDateValue(p.date);
+      if (!d) return false;
+      if (fromDate && d < fromDate) return false;
+      if (toDate && d > toDate) return false;
+      return true;
+    });
+    if (!payments.length) {
+      lines.push([
+        csvEscape(s.admissionNo), csvEscape(getStudentPen(s)), csvEscape(s.name),
+        csvEscape(s.currentClass || ''), csvEscape(s.currentSection || ''),
+        '', '', 0, 0, 0, 0, '', status.totalDue || 0
+      ].join(','));
+      return;
+    }
+    payments.forEach((p) => {
+      const br = getPaymentPaidBreakdown(p);
+      count += 1;
+      lines.push([
+        csvEscape(s.admissionNo), csvEscape(getStudentPen(s)), csvEscape(s.name),
+        csvEscape(s.currentClass || ''), csvEscape(s.currentSection || ''),
+        csvEscape(p.receiptNo || ''), csvEscape(p.date || ''), p.amount || 0,
+        br.tuitionPaid, br.annualPaid, br.examPaid, csvEscape(p.mode || p.paymentMode || 'Cash'),
+        status.totalDue || 0
+      ].join(','));
+    });
+  });
+  downloadReportsCsvFile(`Fee_Payments_Report_${buildReportsFilterLabel().replace(/[^a-z0-9]+/gi, '_')}.csv`, lines.join('\n'));
+  showNotification(`Exported ${count} fee receipt row(s).`, 'success');
+}
+
+function exportCombinedFeeAttendanceReport() {
+  const { fromKey, toKey, fromDate, toDate } = getReportsFilterValues();
+  const students = getStudentsForReportsFilter();
+  const session = SchoolData.activeSession;
+  const headers = ['Admission No', 'PEN', 'Student Name', 'Class', 'Section', 'Present Days', 'Absent Days', 'Attendance %', 'Fee Collected (Range)', 'Current Due', 'Overdue Months'];
+  const lines = [headers.join(',')];
+  students.forEach((s) => {
+    const att = getStudentAttendanceSummaryForDateRange(s, fromKey, toKey);
+    const status = getStudentFeeCategoryStatus(s);
+    const collected = (s.feeRecords?.[session]?.payments || []).reduce((sum, p) => {
+      if (fromDate || toDate) {
+        const d = parseReceiptDateValue(p.date);
+        if (!d) return sum;
+        if (fromDate && d < fromDate) return sum;
+        if (toDate && d > toDate) return sum;
+      }
+      return sum + Number(p.amount || 0);
+    }, 0);
+    lines.push([
+      csvEscape(s.admissionNo), csvEscape(getStudentPen(s)), csvEscape(s.name),
+      csvEscape(s.currentClass || ''), csvEscape(s.currentSection || ''),
+      att.daysPresent, att.daysAbsent, att.percentage != null ? att.percentage : '',
+      collected, status.totalDue || 0, csvEscape((status.overdueMonths || []).join('; '))
+    ].join(','));
+  });
+  downloadReportsCsvFile(`Combined_Fee_Attendance_${buildReportsFilterLabel().replace(/[^a-z0-9]+/gi, '_')}.csv`, lines.join('\n'));
+  showNotification(`Exported combined report for ${students.length} student(s).`, 'success');
+}
+
+function downloadReportsCsvFile(filename, content) {
+  const blob = new Blob(['\ufeff' + content], { type: 'text/csv;charset=utf-8;' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
 function renderReportsPage(container) {
   const canDuesReport = canUserViewSchoolTotalDues();
   const canRevenueReport = canUserViewSchoolTotalRevenue();
+  const classOptions = getSchoolClassNames();
+  const selectedClass = window.reportsFilterClass || 'ALL';
+  const fromDate = window.reportsFilterFrom || '';
+  const toDate = window.reportsFilterTo || '';
+  const classSelectOptions = ['ALL', ...classOptions.filter(c => c !== 'ALL')];
+
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-chart-column" style="color:var(--accent-warning)"></i> Reports & Analytics</h2>
-        <p class="page-subtitle">Generate Admission, Fee & Attendance Reports for ${SchoolData.activeSession}</p>
+        <p class="page-subtitle">Class-wise and custom date-range reports for fees and attendance — Session ${SchoolData.activeSession}</p>
+      </div>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="syncAttendanceFromGoogleSheets()"><i class="fa-solid fa-cloud-arrow-down"></i> Sync Attendance from NFC Sheet</button>
+        <button class="btn btn-secondary" onclick="window.location.hash='attendance'"><i class="fa-solid fa-clipboard-user"></i> Open Attendance Register</button>
       </div>
     </div>
+
+    <div class="glass-card" style="margin-bottom:20px; border:1px solid #334155;">
+      <h3 style="margin:0 0 14px 0;"><i class="fa-solid fa-filter"></i> Report Filters</h3>
+      <div style="display:flex; flex-wrap:wrap; gap:14px; align-items:flex-end;">
+        <div>
+          <label style="font-size:0.78rem; font-weight:700; color:#94a3b8; display:block; margin-bottom:4px;">Class</label>
+          <select id="reportsClassFilter" class="session-dropdown" style="width:190px; font-weight:700;">
+            ${classSelectOptions.map(c => `<option value="${c}" ${c === selectedClass ? 'selected' : ''}>${c === 'ALL' ? 'All Classes' : c}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label style="font-size:0.78rem; font-weight:700; color:#94a3b8; display:block; margin-bottom:4px;">From Date</label>
+          <input type="date" id="reportsFromDate" class="session-dropdown" style="width:170px; font-weight:700;" value="${fromDate}">
+        </div>
+        <div>
+          <label style="font-size:0.78rem; font-weight:700; color:#94a3b8; display:block; margin-bottom:4px;">To Date</label>
+          <input type="date" id="reportsToDate" class="session-dropdown" style="width:170px; font-weight:700;" value="${toDate}">
+        </div>
+        <button class="btn btn-secondary" onclick="window.reportsFilterFrom=''; window.reportsFilterTo=''; renderReportsPage(document.getElementById('contentBody'));">Clear Dates</button>
+      </div>
+      <p style="margin:12px 0 0 0; font-size:0.78rem; color:#94a3b8;">Leave dates empty for full-session attendance totals. Fee payment export uses receipt dates in the selected range.</p>
+    </div>
+
     <div class="grid-2">
       <div class="glass-card">
-        <h3><i class="fa-solid fa-download"></i> Fee Dues Report (Bifurcated)</h3>
-        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Download CSV with tuition, annual, and exam fee paid/due columns plus a TOTAL row for every student in the active session.</p>
+        <h3><i class="fa-solid fa-clipboard-check"></i> Attendance Report</h3>
+        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Present / absent / late totals per student for the selected class and date range.</p>
+        <button class="btn btn-primary" onclick="exportAttendanceRangeReport()"><i class="fa-solid fa-file-csv"></i> Export Attendance CSV</button>
+      </div>
+      <div class="glass-card">
+        <h3><i class="fa-solid fa-download"></i> Fee Dues Snapshot</h3>
+        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Current-session dues with tuition, annual, and exam bifurcation for every student in the filter.</p>
         ${canDuesReport
           ? `<button class="btn btn-primary" onclick="exportAllStudentsFeeReport()"><i class="fa-solid fa-file-csv"></i> Export Fee Dues Report</button>`
           : `<button class="btn btn-secondary" disabled style="opacity:0.55;">Hidden — need View Total Dues right</button>`}
       </div>
       <div class="glass-card">
-        <h3><i class="fa-solid fa-receipt"></i> Fee Receipts Register</h3>
+        <h3><i class="fa-solid fa-receipt"></i> Fee Payments (Date Range)</h3>
+        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Receipt-by-receipt export filtered by From/To dates and class.</p>
+        ${canRevenueReport
+          ? `<button class="btn btn-secondary" onclick="exportFeePaymentsRangeReport()" style="background:#0284c7; color:#fff; border:none; font-weight:700;"><i class="fa-solid fa-file-invoice-dollar"></i> Export Payments CSV</button>`
+          : `<button class="btn btn-secondary" disabled style="opacity:0.55;">Hidden — need View Total Revenue right</button>`}
+      </div>
+      <div class="glass-card">
+        <h3><i class="fa-solid fa-table"></i> Combined Fee + Attendance</h3>
+        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">One sheet with PEN, attendance totals, fee collected in range, and current due.</p>
+        <button class="btn btn-secondary" onclick="exportCombinedFeeAttendanceReport()" style="background:#7c3aed; color:#fff; border:none; font-weight:700;"><i class="fa-solid fa-table-columns"></i> Export Combined CSV</button>
+      </div>
+      <div class="glass-card">
+        <h3><i class="fa-solid fa-file-invoice-dollar"></i> Fee Receipts Ledger</h3>
         <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Open the receipts ledger to filter by month or date range, then export with tuition/annual/exam bifurcation and totals.</p>
         ${canRevenueReport
           ? `<button class="btn btn-secondary" onclick="window.location.hash='receipts'" style="background:#0284c7; color:#fff; border:none; font-weight:700;"><i class="fa-solid fa-file-invoice-dollar"></i> Open Receipts Ledger</button>`
           : `<button class="btn btn-secondary" disabled style="opacity:0.55;">Hidden — need View Total Revenue right</button>`}
-      </div>
-      <div class="glass-card">
-        <h3><i class="fa-solid fa-file-pdf"></i> Export Attendance Summary</h3>
-        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Generate PDF report of monthly NFC attendance logs.</p>
-        <button class="btn btn-secondary" onclick="showNotification('Generating Attendance PDF...', 'info')">Export PDF</button>
       </div>
     </div>
   `;
@@ -21025,6 +21283,7 @@ function openStudentProfile(admissionNo) {
                   ${student.parentPhone ? `<a href="tel:${student.parentPhone}" style="margin-left:8px; color:#34d399; text-decoration:none;"><i class="fa-solid fa-phone"></i> Call</a>` : ''}
                 </div>
                 <div><span style="color:#94a3b8;">Email Address:</span> <span style="color:#cbd5e1;">${student.parentEmail || 'N/A'}</span></div>
+                <div><span style="color:#94a3b8;">PEN (Permanent Education No.):</span> <code style="color:#c084fc; font-weight:800;">${getStudentPen(student)}</code></div>
                 <div><span style="color:#94a3b8;">Aadhaar Number:</span> <code style="color:#fbbf24;">${student.aadhaar || 'N/A'}</code></div>
                 <div><span style="color:#94a3b8;">School Bot Chat ID:</span> <code style="color:#60a5fa;">${getStudentSchoolChatId(student) || 'Not Linked'}</code></div>
                 <div><span style="color:#94a3b8;">Home Address:</span> <span style="color:#cbd5e1;">${student.address || 'N/A'}</span></div>
