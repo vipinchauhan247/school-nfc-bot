@@ -209,6 +209,27 @@ function getClassTeacherForStudent(student) {
   return cls?.teacher || '';
 }
 
+function getStudentAttendanceSummaryForReport(student, session = SchoolData.activeSession) {
+  const logs = student?.attendanceLogs || {};
+  let daysPresent = 0;
+  let daysAbsent = 0;
+  let daysLate = 0;
+  const bounds = String(session || '').match(/(\d{4})-(\d{2})/);
+  const start = bounds ? `${bounds[1]}-04-01` : '';
+  const end = bounds ? `${parseInt(bounds[1], 10) + 1}-03-31` : '';
+  Object.entries(logs).forEach(([dateKey, log]) => {
+    const day = String(dateKey || '').slice(0, 10);
+    if (start && day && (day < start || day > end)) return;
+    const status = String(log?.status || '').trim().toLowerCase();
+    if (status === 'present') daysPresent += 1;
+    else if (status === 'late') { daysPresent += 1; daysLate += 1; }
+    else if (status === 'absent') daysAbsent += 1;
+  });
+  const workingDays = daysPresent + daysAbsent;
+  const percentage = workingDays ? Math.round((daysPresent / workingDays) * 100) : null;
+  return { daysPresent, daysAbsent, daysLate, workingDays, percentage, session };
+}
+
 function getTeacherSignatureByName(teacherName) {
   const teacher = (SchoolData.teachers || []).find(t => String(t.name || '').trim().toLowerCase() === String(teacherName || '').trim().toLowerCase());
   return teacher?.signatureDataUrl || '';
@@ -4366,6 +4387,34 @@ function getStudentPhotoForAdmitCard(student) {
   return photo;
 }
 
+function replaceStudentPhotoWithInitials(img) {
+  if (!img || img.tagName !== 'IMG') return;
+  img.onerror = null;
+  const sizePx = Number(img.getAttribute('data-photo-size')) || 36;
+  const initials = img.getAttribute('data-photo-initials') || '?';
+  const el = document.createElement('div');
+  el.style.cssText = `width:${sizePx}px;height:${sizePx}px;display:flex;align-items:center;justify-content:center;background:#e2e8f0;color:#475569;font-size:${Math.max(10, Math.round(sizePx * 0.32))}px;font-weight:800;flex-shrink:0;`;
+  el.textContent = initials;
+  img.replaceWith(el);
+}
+
+/** Student list/profile avatar — real photo only; initials when missing or broken. */
+function getStudentDirectoryPhotoHtml(student, sizePx = 36) {
+  const size = Number(sizePx) || 36;
+  const photo = getStudentPhotoForAdmitCard(student);
+  const parts = String(student?.name || 'Student').trim().split(/\s+/).filter(Boolean);
+  const initials = parts.slice(0, 2).map((part) => part[0]).join('').toUpperCase() || '?';
+  const safeInitials = typeof escapeHtml === 'function' ? escapeHtml(initials) : initials;
+  if (!photo) {
+    const fontSize = Math.max(10, Math.round(size * 0.32));
+    return `<div style="width:${size}px;height:${size}px;display:flex;align-items:center;justify-content:center;background:#e2e8f0;color:#475569;font-size:${fontSize}px;font-weight:800;flex-shrink:0;">${safeInitials}</div>`;
+  }
+  const safeSrc = typeof escapeHtml === 'function' ? escapeHtml(photo) : photo;
+  return `<img src="${safeSrc}" alt="" data-photo-size="${size}" data-photo-initials="${safeInitials}" style="width:${size}px;height:${size}px;object-fit:cover;flex-shrink:0;display:block;background:#e2e8f0;" onerror="replaceStudentPhotoWithInitials(this)">`;
+}
+window.replaceStudentPhotoWithInitials = replaceStudentPhotoWithInitials;
+window.getStudentDirectoryPhotoHtml = getStudentDirectoryPhotoHtml;
+
 /** Roll numbers are edited on this page and stored against the active session. */
 function saveAdmitCardRollNo(admissionNo, value) {
   const session = SchoolData.activeSession || '2026-27';
@@ -6880,7 +6929,8 @@ function exportMasterConsolidatedClassExcel(className) {
 }
 
 function printReportCard(containerId) {
-  const printArea = document.getElementById(containerId || 'printableSingleSheetArea');
+  const id = containerId || 'printableSingleSheetArea';
+  const printArea = document.getElementById(id);
   if (!printArea) {
     window.print();
     return;
@@ -6892,20 +6942,25 @@ function printReportCard(containerId) {
     return;
   }
 
+  const isReportCard = id === 'printableSingleSheetArea';
+  const pageCss = isReportCard
+    ? `@page { size: A4 portrait; margin: 0; }`
+    : `@page { size: A4 portrait; margin: 6mm 8mm; }`;
+  const bodyHtml = isReportCard
+    ? printArea.outerHTML
+    : `<div style="padding: 10px;">${printArea.innerHTML}</div>`;
+
   printWindow.document.write(`
     <!DOCTYPE html>
     <html>
       <head>
         <title>Official Report Card - Madan Mohan Malviya School</title>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Playfair+Display:wght@700&family=Caveat:wght@700&display=swap" rel="stylesheet">
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Montserrat:wght@800;900&family=Outfit:wght@700&family=Caveat:wght@700&display=swap" rel="stylesheet">
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <style>
-          @page {
-            size: A4 portrait;
-            margin: 6mm 8mm;
-          }
+          ${pageCss}
           * { box-sizing: border-box; }
-          body {
+          html, body {
             font-family: 'Inter', sans-serif;
             margin: 0;
             padding: 0;
@@ -6916,12 +6971,20 @@ function printReportCard(containerId) {
           }
           img { max-width: 100%; }
           .no-print { display: none !important; }
+          .print-only { display: inline !important; }
+          #printableSingleSheetArea {
+            width: 210mm !important;
+            max-width: 210mm !important;
+            height: auto !important;
+            margin: 0 auto !important;
+            box-shadow: none !important;
+            page-break-inside: avoid !important;
+            overflow: hidden !important;
+          }
         </style>
       </head>
       <body>
-        <div style="padding: 10px;">
-          ${printArea.innerHTML}
-        </div>
+        ${bodyHtml}
         <script>
           window.onload = function() {
             setTimeout(function() {
@@ -7272,34 +7335,40 @@ function viewCombinedConsolidatedReportCard(admissionNo) {
 }
 
 /* ============================================================================
-   ULTRA-MODERN INDIVIDUAL REPORT CARDS (HALF YEARLY & FINAL ANNUAL)
+   OFFICIAL HALF-YEARLY ACADEMIC PROGRESS REPORT (A4 PORTRAIT)
    ============================================================================ */
 function viewHalfYearlyReportCard(admissionNo) {
-  const student = SchoolData.students.find(s => s.admissionNo === admissionNo);
-  if (!student) return;
+  document.getElementById('reportPreviewModal')?.remove();
 
-  const cls = student.currentClass || student.class || 'Class 5';
+  const student = (typeof findStudentByAdmissionNo === 'function')
+    ? findStudentByAdmissionNo(admissionNo)
+    : (SchoolData.students || []).find((s) => String(s.admissionNo) === String(admissionNo));
+  if (!student) {
+    if (typeof showNotification === 'function') showNotification('Student not found for this report card.', 'error');
+    return;
+  }
+
+  const cls = student.currentClass || student.class || '';
   const sec = student.currentSection || student.section || 'A';
-  const roll = student.currentRollNo || student.rollNo || '1';
+  const roll = student.currentRollNo || student.rollNo || '—';
   const sigs = SchoolData.signatures || {};
   const school = getSchoolProfile();
+  const currentSession = SchoolData.activeSession || '';
   const classTeacherName = getClassTeacherForStudent(student) || sigs.teacherName || 'Class Teacher';
   const classTeacherSignature = getTeacherSignatureByName(classTeacherName) || sigs.teacherSig || '';
   const principalSignature = school.principalSignatureDataUrl || sigs.principalSig || '';
-  const isPrimary = (cls.includes('Nursery') || cls.includes('LKG') || cls.includes('UKG') || cls.includes('Class 1') || cls.includes('Class 2') || cls.includes('Class 3') || cls.includes('Class 4') || cls.includes('Class 5'));
-  
-  const utMax = isPrimary ? 15 : 10;
-  const hyMax = isPrimary ? 70 : 80;
-  const currentSession = SchoolData.activeSession;
+  const attendanceSummary = getStudentAttendanceSummaryForReport(student, currentSession);
+  const attendanceLine = String(student.customAttendance || '').trim()
+    || `${attendanceSummary.daysPresent}/${attendanceSummary.workingDays}`;
+  const logoSrc = getPrintLogoSource();
 
   const configuredSubs = getSubjectsForClassAndExam(cls, 'half_yearly');
-  const subjects = configuredSubs.map(s => {
+  const subjects = configuredSubs.map((s) => {
     const code = (s.code || s.name).toLowerCase();
     const studentMarks = (student.examMarks && student.examMarks[code]) ? student.examMarks[code] : {};
     return {
       name: s.name,
       code: s.code,
-      maxMarks: s.maxMarks || 100,
       ut1: studentMarks.ut1 !== undefined ? parseFloat(studentMarks.ut1) || 0 : 0,
       ut2: studentMarks.ut2 !== undefined ? parseFloat(studentMarks.ut2) || 0 : 0,
       hy: studentMarks.hy !== undefined ? parseFloat(studentMarks.hy) || 0 : 0,
@@ -7311,10 +7380,11 @@ function viewHalfYearlyReportCard(admissionNo) {
       hyWeight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'hy')
     };
   });
-  
+
   const rankMap = calculateClassRanks(cls, 'half_yearly');
+  const classCount = Object.keys(rankMap).length;
   const studentRank = rankMap[student.admissionNo] || 1;
-  const subjectSummaries = subjects.map(s => {
+  const subjectSummaries = subjects.map((s) => {
     const scaledUt1 = s.ut1Max ? (s.ut1 / s.ut1Max) * s.ut1Weight : 0;
     const scaledUt2 = s.ut2Max ? (s.ut2 / s.ut2Max) * s.ut2Weight : 0;
     const scaledHy = s.hyMax ? (s.hy / s.hyMax) * s.hyWeight : 0;
@@ -7325,184 +7395,188 @@ function viewHalfYearlyReportCard(admissionNo) {
   const maxPossible = subjectSummaries.length * 100;
   const percentage = maxPossible ? ((grandTotal / maxPossible) * 100).toFixed(1) : '0.0';
 
+  const getGradeFromScore = (score) => {
+    if (score >= 90) return { letter: 'A+', color: '#22c55e' };
+    if (score >= 80) return { letter: 'A', color: '#16a34a' };
+    if (score >= 60) return { letter: 'B', color: '#2563eb' };
+    if (score >= 40) return { letter: 'C', color: '#f97316' };
+    return { letter: 'D', color: '#ef4444' };
+  };
+
+  const grandRemarks = parseFloat(percentage) >= 40
+    ? 'Consistently hardworking student, demonstrates excellent growth.'
+    : 'Needs improvement. Please work harder.';
+
+  const marksRows = subjectSummaries.length
+    ? subjectSummaries.map((s, i) => {
+      const grade = getGradeFromScore(s.total);
+      const bg = i % 2 === 0 ? '#ffffff' : '#f8fafc';
+      return `
+        <tr style="background:${bg};">
+          <td style="padding:7px 4px; color:#64748b; font-weight:700; border:1px solid #cbd5e1;">${i + 1}</td>
+          <td style="padding:7px 8px; text-align:left; font-weight:600; color:#0f172a; border:1px solid #cbd5e1;">${escapeHtml(String(s.name || '').toUpperCase())}</td>
+          <td style="padding:7px 4px; border:1px solid #cbd5e1;">${s.ut1}</td>
+          <td style="padding:7px 4px; border:1px solid #cbd5e1;">${s.ut2}</td>
+          <td style="padding:7px 4px; border:1px solid #cbd5e1;">${s.hy}</td>
+          <td style="padding:7px 4px; font-weight:800; color:#0f2e5c; background:rgba(15,46,92,0.04); border:1px solid #cbd5e1;">${s.total}</td>
+          <td style="padding:7px 4px; border:1px solid #cbd5e1;">
+            <span style="display:inline-block; padding:2px 10px; border-radius:999px; background:${grade.color}; color:#ffffff; font-size:0.75rem; font-weight:800; letter-spacing:0.3px;">${grade.letter}</span>
+          </td>
+        </tr>`;
+    }).join('')
+    : `<tr><td colspan="7" style="padding:12px; border:1px solid #cbd5e1; color:#64748b;">No subjects configured for this class.</td></tr>`;
+
   const modalHtml = `
     <div class="modal-overlay active" id="reportPreviewModal" style="z-index:99999;">
-      <div class="modal-box" style="max-width:880px; max-height:92vh; overflow-y:auto; background:#ffffff; color:#0f172a; padding:0; border-radius:16px; box-shadow:0 25px 50px -12px rgba(0, 0, 0, 0.5); position:relative;">
-        
+      <div class="modal-box" style="max-width:760px; max-height:96vh; overflow-y:auto; overflow-x:hidden; background:#e8edf4; padding:16px; border-radius:12px; box-shadow:0 25px 50px -12px rgba(0,0,0,0.5); position:relative;">
+        <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@800;900&family=Outfit:wght@700&display=swap" rel="stylesheet">
+
         <style>
+          .print-only { display: none; }
+          #printableSingleSheetArea .rc-photo img,
+          #printableSingleSheetArea .rc-photo > div {
+            width: 90px !important;
+            height: 106px !important;
+            border-radius: 0 !important;
+            object-fit: cover;
+          }
           @media print {
-            @page {
-              size: A4 portrait;
-              margin: 5mm 6mm;
-            }
-            html, body {
-              background: #ffffff !important;
-              color: #000000 !important;
-              margin: 0 !important;
-              padding: 0 !important;
-            }
-            body * { visibility: hidden !important; }
-            #printableSingleSheetArea, #printableSingleSheetArea * { visibility: visible !important; }
+            @page { size: A4 portrait; margin: 0; }
+            html, body { background:#ffffff !important; margin:0 !important; padding:0 !important; }
+            body * { visibility:hidden !important; }
+            #printableSingleSheetArea, #printableSingleSheetArea * { visibility:visible !important; }
             #printableSingleSheetArea {
-              position: absolute !important;
-              left: 0 !important;
-              top: 0 !important;
-              width: 100% !important;
-              padding: 0 !important;
-              margin: 0 !important;
-              page-break-inside: avoid !important;
+              position:absolute !important; left:0 !important; top:0 !important;
+              width:210mm !important; height:auto !important;
+              border:5px solid #0f2e5c !important; border-radius:0 !important;
+              padding:0 !important; box-shadow:none !important; margin:0 !important;
+              background:#ffffff !important; overflow:hidden !important;
+              page-break-inside:avoid !important;
             }
-            .no-print { display: none !important; }
-            .modal-overlay { position: static !important; background: none !important; padding: 0 !important; }
-            .modal-box { max-width: 100% !important; max-height: none !important; overflow: visible !important; box-shadow: none !important; border: none !important; padding: 0 !important; margin: 0 !important; }
+            .no-print { display:none !important; }
+            .print-only { display:inline !important; }
+            .modal-overlay { position:static !important; background:none !important; padding:0 !important; }
+            .modal-box { max-width:100% !important; max-height:none !important; overflow:visible !important; box-shadow:none !important; border:none !important; padding:0 !important; margin:0 !important; background:transparent !important; }
           }
         </style>
 
-        <!-- LUXURY GRADIENT HEADER WITH OFFICIAL LOGO EMBLEM -->
-        <div style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #1e1b4b 100%); color:#ffffff; padding:20px 24px; border-top-left-radius:16px; border-top-right-radius:16px; display:flex; align-items:center; justify-content:space-between; position:relative; border-bottom:4px solid #f59e0b;">
-          <div style="display:flex; align-items:center; gap:16px;">
-            ${getSchoolLogoHtml(65)}
-            <div>
-              <h1 style="font-family:'Playfair Display', serif; font-size:1.4rem; letter-spacing:1px; margin:0; color:#ffffff;">${school.name.toUpperCase()}</h1>
-              <p style="margin:2px 0 0 0; font-size:0.8rem; color:#cbd5e1; font-weight:500;">${school.address}</p>
-              <div style="margin-top:4px; display:inline-block; padding:2px 10px; background:rgba(245, 158, 11, 0.2); border:1px solid #f59e0b; border-radius:20px; font-size:0.72rem; color:#fbbf24; font-weight:700;">
-                HALF-YEARLY EXAMINATION REPORT CARD (TERM 1) - SESSION ${currentSession}
+        <button class="close-modal-btn no-print" onclick="document.getElementById('reportPreviewModal').remove()"
+          style="position:absolute;top:20px;right:20px;background:#e2e8f0;color:#334155;border:none;width:32px;height:32px;border-radius:50%;font-size:1.1rem;cursor:pointer;display:flex;align-items:center;justify-content:center;z-index:10;" title="Close Preview">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+
+        <div id="printableSingleSheetArea"
+          style="width:700px; height:auto; padding:0; margin:0 auto;
+                 background:#ffffff; color:#0f172a; position:relative;
+                 border:5px solid #0f2e5c; border-radius:0;
+                 box-shadow:0 8px 32px rgba(0,0,0,0.18);
+                 font-family:'Inter',sans-serif; font-size:0.92rem;
+                 overflow:visible; box-sizing:border-box;">
+
+          <span class="rc-inner-border"
+            style="position:absolute; top:10px; left:10px; right:10px; bottom:10px;
+                   border:1.5px solid #0f2e5c; border-radius:0; pointer-events:none;
+                   z-index:1; display:block;"></span>
+
+          <span style="position:absolute;top:0;left:0;width:28px;height:28px;border-top:2.5px solid #0f2e5c;border-left:2.5px solid #0f2e5c;border-radius:0;z-index:3;display:block;pointer-events:none;"></span>
+          <span style="position:absolute;top:0;right:0;width:28px;height:28px;border-top:2.5px solid #0f2e5c;border-right:2.5px solid #0f2e5c;border-radius:0;z-index:3;display:block;pointer-events:none;"></span>
+          <span style="position:absolute;bottom:0;left:0;width:28px;height:28px;border-bottom:2.5px solid #0f2e5c;border-left:2.5px solid #0f2e5c;border-radius:0;z-index:3;display:block;pointer-events:none;"></span>
+          <span style="position:absolute;bottom:0;right:0;width:28px;height:28px;border-bottom:2.5px solid #0f2e5c;border-right:2.5px solid #0f2e5c;border-radius:0;z-index:3;display:block;pointer-events:none;"></span>
+
+          <div class="rc-content-wrapper"
+            style="position:relative; z-index:2; padding:22px 30px;
+                   display:flex; flex-direction:column; box-sizing:border-box; width:100%;">
+
+            <div style="text-align:center; border-bottom:2px solid #0f2e5c; padding-bottom:8px; margin-bottom:10px;">
+              <div style="margin-bottom:5px;">
+                <img src="${logoSrc}" alt="School Crest" width="58" height="58"
+                  style="width:58px; height:58px; object-fit:contain; object-position:center center;">
+              </div>
+              <h1 style="font-family:'Montserrat',sans-serif; font-weight:900; font-size:1.4rem; margin:0 0 2px; color:#0f2e5c; letter-spacing:0.5px; line-height:1.2; text-transform:uppercase;">MADAN MOHAN MALVIYA JUNIOR HIGH SCHOOL</h1>
+              <h2 style="font-family:'Outfit',sans-serif; font-weight:700; font-size:0.88rem; margin:2px 0; color:#1e293b; letter-spacing:1.5px; text-transform:uppercase;">ACADEMIC PROGRESS REPORT</h2>
+              <div style="font-family:'Outfit',sans-serif; font-size:0.76rem; color:#475569; font-weight:700; margin-top:2px;">SESSION: ${escapeHtml(String(currentSession))}</div>
+            </div>
+
+            <div style="border:1.5px solid #cbd5e1; padding:10px; margin-bottom:10px; display:flex; align-items:center; gap:14px; background:#f8fafc;">
+              <div class="rc-photo" style="width:90px; height:106px; border:1px solid #cbd5e1; overflow:hidden; background:#ffffff; display:flex; align-items:center; justify-content:center; flex-shrink:0;">
+                ${getStudentDirectoryPhotoHtml(student, 90)}
+              </div>
+              <div style="flex-grow:1; display:grid; grid-template-columns:1.3fr 1fr; gap:6px 14px; font-size:0.88rem; color:#1e293b; line-height:1.4;">
+                <div style="grid-column:1 / -1;"><strong>Student Name:</strong> <span style="text-transform:uppercase; font-weight:800; color:#0f172a;">${escapeHtml(student.name || '')}</span></div>
+                <div><strong>Roll No:</strong> ${escapeHtml(String(roll))}</div>
+                <div><strong>Class &amp; Section:</strong> ${escapeHtml(cls)} ${escapeHtml(sec) ? `– ${escapeHtml(sec)}` : ''}</div>
+                <div><strong>Admission No:</strong> ${escapeHtml(String(student.admissionNo || ''))}</div>
+                <div><strong>Attendance:</strong> <span style="font-weight:800;">${escapeHtml(attendanceLine)}</span></div>
               </div>
             </div>
-          </div>
-          <button class="close-modal-btn no-print" onclick="document.getElementById('reportPreviewModal').remove()" style="color:#ffffff; font-size:1.6rem; opacity:0.8; cursor:pointer;" title="Close Preview"><i class="fa-solid fa-xmark"></i></button>
-        </div>
 
-        <div id="printableSingleSheetArea" style="padding:20px 24px;">
-          <!-- STUDENT GRAPHIC INFO CARD -->
-          <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:12px 18px; margin-bottom:16px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
-            <div style="display:flex; align-items:center; gap:14px;">
-              <img src="${student.photo}" style="width:55px; height:55px; border-radius:50%; border:2.5px solid #6366f1; object-fit:cover;">
-              <div>
-                <h3 style="font-size:1.15rem; margin:0 0 2px 0; color:#0f172a; font-weight:700;">${student.name}</h3>
-                <div style="display:flex; gap:8px; font-size:0.78rem; color:#475569;">
-                  <span><strong>Adm No:</strong> <code style="color:#4f46e5; font-weight:700;">${student.admissionNo}</code></span> |
-                  <span><strong>Class:</strong> <strong style="color:#6366f1;">${cls} - ${sec}</strong></span> |
-                  <span><strong>Roll No:</strong> ${roll}</span>
+            <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.86rem; margin-bottom:10px; border:1px solid #cbd5e1;">
+              <thead>
+                <tr style="background:#dbeafe; color:#1e3a8a;">
+                  <th style="padding:7px 4px; width:45px; border:1px solid #cbd5e1; font-weight:800;">SR.</th>
+                  <th style="padding:7px 8px; text-align:left; border:1px solid #cbd5e1; font-weight:800;">SUBJECTS</th>
+                  <th style="padding:7px 4px; border:1px solid #cbd5e1; font-weight:800;">UT-1 (25)</th>
+                  <th style="padding:7px 4px; border:1px solid #cbd5e1; font-weight:800;">UT-2 (25)</th>
+                  <th style="padding:7px 4px; border:1px solid #cbd5e1; font-weight:800;">HALF-YEARLY (100)</th>
+                  <th style="padding:7px 4px; background:rgba(15,46,92,0.08); border:1px solid #cbd5e1; font-weight:800;">TOTAL (100)</th>
+                  <th style="padding:7px 4px; border:1px solid #cbd5e1; font-weight:800;">GRADE</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${marksRows}
+                <tr style="background:#eef2f6; font-weight:800; color:#0f2e5c;">
+                  <td style="padding:8px; text-align:left; border:1px solid #cbd5e1;" colspan="3">Total Marks: ${grandTotal} / ${maxPossible}</td>
+                  <td style="padding:8px; text-align:right; border:1px solid #cbd5e1;" colspan="4">Rank: ${studentRank}${classCount ? ` / ${classCount}` : ''}</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <div style="font-size:0.84rem; color:#334155; border-bottom:1px solid #cbd5e1; padding-bottom:6px; margin-bottom:18px;">
+              Remarks: <em>${escapeHtml(grandRemarks)}</em>
+            </div>
+
+            <div style="display:flex; justify-content:space-between; align-items:flex-end; font-size:0.78rem; margin-bottom:12px; gap:12px;">
+              <div style="text-align:center; min-width:150px; flex:1;">
+                <div style="height:34px; display:flex; align-items:flex-end; justify-content:center; margin-bottom:4px;">
+                  ${classTeacherSignature
+                    ? `<img src="${classTeacherSignature}" alt="Class Teacher Signature" style="max-height:32px; max-width:130px; object-fit:contain;">`
+                    : ''}
                 </div>
+                <div style="border-top:1.5px dotted #0f2e5c; padding-top:4px; font-weight:800; color:#0f172a;">Class Teacher's Signature</div>
+              </div>
+              <div style="text-align:center; min-width:150px; flex:1;">
+                <div style="height:34px; display:flex; align-items:flex-end; justify-content:center; margin-bottom:4px;">
+                  ${principalSignature
+                    ? `<img src="${principalSignature}" alt="Principal Signature" style="max-height:32px; max-width:130px; object-fit:contain;">`
+                    : ''}
+                </div>
+                <div style="border-top:1.5px dotted #0f2e5c; padding-top:4px; font-weight:800; color:#0f172a;">Principal's Signature</div>
+              </div>
+              <div style="text-align:center; min-width:150px; flex:1;">
+                <div style="height:34px; margin-bottom:4px;"></div>
+                <div style="border-top:1.5px dotted #0f2e5c; padding-top:4px; font-weight:800; color:#0f172a;">Parent/Guardian's Signature</div>
               </div>
             </div>
 
-            <div style="font-size:0.78rem; color:#334155; line-height:1.5;">
-              <div><strong>Father Name:</strong> ${student.parentName}</div>
-              <div><strong>Mother Name:</strong> ${student.motherName || 'N/A'}</div>
-              <div><strong>Date of Birth:</strong> <strong style="color:#0284c7;">${formatDobToDDMMYYYY(student.dob)}</strong></div>
-            </div>
-
-            <div style="display:flex; align-items:center; gap:12px;">
-              <div style="background:linear-gradient(135deg, #4f46e5 0%, #3730a3 100%); color:#ffffff; padding:6px 12px; border-radius:10px; font-weight:800; font-size:0.78rem; text-align:center; box-shadow:0 4px 6px -1px rgba(79, 70, 229, 0.3);">
-                Rank CLASS RANK<br>
-                <span style="font-size:1.15rem; color:#fef08a;">#${studentRank}</span>
-              </div>
-              <img src="https://api.qrserver.com/v1/create-qr-code/?size=55x55&data=STUDENT-HY-${student.admissionNo}" style="width:55px; height:55px; border-radius:6px; border:1px solid #cbd5e1;">
-            </div>
-          </div>
-
-          <!-- MARKS TABLE WITH MODERN GRADE BADGES -->
-          <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.8rem; margin-bottom:16px; border-radius:8px; overflow:hidden; border:1px solid #cbd5e1;">
-            <thead>
-              <tr style="background:#1e293b; color:#ffffff;">
-                <th style="padding:8px 10px; text-align:left; font-weight:600;">Subject Name</th>
-                <th style="padding:8px; font-weight:600;">UT-1</th>
-                <th style="padding:8px; font-weight:600;">UT-2</th>
-                <th style="padding:8px; font-weight:600;">Half-Yearly Written</th>
-                <th style="padding:8px; font-weight:600; background:#334155;">Term 1 Total (100)</th>
-                <th style="padding:8px; font-weight:600;">Grade</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${subjectSummaries.map((s, idx) => {
-                const tot = s.total;
-                const grade = tot >= 90 ? 'A+' : tot >= 80 ? 'A' : 'B';
-                const bg = idx % 2 === 0 ? '#ffffff' : '#f8fafc';
-
-                return `
-                  <tr style="background:${bg}; border-bottom:1px solid #e2e8f0;">
-                    <td style="padding:7px 10px; text-align:left; font-weight:600; color:#0f172a;">${s.name}</td>
-                    <td style="padding:7px;">${s.ut1} / ${s.ut1Max}</td>
-                    <td style="padding:7px;">${s.ut2} / ${s.ut2Max}</td>
-                    <td style="padding:7px;">${s.hy} / ${s.hyMax}</td>
-                    <td style="padding:7px; font-weight:700; color:#4f46e5; background:rgba(99, 102, 241, 0.08);">${tot} / 100</td>
-                    <td style="padding:7px;"><span style="padding:2px 8px; border-radius:10px; background:#10b981; color:#ffffff; font-size:0.7rem; font-weight:700;">${grade}</span></td>
-                  </tr>
-                `;
-              }).join('')}
-            </tbody>
-          </table>
-
-          <!-- GRAND TOTAL SUMMARY CARD -->
-          <div style="background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%); border:1.5px solid #86efac; border-radius:10px; padding:12px 18px; display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-            <div>
-              <div style="font-size:0.78rem; color:#166534; font-weight:600; text-transform:uppercase; letter-spacing:0.5px;">Term 1 Performance Summary</div>
-              <div style="font-size:1.2rem; font-weight:800; color:#14532d; margin-top:2px;">GRAND TOTAL: ${grandTotal} / ${maxPossible} MARKS</div>
-            </div>
-            <div style="text-align:right;">
-              <span style="padding:4px 14px; background:#16a34a; color:#ffffff; border-radius:20px; font-weight:700; font-size:0.82rem;">PERCENTAGE: ${percentage}%</span>
-              <div style="margin-top:4px; font-size:0.78rem; font-weight:700; color:#15803d;">RANK: ${studentRank}</div>
-            </div>
-          </div>
-
-          <!-- DYNAMIC SIGNATURE FOOTER -->
-          <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-top:16px; border-top:1px solid #cbd5e1; padding-top:8px; font-size:0.72rem;">
-            <!-- TEACHER SIG -->
-            <div style="text-align:center;">
-              <div style="height:38px; display:flex; align-items:flex-end; justify-content:center;">
-                ${classTeacherSignature ? `
-                  <img src="${classTeacherSignature}" style="max-height:38px; max-width:110px; object-fit:contain;">
-                ` : `
-                  <span style="font-family:'Caveat', cursive; font-size:1.15rem; color:#4f46e5; font-weight:bold;">${classTeacherName}</span>
-                `}
-              </div>
-              <div style="border-top:1px solid #94a3b8; padding-top:2px; font-weight:600; color:#475569;">Class Teacher Signature</div>
-            </div>
-
-            <!-- EXAM CONTROLLER SIGNATURE / SCHOOL STAMP FALLBACK -->
-            <div style="text-align:center;">
-              <div style="height:50px; display:flex; align-items:center; justify-content:center;">
-                ${(sigs.examControllerSig || sigs.schoolStamp) ? `
-                  <img src="${sigs.examControllerSig || sigs.schoolStamp}" style="max-height:50px; max-width:90px; object-fit:contain;">
-                ` : `
-                  <div style="width:50px; height:50px; border-radius:50%; border:2px dashed #f59e0b; display:flex; align-items:center; justify-content:center; color:#d97706; font-size:0.55rem; font-weight:bold; text-align:center; background:rgba(245,158,11,0.05);">
-                    MMM SCHOOL<br>SEAL
-                  </div>
-                `}
-              </div>
-              <div style="border-top:1px solid #94a3b8; padding-top:2px; font-weight:600; color:#475569;">Exam Controller Signature</div>
-            </div>
-
-            <!-- PRINCIPAL SIG -->
-            <div style="text-align:center;">
-              <div style="height:38px; display:flex; align-items:flex-end; justify-content:center;">
-                ${principalSignature ? `
-                  <img src="${principalSignature}" style="max-height:38px; max-width:110px; object-fit:contain;">
-                ` : `
-                  <span style="font-family:'Caveat', cursive; font-size:1.15rem; color:#059669; font-weight:bold;">${sigs.principalName || 'Principal Office'}</span>
-                `}
-              </div>
-              <div style="border-top:1px solid #94a3b8; padding-top:2px; font-weight:600; color:#475569;">Principal Signature & Stamp</div>
+            <div style="text-align:center; font-size:0.7rem; color:#0f2e5c; font-weight:700; border-top:1px solid #e2e8f0; padding-top:6px; text-transform:uppercase; letter-spacing:0.5px;">
+              CAMPUS: VIVEK VIHAR, LUCKNOW - 226010 | WWW.MMMJHS.EDU
             </div>
           </div>
         </div>
 
-        <!-- ACTION FOOTER BAR -->
-        <div style="display:flex; justify-content:space-between; align-items:center; padding:14px 24px; background:#f8fafc; border-top:1px solid #e2e8f0;" class="no-print">
-          <div style="display:flex; gap:10px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; padding:14px 8px 4px; flex-wrap:wrap; gap:12px;" class="no-print">
+          <div style="display:flex; gap:10px; flex-wrap:wrap;">
             <button class="btn btn-secondary" onclick="document.getElementById('reportPreviewModal').remove()" style="padding:10px 18px; font-weight:800; background:#475569; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-xmark"></i> Close Preview</button>
             <button class="btn btn-secondary" onclick="openUploadSignaturesModal()" style="padding:10px 18px; font-weight:800; background:#0284c7; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-signature"></i> Upload Signatures / Stamp</button>
           </div>
-          <button class="btn btn-primary" onclick="printReportCard('printableSingleSheetArea')" style="padding:10px 24px; font-weight:800; background:linear-gradient(135deg, #6366f1 0%, #4f46e5 100%); color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-print"></i> Print 1-Page A4 Report Card</button>
+          <button class="btn btn-primary" onclick="printReportCard('printableSingleSheetArea')" style="padding:10px 24px; font-weight:800; background:linear-gradient(135deg, #4f46e5 0%, #3730a3 100%); color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-print"></i> Print Report Card</button>
         </div>
-
       </div>
     </div>
   `;
   document.body.insertAdjacentHTML('beforeend', modalHtml);
 }
+window.viewHalfYearlyReportCard = viewHalfYearlyReportCard;
 
 function viewFinalAnnualReportCard(admissionNo) {
   const student = SchoolData.students.find(s => s.admissionNo === admissionNo);
