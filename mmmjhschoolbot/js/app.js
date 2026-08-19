@@ -187,12 +187,22 @@ function getPrintLogoSource() {
 
 function getSchoolLogoHtml(size = 62) {
   const profile = getSchoolProfile();
-  const logoSrc = profile.logoDataUrl || 'assets/school_logo.png';
+  const uploaded = String(profile.logoDataUrl || '').trim();
+  const logoSrc = uploaded || absoluteAssetUrl('assets/school_logo.png');
   return `<img src="${logoSrc}" alt="School Logo" class="school-logo-img" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center; background:transparent; display:block;">`;
 }
 
 function getTransferCertificateLogoHtml(size = 78) {
-  return `<img src="assets/school_logo_tc.png" alt="School Logo" class="school-logo-img" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center; background:transparent; display:block;">`;
+  return `<img src="${absoluteAssetUrl('assets/school_logo_tc.png')}" alt="School Logo" class="school-logo-img" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center; background:transparent; display:block;">`;
+}
+
+function getReportCardLetterheadHtml(size = 96) {
+  const logoSrc = getPrintLogoSource();
+  return `
+    <div class="rc-letterhead" style="display:flex; justify-content:center; padding:2px 0 12px; border-bottom:3px double #0f172a; margin-bottom:14px;">
+      <img src="${logoSrc}" alt="" class="rc-emblem" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center; background:transparent; display:block;">
+    </div>
+  `;
 }
 
 function applySchoolProfileToShell() {
@@ -6937,13 +6947,26 @@ function printReportCard(containerId) {
           ${printArea.innerHTML}
         </div>
         <script>
+          function waitForReportCardImages() {
+            var imgs = Array.prototype.slice.call(document.images || []);
+            return Promise.all(imgs.map(function(img) {
+              if (img.complete) return Promise.resolve();
+              return new Promise(function(resolve) {
+                img.onload = resolve;
+                img.onerror = resolve;
+                setTimeout(resolve, 1600);
+              });
+            }));
+          }
           window.onload = function() {
-            setTimeout(function() {
-              window.print();
-              setTimeout(function() { window.close(); }, 500);
-            }, 300);
+            waitForReportCardImages().then(function() {
+              setTimeout(function() {
+                window.print();
+                setTimeout(function() { window.close(); }, 500);
+              }, 150);
+            });
           };
-        </script>
+        <\/script>
       </body>
     </html>
   `);
@@ -7137,19 +7160,10 @@ function viewCombinedConsolidatedReportCard(admissionNo) {
         </style>
 
         <div id="printableSingleSheetArea" style="padding:20px 24px; font-family:'Inter', sans-serif;">
-          <!-- 1-PAGE COMBINED HEADER WITH EMBLEM -->
-          <div style="display:flex; align-items:center; justify-content:space-between; border-bottom:3px double #0f172a; padding-bottom:10px; margin-bottom:12px;">
-            <div style="display:flex; align-items:center; gap:14px;">
-              ${getSchoolLogoHtml(60)}
-              <div>
-                <h2 style="font-family:'Playfair Display', serif; font-size:1.3rem; margin:0; color:#0f172a; text-transform:uppercase;">${school.name}</h2>
-                <p style="margin:2px 0 0 0; font-size:0.75rem; color:#475569; font-weight:600;">${school.address} - Session ${currentSession}</p>
-                <div style="margin-top:3px; font-size:0.72rem; color:#059669; font-weight:700;">OFFICIAL CONSOLIDATED 1-SHEET COMBINED REPORT CARD</div>
-              </div>
-            </div>
-            <div style="text-align:right; margin-right:45px;">
-              <img src="https://api.qrserver.com/v1/create-qr-code/?size=50x50&data=COMBINED-${student.admissionNo}" style="width:50px; height:50px; border-radius:4px; border:1px solid #cbd5e1;">
-            </div>
+          <!-- LETTERHEAD: round emblem image only (school name is on the logo) -->
+          ${getReportCardLetterheadHtml(96)}
+          <div style="display:flex; justify-content:flex-end; margin-top:-8px; margin-bottom:10px;">
+            <img src="https://api.qrserver.com/v1/create-qr-code/?size=50x50&data=COMBINED-${student.admissionNo}" style="width:50px; height:50px; border-radius:4px; border:1px solid #cbd5e1;">
           </div>
 
           <!-- STUDENT BIO COMPACT BANNER -->
@@ -7373,21 +7387,13 @@ function viewHalfYearlyReportCard(admissionNo) {
         </style>
 
         <!-- LUXURY GRADIENT HEADER WITH OFFICIAL LOGO EMBLEM -->
-        <div style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #1e1b4b 100%); color:#ffffff; padding:20px 24px; border-top-left-radius:16px; border-top-right-radius:16px; display:flex; align-items:center; justify-content:space-between; position:relative; border-bottom:4px solid #f59e0b;">
-          <div style="display:flex; align-items:center; gap:16px;">
-            ${getSchoolLogoHtml(65)}
-            <div>
-              <h1 style="font-family:'Playfair Display', serif; font-size:1.4rem; letter-spacing:1px; margin:0; color:#ffffff;">${school.name.toUpperCase()}</h1>
-              <p style="margin:2px 0 0 0; font-size:0.8rem; color:#cbd5e1; font-weight:500;">${school.address}</p>
-              <div style="margin-top:4px; display:inline-block; padding:2px 10px; background:rgba(245, 158, 11, 0.2); border:1px solid #f59e0b; border-radius:20px; font-size:0.72rem; color:#fbbf24; font-weight:700;">
-                HALF-YEARLY EXAMINATION REPORT CARD (TERM 1) - SESSION ${currentSession}
-              </div>
-            </div>
-          </div>
-          <button class="close-modal-btn no-print" onclick="document.getElementById('reportPreviewModal').remove()" style="color:#ffffff; font-size:1.6rem; opacity:0.8; cursor:pointer;" title="Close Preview"><i class="fa-solid fa-xmark"></i></button>
+        <div class="no-print" style="background:#0f172a; color:#ffffff; padding:12px 24px; border-top-left-radius:16px; border-top-right-radius:16px; display:flex; align-items:center; justify-content:space-between; border-bottom:4px solid #f59e0b;">
+          <div style="font-weight:800; font-size:0.92rem; letter-spacing:0.04em;">REPORT CARD PREVIEW</div>
+          <button class="close-modal-btn" onclick="document.getElementById('reportPreviewModal').remove()" style="color:#ffffff; font-size:1.6rem; opacity:0.8; cursor:pointer; background:none; border:none;" title="Close Preview"><i class="fa-solid fa-xmark"></i></button>
         </div>
 
         <div id="printableSingleSheetArea" style="padding:20px 24px;">
+          ${getReportCardLetterheadHtml(96)}
           <!-- STUDENT GRAPHIC INFO CARD -->
           <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:12px 18px; margin-bottom:16px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
             <div style="display:flex; align-items:center; gap:14px;">
@@ -7609,21 +7615,13 @@ function viewFinalAnnualReportCard(admissionNo) {
         </style>
 
         <!-- LUXURY GRADIENT HEADER WITH OFFICIAL CREST LOGO -->
-        <div style="background: linear-gradient(135deg, #065f46 0%, #047857 50%, #0f172a 100%); color:#ffffff; padding:20px 24px; border-top-left-radius:16px; border-top-right-radius:16px; display:flex; align-items:center; justify-content:space-between; border-bottom:4px solid #f59e0b; position:relative;">
-          <div style="display:flex; align-items:center; gap:16px;">
-            ${getSchoolLogoHtml(65)}
-            <div>
-              <h1 style="font-family:'Playfair Display', serif; font-size:1.4rem; letter-spacing:1px; margin:0; color:#ffffff;">${school.name.toUpperCase()}</h1>
-              <p style="margin:2px 0 0 0; font-size:0.8rem; color:#a7f3d0; font-weight:500;">${school.address} - Session ${currentSession}</p>
-              <div style="margin-top:4px; display:inline-block; padding:2px 10px; background:rgba(245, 158, 11, 0.2); border:1px solid #f59e0b; border-radius:20px; font-size:0.72rem; color:#fbbf24; font-weight:700;">
-                OFFICIAL CONSOLIDATED FINAL PASSING REPORT CARD (TERM 1 & TERM 2)
-              </div>
-            </div>
-          </div>
-          <button class="close-modal-btn no-print" onclick="document.getElementById('reportPreviewModal').remove()" style="color:#ffffff; font-size:1.6rem; opacity:0.8; cursor:pointer;" title="Close Preview"><i class="fa-solid fa-xmark"></i></button>
+        <div class="no-print" style="background:#065f46; color:#ffffff; padding:12px 24px; border-top-left-radius:16px; border-top-right-radius:16px; display:flex; align-items:center; justify-content:space-between; border-bottom:4px solid #f59e0b;">
+          <div style="font-weight:800; font-size:0.92rem; letter-spacing:0.04em;">REPORT CARD PREVIEW</div>
+          <button class="close-modal-btn" onclick="document.getElementById('reportPreviewModal').remove()" style="color:#ffffff; font-size:1.6rem; opacity:0.8; cursor:pointer; background:none; border:none;" title="Close Preview"><i class="fa-solid fa-xmark"></i></button>
         </div>
 
         <div id="printableSingleSheetArea" style="padding:20px 24px;">
+          ${getReportCardLetterheadHtml(96)}
           <!-- STUDENT GRAPHIC INFO CARD -->
           <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:12px 18px; margin-bottom:16px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
             <div style="display:flex; align-items:center; gap:14px;">
