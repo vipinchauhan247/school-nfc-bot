@@ -4,7 +4,7 @@
  * NFC:  PN532 (I2C)
  * OLED: SSD1306 128x64 (I2C, address 0x3C)
  *
- * Server: @Vipinbellbot on Render — GET /nfc?uid=XXXX
+ * Server: @Vipinbellbot on Render — GET /nfc?uid=XXXX&battery=NN
  * Response (plain text):
  *   SUCCESS:Name:IN:HH:mm:ss
  *   SUCCESS:Name:OUT:HH:mm:ss
@@ -20,6 +20,18 @@
  * Wiring (I2C — SDA=D2/GPIO4, SCL=D1/GPIO5):
  *   PN532  VCC→3V3  GND→GND  SDA→D2  SCL→D1
  *   OLED   VCC→3V3  GND→GND  SDA→D2  SCL→D1
+ *
+ * Battery percentage on the OLED (1S Li-ion / 18650 / LiPo):
+ *   Measure RAW pack voltage, not the 3.3V rail (that stays high until cutoff).
+ *   NodeMCU / Wemos A0 max is ~3.3V, so use a 2:1 divider from BAT+ :
+ *     BAT+ --[100k]--+-- A0
+ *                    |
+ *                  [100k]
+ *                    |
+ *                   GND
+ *   Never feed 4.2V straight into A0.
+ *   If A0 is left unwired, the idle screen shows "BAT --".
+ *   Tune BATTERY_VOLT_SCALE / BAT_V_FULL / BAT_V_EMPTY if the % looks off.
  */
 
 #include <ESP8266WiFi.h>
@@ -39,6 +51,16 @@ const char* SERVER_BASE   = "https://school-nfc-bot.onrender.com";
 
 // Optional: call /warm on boot so first morning tap is fast
 const bool WARM_ON_BOOT   = true;
+
+// OLED battery % (set false if the box is USB-only)
+const bool SHOW_BATTERY   = true;
+#define BATTERY_PIN A0
+// Vbat = analogRead(A0) * scale. Default: NodeMCU A0 ~3.3V FS + 100k/100k divider.
+const float BATTERY_VOLT_SCALE = (3.3f * 2.0f) / 1023.0f;
+const float BAT_V_FULL  = 4.20f;  // 100%
+const float BAT_V_EMPTY = 3.20f;  // 0%
+const int   BAT_LOW_PCT = 15;
+const unsigned long BATTERY_REFRESH_MS = 30000;
 // ────────────────────────────────────────────────────────────────────────────
 
 #define SCREEN_WIDTH 128
@@ -62,6 +84,8 @@ const unsigned long HTTP_TIMEOUT_MS = 8000;
 String lastUid = "";
 unsigned long lastUidAt = 0;
 bool wifiOk = false;
+int lastBatteryPct = -1;  // -1 = not wired / unknown
+unsigned long lastBatteryDraw = 0;
 
 void showLines(const char* line1, const char* line2 = "", const char* line3 = "") {
   display.clearDisplay();
@@ -86,6 +110,58 @@ void showBig(const char* line1, const char* line2 = "") {
     display.println(line2);
   }
   display.display();
+}
+
+int readBatteryPercent() {
+  if (!SHOW_BATTERY) {
+    lastBatteryPct = -1;
+    return -1;
+  }
+
+  long sum = 0;
+  for (int i = 0; i < 8; i++) {
+    sum += analogRead(BATTERY_PIN);
+    delay(2);
+  }
+  const int raw = (int)(sum / 8);
+  // Floating / unwired A0 sits near 0. Do not show a fake 0%.
+  if (raw < 30) {
+    lastBatteryPct = -1;
+    return -1;
+  }
+
+  float volts = raw * BATTERY_VOLT_SCALE;
+  float span = BAT_V_FULL - BAT_V_EMPTY;
+  if (span < 0.05f) span = 0.05f;
+  int pct = (int)((volts - BAT_V_EMPTY) / span * 100.0f + 0.5f);
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  lastBatteryPct = pct;
+  Serial.printf("Battery raw=%d V=%.2f pct=%d\n", raw, volts, pct);
+  return pct;
+}
+
+void formatBatteryLine(char* buf, size_t buflen) {
+  const int pct = (lastBatteryPct >= 0) ? lastBatteryPct : readBatteryPercent();
+  if (pct < 0) {
+    snprintf(buf, buflen, "BAT --");
+  } else if (pct <= BAT_LOW_PCT) {
+    snprintf(buf, buflen, "LOW BAT %d%%", pct);
+  } else {
+    snprintf(buf, buflen, "BAT %d%%", pct);
+  }
+}
+
+void showIdle(const char* line1 = "MMM JHS Gate", const char* line2 = "Tap NFC card") {
+  lastBatteryDraw = millis();
+  if (!SHOW_BATTERY) {
+    showLines(line1, line2);
+    return;
+  }
+  readBatteryPercent();
+  char bat[22];
+  formatBatteryLine(bat, sizeof(bat));
+  showLines(line1, line2, bat);
 }
 
 String uidToString(uint8_t* uid, uint8_t uidLength) {
@@ -116,7 +192,7 @@ bool connectWiFi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     wifiOk = true;
-    showLines("WiFi OK", WiFi.localIP().toString().c_str(), "Tap card");
+    showIdle("WiFi OK", WiFi.localIP().toString().c_str());
     delay(800);
     return true;
   }
@@ -156,7 +232,7 @@ void warmServerCache() {
   String url = String(SERVER_BASE) + "/warm";
   showLines("Warming...", "Please wait");
   httpGet(url);
-  showLines("Ready", "Tap NFC card");
+  showIdle("Ready", "Tap NFC card");
   delay(600);
 }
 
@@ -221,12 +297,16 @@ void handleCardTap(const String& uid) {
   showLines("Reading...", uid.c_str());
 
   String url = String(SERVER_BASE) + "/nfc?uid=" + uid;
+  const int bat = readBatteryPercent();
+  if (bat >= 0) {
+    url += "&battery=" + String(bat);
+  }
   String resp = httpGet(url);
   parseAndShow(resp);
 
   // Return to idle after 3 seconds
   delay(3000);
-  showLines("MMM JHS Gate", "Tap NFC card");
+  showIdle();
 }
 
 void setup() {
@@ -259,7 +339,7 @@ void setup() {
   if (WARM_ON_BOOT && wifiOk) {
     warmServerCache();
   } else {
-    showLines("MMM JHS Gate", "Tap NFC card");
+    showIdle();
   }
 }
 
@@ -272,6 +352,11 @@ void loop() {
       wifiOk = false;
       connectWiFi();
     }
+  }
+
+  if (SHOW_BATTERY && millis() - lastBatteryDraw > BATTERY_REFRESH_MS) {
+    lastBatteryDraw = millis();
+    showIdle();
   }
 
   uint8_t uid[7];

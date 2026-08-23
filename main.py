@@ -66,16 +66,26 @@ def warm():
 @app.route("/nfc", methods=["GET", "POST"])
 def nfc_tap():
     """ESP8266 calls this instead of Google Apps Script for fast OLED response."""
+    body = request.get_json(silent=True) or {}
     uid = (
         request.args.get("uid")
         or request.args.get("UID")
-        or (request.get_json(silent=True) or {}).get("uid")
+        or body.get("uid")
         or ""
     )
     if not uid and request.form:
         uid = request.form.get("uid", "")
+    battery = (
+        request.args.get("battery")
+        or request.form.get("battery")
+        or body.get("battery")
+        or ""
+    )
     text = nfc_gate.process_nfc_tap(uid)
-    print(f"[NFC] uid={uid} -> {text}")
+    if battery != "":
+        print(f"[NFC] uid={uid} battery={battery} -> {text}")
+    else:
+        print(f"[NFC] uid={uid} -> {text}")
     return Response(text, status=200, mimetype="text/plain")
 
 
