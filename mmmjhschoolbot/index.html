@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Madan Mohan Malviya School ERP | Cloud Management System</title>
+    <!-- PWA & Mobile Web App Capabilities -->
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#0f172a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="MMM ERP">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+
+  <meta name="description" content="Modern, cloud-based School ERP System for Madan Mohan Malviya Junior High School (Nursery to 10th Grade) featuring NFC card attendance, session management, automated Telegram fee reminders, exam results, and student history timelines.">
+  
+  <!-- Google Fonts: Inter, Outfit, Playfair Display & Caveat -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@600;700&family=Inter:wght@300;400;500;600;700&family=Montserrat:wght@800&family=Outfit:wght@400;500;600;700;800&family=Playfair+Display:wght@700;800&display=swap" rel="stylesheet">
+  
+  <!-- FontAwesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link rel="stylesheet" href="css/styles.css?v=20260823_v137">
+  
+  <!-- Dedicated jsPDF Vector Engine & html2pdf.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+
+  <!-- Custom Design System Stylesheet -->
+    <style>
+    body.theme-emerald { --accent-primary:#10b981; --accent-secondary:#38bdf8; }
+    body.theme-blue { --accent-primary:#38bdf8; --accent-secondary:#8b5cf6; }
+    body.theme-purple { --accent-primary:#8b5cf6; --accent-secondary:#38bdf8; }
+    html[data-theme="light"] body { background:#f8fafc; color:#0f172a; }
+    html[data-theme="light"] .main-content { background:#f8fafc; color:#0f172a; }
+    html[data-theme="light"] .page-title,
+    html[data-theme="light"] .glass-card,
+    html[data-theme="light"] .data-table,
+    html[data-theme="light"] .modal-content { color:#0f172a; }
+    html[data-theme="light"] .glass-card,
+    html[data-theme="light"] .modal-box,
+    html[data-theme="light"] .data-table-container {
+      background:#ffffff !important;
+      border-color:#cbd5e1 !important;
+    }
+    html[data-theme="light"] .data-table thead,
+    html[data-theme="light"] .data-table th {
+      background:#e2e8f0 !important;
+      color:#334155 !important;
+    }
+    html[data-theme="light"] .data-table tr,
+    html[data-theme="light"] .data-table td {
+      background:#ffffff !important;
+      border-color:#e2e8f0 !important;
+    }
+    html[data-theme="light"] .page-header,
+    html[data-theme="light"] .grid-2 > div {
+      color:#0f172a;
+    }
+    html[data-theme="light"] .page-subtitle,
+    html[data-theme="light"] .glass-card small,
+    html[data-theme="light"] .data-table th,
+    html[data-theme="light"] .data-table td { color:#334155; }
+    html[data-theme="light"] .session-dropdown,
+    html[data-theme="light"] input,
+    html[data-theme="light"] select,
+    html[data-theme="light"] textarea {
+      background:#ffffff !important;
+      color:#0f172a !important;
+      border-color:#cbd5e1 !important;
+    }
+    html[data-theme="light"] input::placeholder,
+    html[data-theme="light"] textarea::placeholder { color:#64748b !important; }
+
+    /* Light theme modals general styling */
+    html[data-theme="light"] .modal-box {
+      background:#ffffff !important;
+      color:#0f172a !important;
+      border-color:#cbd5e1 !important;
+    }
+    html[data-theme="light"] .modal-box h3,
+    html[data-theme="light"] .modal-box h2,
+    html[data-theme="light"] .modal-box strong {
+      color:#0f172a !important;
+    }
+    html[data-theme="light"] .modal-box p,
+    html[data-theme="light"] .modal-box small,
+    html[data-theme="light"] .modal-box span:not(.badge):not(.adm-no-chip) {
+      color:#334155 !important;
+    }
+    html[data-theme="light"] #quickFeeStudentListContainer,
+    html[data-theme="light"] .quick-fee-student-item {
+      background:#f8fafc !important;
+      color:#0f172a !important;
+      border-color:#cbd5e1 !important;
+    }
+    html[data-theme="light"] .quick-fee-student-item strong {
+      color:#0f172a !important;
+    }
+    html[data-theme="light"] .quick-fee-student-item small {
+      color:#475569 !important;
+    }
+    html[data-theme="light"] #quickFeeSearchInput {
+      background:#ffffff !important;
+      color:#0f172a !important;
+      border-color:#059669 !important;
+    }
+    html[data-theme="light"] .text-muted,
+    html[data-theme="light"] .muted-text,
+    html[data-theme="light"] small {
+      color:#374151 !important;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- APP SHELL CONTAINER -->
+  <div id="app" class="app-container">
+
+    <!-- SIDEBAR NAVIGATION -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <a class="school-logo" href="#dashboard" title="Go to Dashboard" style="text-decoration:none; color:inherit; display:flex; align-items:center; gap:12px;">
+          <img src="assets/school_logo_clean.png" alt="Madan Mohan Malviya Junior High School" style="width:44px; height:44px; object-fit:contain; border-radius:10px; display:block; filter:drop-shadow(0 2px 8px rgba(0,0,0,0.35));">
+          <div class="logo-text">
+            <h1 class="school-name" style="font-size:1.05rem; font-weight:800; line-height:1.2; margin:0;">MMM Jr High School</h1>
+            <span class="school-tagline" style="font-size:0.75rem; color:var(--text-muted);">Sector 53, Noida</span>
+          </div>
+        </a>
+        <button class="icon-btn mobile-close-sidebar" id="closeSidebarBtn">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+
+      <!-- ACADEMIC SESSION ISOLATION BAR -->
+      <div class="sidebar-session-widget">
+        <label for="sessionSelect"><i class="fa-solid fa-calendar-days"></i> Academic Session</label>
+        <select id="sessionSelect" class="session-dropdown">
+          <option value="2026-27" selected>2026-27 (Active)</option>
+          <option value="2025-26">2025-26 (Closed)</option>
+          <option value="2024-25">2024-25 (Archived)</option>
+          <option value="2027-28">2027-28 (Upcoming)</option>
+        </select>
+        <div class="session-badge" id="sessionStatusBadge">
+          <span class="status-dot green"></span> Active Session
+        </div>
+      </div>
+
+      <!-- NAVIGATION MENU -->
+      <nav class="sidebar-nav">
+        <div class="nav-section-title">MAIN MENU</div>
+        <a href="#login" class="nav-item" data-page="login" style="background:rgba(56, 189, 248, 0.15); color:#38bdf8; font-weight:800; border:1px solid #38bdf8;">
+          <i class="fa-solid fa-key"></i> <span>Staff & Teacher Login</span>
+        </a>
+        <a href="#dashboard" class="nav-item active" data-page="dashboard">
+          <i class="fa-solid fa-chart-pie"></i> <span>Dashboard</span>
+        </a>
+        <a href="#nfc" class="nav-item highlight-nav" data-page="nfc">
+          <i class="fa-solid fa-id-card-clip"></i> <span>NFC Tap Scanner</span>
+          <span class="nav-badge pulse">LIVE</span>
+        </a>
+        <a href="#students" class="nav-item" data-page="students">
+          <i class="fa-solid fa-user-graduate"></i> <span>Students & Profiles</span>
+        </a>
+        <a href="#left-students" class="nav-item" data-page="left-students">
+          <i class="fa-solid fa-user-clock"></i> <span>Left / Inactive Students</span>
+        </a>
+        <a href="#admissions" class="nav-item" data-page="admissions">
+          <i class="fa-solid fa-user-plus"></i> <span>Admissions</span>
+        </a>
+        <a href="#attendance" class="nav-item" data-page="attendance">
+          <i class="fa-solid fa-clipboard-user"></i> <span>Attendance</span>
+        </a>
+        <a href="#fees" class="nav-item" data-page="fees">
+          <i class="fa-solid fa-indian-rupee-sign"></i> <span>Fee Management</span>
+        </a>
+        <a href="#receipts" class="nav-item" data-page="receipts" style="background:rgba(16, 185, 129, 0.12); color:#34d399; font-weight:700; border:1px solid #10b981;">
+          <i class="fa-solid fa-file-invoice-dollar"></i> <span>Fee Receipts Ledger</span>
+        </a>
+        <a href="#telegram-bot" class="nav-item" data-page="telegram-bot">
+          <i class="fa-brands fa-telegram"></i> <span>Telegram Bot Alerts</span>
+        </a>
+        <div class="nav-sub-directory" data-parent="telegram-bot" style="padding-left: 28px; display: flex; flex-direction: column; gap: 4px; margin-bottom: 6px;">
+          <a href="#telegram-bot" class="nav-item sub-item" data-page="telegram-bot" style="font-size: 0.82rem; padding: 6px 12px;">
+            <i class="fa-brands fa-telegram" style="font-size:0.75rem; color:var(--accent-primary);"></i> <span>Bot Console</span>
+          </a>
+          <a href="#telegram-links" class="nav-item sub-item" data-page="telegram-links" style="font-size: 0.82rem; padding: 6px 12px;">
+            <i class="fa-solid fa-address-book" style="font-size:0.75rem; color:var(--accent-success);"></i> <span>Parent Chat IDs</span>
+          </a>
+          <a href="#telegram-fee-dues-log" class="nav-item sub-item" data-page="telegram-fee-dues-log" style="font-size: 0.82rem; padding: 6px 12px;">
+            <i class="fa-solid fa-bell" style="font-size:0.75rem; color:var(--accent-warning);"></i> <span>Fee Due Message Log</span>
+          </a>
+          <a href="#telegram-receipt-log" class="nav-item sub-item" data-page="telegram-receipt-log" style="font-size: 0.82rem; padding: 6px 12px;">
+            <i class="fa-solid fa-receipt" style="font-size:0.75rem; color:var(--accent-success);"></i> <span>Fee Receipt Message Log</span>
+          </a>
+          <a href="#telegram-school-message-log" class="nav-item sub-item" data-page="telegram-school-message-log" style="font-size: 0.82rem; padding: 6px 12px;">
+            <i class="fa-solid fa-bullhorn" style="font-size:0.75rem; color:var(--accent-primary);"></i> <span>School Message Log</span>
+          </a>
+        </div>
+        <a href="#exams" class="nav-item" data-page="exams">
+          <i class="fa-solid fa-file-pen"></i> <span>Exams & Report Cards</span>
+        </a>
+        <div class="nav-sub-directory" data-parent="exams" style="padding-left: 28px; display: flex; flex-direction: column; gap: 4px; margin-bottom: 6px;">
+          <a href="#exams-entry" class="nav-item sub-item" data-page="exams-entry" style="font-size: 0.82rem; padding: 6px 12px;">
+            <i class="fa-solid fa-table-cells" style="font-size:0.75rem; color:var(--accent-primary);"></i> <span>Marks Entry</span>
+          </a>
+          <a href="#exams-weightage" class="nav-item sub-item" data-page="exams-weightage" style="font-size: 0.82rem; padding: 6px 12px;">
+            <i class="fa-solid fa-sliders" style="font-size:0.75rem; color:var(--accent-warning);"></i> <span>Subject Marks & Weightage</span>
+          </a>
+          <a href="#exams-report-cards" class="nav-item sub-item" data-page="exams-report-cards" style="font-size: 0.82rem; padding: 6px 12px;">
+            <i class="fa-solid fa-award" style="font-size:0.75rem; color:var(--accent-success);"></i> <span>Report Cards</span>
+          </a>
+          <a href="#exams-schedule" class="nav-item sub-item" data-page="exams-schedule" style="font-size: 0.82rem; padding: 6px 12px;">
+            <i class="fa-solid fa-calendar-days" style="font-size:0.75rem; color:var(--accent-primary);"></i> <span>Exam Schedule</span>
+          </a>
+        </div>
+        <a href="#promotion" class="nav-item" data-page="promotion">
+          <i class="fa-solid fa-person-walking-arrow-right"></i> <span>1-Click Promotion</span>
+        </a>
+        <a href="#certificates" class="nav-item" data-page="certificates">
+          <i class="fa-solid fa-certificate"></i> <span>Certificates (QR)</span>
+        </a>
+        <a href="#classes" class="nav-item" data-page="classes">
+          <i class="fa-solid fa-chalkboard-user"></i> <span>Classes & Sections</span>
+        </a>
+        <a href="#users" class="nav-item" data-page="users" style="background:rgba(56, 189, 248, 0.15); color:#38bdf8; font-weight:700; border:1px solid #38bdf8;">
+          <i class="fa-solid fa-user-gear"></i> <span>User Management & Rights</span>
+        </a>
+        <a href="#teachers" class="nav-item" data-page="teachers">
+          <i class="fa-solid fa-user-tie"></i> <span>Teachers Directory</span>
+        </a>
+        <a href="#subjects" class="nav-item" data-page="subjects">
+          <i class="fa-solid fa-book-open"></i> <span>Subjects Directory</span>
+        </a>
+        <a href="#timetable" class="nav-item" data-page="timetable">
+          <i class="fa-solid fa-calendar-week"></i> <span>Timetable Module</span>
+        </a>
+        <div class="nav-sub-directory" data-parent="timetable" style="padding-left: 28px; display: flex; flex-direction: column; gap: 4px; margin-bottom: 6px;">
+          <a href="#timetable-class" class="nav-item sub-item" data-page="timetable-class" style="font-size: 0.82rem; padding: 6px 12px;">
+            <i class="fa-solid fa-school" style="font-size:0.75rem; color:var(--accent-primary);"></i> <span>Class Timetables</span>
+          </a>
+          <a href="#timetable-teacher" class="nav-item sub-item" data-page="timetable-teacher" style="font-size: 0.82rem; padding: 6px 12px;">
+            <i class="fa-solid fa-user-tie" style="font-size:0.75rem; color:var(--accent-success);"></i> <span>Teacher Timetables</span>
+          </a>
+          <a href="#period-settings" class="nav-item sub-item" data-page="period-settings" style="font-size: 0.82rem; padding: 6px 12px;">
+            <i class="fa-solid fa-clock" style="font-size:0.75rem; color:var(--accent-warning);"></i> <span>Period Timings Settings</span>
+          </a>
+        </div>
+        <a href="#users" class="nav-item" data-page="users">
+          <i class="fa-solid fa-user-shield"></i> <span>User Rights & Permissions</span>
+        </a>
+        <a href="#login-audit" class="nav-item" data-page="login-audit">
+          <i class="fa-solid fa-clock-rotate-left"></i> <span>Login Session Audit</span>
+        </a>
+        <a href="#sessions" class="nav-item" data-page="sessions">
+          <i class="fa-solid fa-timeline"></i> <span>Session Engine</span>
+        </a>
+        <a href="#reports" class="nav-item" data-page="reports">
+          <i class="fa-solid fa-chart-column"></i> <span>Reports & Analytics</span>
+        </a>
+        <a href="#settings" class="nav-item" data-page="settings" style="background:rgba(14, 165, 233, 0.12); color:#38bdf8; font-weight:700; border:1px solid #0ea5e9;">
+          <i class="fa-solid fa-gear"></i> <span>Settings</span>
+        </a>
+        <div class="nav-sub-directory" data-parent="settings" style="padding-left: 28px; display: flex; flex-direction: column; gap: 4px; margin-bottom: 6px;">
+          <a href="#print-settings" class="nav-item sub-item" data-page="print-settings" style="font-size: 0.82rem; padding: 6px 12px;">
+            <i class="fa-solid fa-print" style="font-size:0.75rem; color:#38bdf8;"></i> <span>Print (58mm / 80mm)</span>
+          </a>
+          <a href="#school-profile" class="nav-item sub-item" data-page="school-profile" style="font-size: 0.82rem; padding: 6px 12px;">
+            <i class="fa-solid fa-school-flag" style="font-size:0.75rem; color:var(--accent-primary);"></i> <span>School Profile</span>
+          </a>
+          <a href="#appearance" class="nav-item sub-item" data-page="appearance" style="font-size: 0.82rem; padding: 6px 12px;">
+            <i class="fa-solid fa-palette" style="font-size:0.75rem; color:var(--accent-warning);"></i> <span>Website Appearance</span>
+          </a>
+          <a href="#backup" class="nav-item sub-item" data-page="backup" style="font-size: 0.82rem; padding: 6px 12px;">
+            <i class="fa-solid fa-database" style="font-size:0.75rem; color:var(--accent-success);"></i> <span>Backup & Export</span>
+          </a>
+        </div>
+      </nav>
+
+      <!-- LOGGED-IN STAFF (read-only — no role impersonation) -->
+      <div class="sidebar-footer">
+        <div class="role-selector-box">
+          <span class="role-label"><i class="fa-solid fa-user-shield"></i> Signed in as</span>
+          <div id="signedInRoleLabel" class="role-dropdown" style="display:flex; align-items:center; min-height:36px; cursor:default;">Staff</div>
+        </div>
+      </div>
+    </aside>
+    <div class="sidebar-overlay" id="sidebarOverlay"></div>
+
+    <!-- MAIN CONTENT AREA -->
+    <div class="main-wrapper">
+      
+      <!-- TOP NAVBAR -->
+      <header class="top-navbar">
+        <div class="left-nav">
+          <button class="icon-btn toggle-sidebar-btn" id="mobileMenuBtn">
+            <i class="fa-solid fa-bars"></i>
+          </button>
+          <div class="global-search-trigger" id="globalSearchTrigger">
+            <i class="fa-solid fa-magnifying-glass search-icon"></i>
+            <span class="search-placeholder">Search Admission No, Name, Phone, Roll No...</span>
+            <kbd class="search-shortcut">Ctrl + K</kbd>
+          </div>
+        </div>
+
+        <div class="right-nav">
+          <!-- THEME TOGGLE SWITCH -->
+          <button class="icon-btn theme-toggle-btn" id="themeToggleBtn" title="Toggle Light / Dark Mode">
+            <i class="fa-solid fa-moon moon-icon"></i>
+            <i class="fa-solid fa-sun sun-icon"></i>
+          </button>
+
+          <!-- NOTIFICATIONS -->
+          <div class="notification-wrapper" id="notifWrapper">
+            <button class="icon-btn notif-btn" id="notifBtn">
+              <i class="fa-solid fa-bell"></i>
+              <span class="notif-badge">3</span>
+            </button>
+          </div>
+
+
+          <!-- USER PROFILE CARD & LOGOUT -->
+          <div style="display:flex; align-items:center; gap:8px;">
+            <div class="user-profile-header" style="cursor:pointer;" onclick="openAccountMenu()" title="My account">
+              <div class="user-avatar" id="headerUserAvatar" aria-hidden="true">SA</div>
+              <div class="user-info">
+                <span class="user-name">Staff</span>
+                <span class="user-role-badge" id="currentRoleBadge">Signed in</span>
+              </div>
+            </div>
+            <button class="btn btn-secondary" onclick="logoutActiveUser()" style="padding:6px 12px; font-weight:800; font-size:0.8rem; background:rgba(239, 68, 68, 0.15); color:#ef4444; border:1px solid #ef4444;" title="Log Out of ERP Portal">
+              <i class="fa-solid fa-right-from-bracket"></i> Log Out
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <!-- DYNAMIC PAGE BODY CONTAINER -->
+      <main class="content-body" id="contentBody">
+        <!-- Content will be loaded dynamically by App Router -->
+      </main>
+
+      <!-- FOOTER -->
+      <footer class="app-footer">
+        <p>(c) 2026 Madan Mohan Malviya Junior High School ERP - Crafted by Vipin Chauhan</p>
+      </footer>
+    </div>
+  </div>
+
+  <!-- GLOBAL SEARCH MODAL -->
+  <div class="modal-overlay" id="searchModal">
+    <div class="modal-box search-modal-box">
+      <div class="search-input-header">
+        <i class="fa-solid fa-magnifying-glass modal-search-icon"></i>
+        <input type="text" id="globalSearchInput" placeholder="Type Admission No, Name, Parent Phone, Roll No..." autofocus>
+        <button class="close-modal-btn" id="closeSearchModalBtn"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+      <div class="search-results-list" id="searchResultsList">
+        <div class="search-empty-state">
+          <i class="fa-solid fa-id-card"></i>
+          <p>Start typing to search across student profiles, parents, and fee records.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- NFC TAP SCANNER MODAL -->
+  <div class="modal-overlay" id="nfcModal">
+    <div class="modal-box nfc-modal-box">
+      <div class="modal-header">
+        <h3><i class="fa-solid fa-wifi"></i> Hardware NFC Card Tap Simulator</h3>
+        <button class="close-modal-btn" id="closeNfcModalBtn"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+      <div class="nfc-modal-body">
+        <div class="nfc-scanner-waves">
+          <div class="wave wave1"></div>
+          <div class="wave wave2"></div>
+          <div class="wave wave3"></div>
+          <i class="fa-solid fa-id-card nfc-card-icon"></i>
+        </div>
+        <p class="nfc-prompt-text">Tap physical NFC card or select a student NFC UID below:</p>
+        
+        <!-- PRE-CONFIGURED SAMPLE NFC CARDS -->
+        <div class="sample-cards-grid">
+          <button class="sample-nfc-card-btn" data-uid="53:14:17:E0:73:00:01">
+            <span class="card-name">Vedanti Chauhan</span>
+            <span class="card-uid">53:14:17:E0:73:00:01</span>
+            <span class="card-class">Class LKG B</span>
+          </button>
+          <button class="sample-nfc-card-btn" data-uid="04:A5:6B:91:22:7C">
+            <span class="card-name">Aarav Sharma</span>
+            <span class="card-uid">04:A5:6B:91:22:7C</span>
+            <span class="card-class">Class 10 A</span>
+          </button>
+          <button class="sample-nfc-card-btn" data-uid="BB:1A:51:07:99:44">
+            <span class="card-name">Ansh Raj</span>
+            <span class="card-uid">BB:1A:51:07:99:44</span>
+            <span class="card-class">Class LKG B</span>
+          </button>
+          <button class="sample-nfc-card-btn" data-uid="F4:33:99:88:11:00">
+            <span class="card-name">Kavya Gupta</span>
+            <span class="card-uid">F4:33:99:88:11:00</span>
+            <span class="card-class">Class 8 A</span>
+          </button>
+        </div>
+
+        <div class="manual-uid-input-group" style="margin-bottom:14px;">
+          <label for="customUidInput">Or Enter Manual NFC Card UID:</label>
+          <div class="input-with-button">
+            <input type="text" id="customUidInput" placeholder="e.g. 53:14:17:E0:73:00:01" value="53:14:17:E0:73:00:01">
+            <button class="btn btn-primary" id="triggerScanBtn"><i class="fa-solid fa-bolt"></i> Tap Card Now</button>
+          </div>
+        </div>
+
+        <div style="text-align:center; padding-top:12px; border-top:1px solid rgba(255,255,255,0.1);">
+          <button class="btn btn-secondary" style="background:#10b981; color:#ffffff; font-weight:800; border:none; padding:10px 18px; width:100%; border-radius:10px; cursor:pointer;" onclick="openNfcHardwareConfigModal()">
+            <i class="fa-solid fa-microchip"></i>  Connect Physical ESP8266 Hardware Reader (COM Port / Wi-Fi)
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+      <!-- NATIVE MOBILE APP BOTTOM NAVIGATION DOCK -->
+    <nav class="mobile-bottom-nav" id="mobileBottomNav">
+      <a href="#dashboard" class="mobile-nav-item" data-route="dashboard" title="Dashboard">
+        <div class="mobile-nav-icon"><i class="fa-solid fa-house"></i></div>
+        <span>Home</span>
+      </a>
+      <a href="#exams" class="mobile-nav-item" data-route="exams" title="Marks Entry">
+        <div class="mobile-nav-icon"><i class="fa-solid fa-file-pen"></i></div>
+        <span>Marks</span>
+      </a>
+      <a href="#fees" class="mobile-nav-item mobile-nav-fees-btn" data-route="fees" title="Fees Ledger">
+        <div class="mobile-nav-icon"><i class="fa-solid fa-receipt"></i></div>
+        <span>Fees</span>
+      </a>
+      <a href="#attendance" class="mobile-nav-item" data-route="attendance" title="Attendance">
+        <div class="mobile-nav-icon"><i class="fa-solid fa-calendar-check"></i></div>
+        <span>Attendance</span>
+      </a>
+      <button type="button" class="mobile-nav-item" onclick="toggleMobileAppMenu()" title="Full Menu">
+        <div class="mobile-nav-icon"><i class="fa-solid fa-bars"></i></div>
+        <span>Menu</span>
+      </button>
+    </nav>
+
+  <!-- APPLICATION JAVASCRIPT MODULES -->
+<script src="js/erp-cloud-runtime.js?v=20260829_v184"></script>
+<script src="js/mockData.js?v=20260823_v143"></script>
+<script src="js/erpOutbox.js?v=20260829_v184"></script>
+<script src="js/erpV2ReadModel.js?v=20260829_v187"></script>
+<script src="js/app.js?v=20260829_v187"></script>
+<script src="js/cloudSync.js?v=20260829_v184"></script>
+<script src="js/erpMarksRealtime.js?v=20260829_v184"></script>
+
+<!-- PWA Service Worker Registration -->
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', function() {
+      navigator.serviceWorker.register('/sw.js')
+        .then(function(reg) { console.log('PWA Service Worker active:', reg.scope); })
+        .catch(function(err) { console.warn('PWA registration failed:', err); });
+    });
+  }
+</script>
+
+</body>
+</html>

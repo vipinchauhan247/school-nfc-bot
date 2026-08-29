@@ -1,3 +1,66 @@
+
+function canonicalPaymentKey(p) {
+  if (!p) return '';
+  const receipt = String(p.receiptNo || p.receipt || p.billNo || p.id || '')
+    .replace(/^rec[-_\s]?/i, '')
+    .replace(/[^a-z0-9]/gi, '')
+    .trim()
+    .toLowerCase();
+  if (receipt && receipt !== 'undefined' && receipt !== 'null') {
+    return `rec:${receipt}`;
+  }
+  const amt = Number(p.amount || 0);
+  const rawDate = String(p.date || p.paidAt || '').split('T')[0].trim();
+  const month = String(p.month || (Array.isArray(p.paidCurrentMonths) ? p.paidCurrentMonths.join(',') : '')).trim().toLowerCase();
+  const mode = String(p.mode || 'Cash').trim().toLowerCase();
+  return `amt:${amt}|dt:${rawDate}|mo:${month}|m:${mode}`;
+}
+
+/**
+ * Return a duplicate-free view without altering SchoolData. The original
+ * receipt rows remain in cloud for audit/recovery; screens, exports and totals
+ * use this canonical view so punctuation variants do not inflate figures.
+ */
+function getUniquePaymentsView(payments) {
+  const seen = new Set();
+  const unique = [];
+  const cancelledKeys = new Set(
+    (typeof SchoolData !== 'undefined' && Array.isArray(SchoolData?.cancelledReceipts) ? SchoolData.cancelledReceipts : [])
+      .map(item => getReceiptCancellationKey(typeof item === 'string' ? item : item?.receiptNo))
+      .filter(Boolean)
+  );
+  (Array.isArray(payments) ? payments : []).forEach(payment => {
+    if (!payment) return;
+    if (cancelledKeys.has(getReceiptCancellationKey(payment?.receiptNo))) return;
+    const key = canonicalPaymentKey(payment);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    unique.push(payment);
+  });
+  return unique;
+}
+
+function dedupeAllSchoolFeeRecords() {
+  if (!SchoolData || !Array.isArray(SchoolData.students)) return 0;
+  let hiddenDuplicateCount = 0;
+  SchoolData.students.forEach(student => {
+    Object.values(student?.feeRecords || {}).forEach(record => {
+      const rows = Array.isArray(record?.payments) ? record.payments : [];
+      hiddenDuplicateCount += rows.length - getUniquePaymentsView(rows).length;
+    });
+  });
+  return hiddenDuplicateCount;
+}
+
+
+function getSubjectMaxMarksConfig(sub, className, examTerm) {
+  if (typeof getSubjectExamComponentMax === 'function') {
+    const max = getSubjectExamComponentMax(className, sub?.code || sub?.name, examTerm);
+    return { maxTheory: max || 20, maxPractical: 0, maxOral: 0 };
+  }
+  return { maxTheory: 20, maxPractical: 0, maxOral: 0 };
+}
+
 // ---------------------------------------------------------------------------
 // ERP contact / Telegram link roster — @mmmjhschoolbot sheet ONLY
 // https://docs.google.com/spreadsheets/d/1r5yK1Czn7MIY3WN-ngfEDJAC1MVJIgYIjyE8shUsYZU
@@ -17,17 +80,38 @@ const GOOGLE_NFC_SHEET_ID = '1tUTF6GSKXCGEXW8iMibG83lnjoQK8SF_RWbFlJlFxHQ';
 
 async function syncAdmissionNumbersFromGoogleSheets() {
   showNotification('Syncing admissions / Chat IDs from MMMJHS Telegram sheet (not NFC)...', 'info');
+  const beforePayload = JSON.parse(JSON.stringify(buildSchoolDataStoragePayload()));
+  const beforeRows = new Map((SchoolData.students || []).map(student => [student, {
+    admissionNo: String(student.admissionNo || '').trim(),
+    master: JSON.stringify(buildStudentMasterFields(student))
+  }]));
   try {
     const rows = await fetchGoogleContactRowsForSync();
     if (rows.length > 0) {
       const rosterResult = applyRosterIdentityRowsToStudents(rows);
       const result = applyContactUidRowsToStudents(rows, { updateAttendance: false });
-      repairDuplicateNfcUidAssignments();
-      showNotification(`MMMJHS Telegram sheet sync complete: ${rosterResult.updatedAdmissions} admission number(s) repaired, ${result.updated} contact field(s) updated.`, 'success');
+      const records = (SchoolData.students || []).filter(student => {
+        const before = beforeRows.get(student);
+        return !before || before.master !== JSON.stringify(buildStudentMasterFields(student));
+      }).map(student => {
+        const before = beforeRows.get(student);
+        return buildStudentMasterRecord(student, {
+          intent: 'contact_link',
+          action: before ? 'update' : 'create',
+          originalAdmissionNo: before?.admissionNo || ''
+        });
+      });
+      if (records.length) await persistStudentMasterDelta(records, null);
+      showNotification(`MMMJHS Telegram sheet sync saved to cloud: ${rosterResult.updatedAdmissions} admission number(s) repaired, ${result.updated} contact field(s) updated.`, 'success');
       rerenderContactSyncViews();
       return;
     }
-  } catch(e) {}
+  } catch(e) {
+    applySchoolDataStoragePayload(beforePayload, { allowEmpty: true });
+    showNotification(`Google Sheet sync was not saved: ${e?.message || 'cloud rejected the changes.'}`, 'error');
+    rerenderContactSyncViews();
+    return;
+  }
   showNotification('Google Sheet sync unavailable. Admission numbers were not changed.', 'warning');
   rerenderContactSyncViews();
   return;
@@ -40,6 +124,74 @@ function applyGoogleSheetsSyncToStudents() {
   // so older buttons cannot reapply stale sample NFC or attendance data.
   return;
 }
+
+function sortHtmlTable(tableId, colIndex, colType) {
+  const table = document.getElementById(tableId);
+  if (!table) return;
+  const tbody = table.querySelector('tbody');
+  if (!tbody) return;
+  const rows = Array.from(tbody.querySelectorAll('tr'));
+  if (rows.length === 0) return;
+
+  if (!window.tableSortDirections) {
+    window.tableSortDirections = {};
+  }
+  const key = `${tableId}_${colIndex}`;
+  const currentDir = window.tableSortDirections[key] || 'desc';
+  const newDir = currentDir === 'asc' ? 'desc' : 'asc';
+  window.tableSortDirections[key] = newDir;
+
+  // Reset all other headers in this table
+  const headers = table.querySelectorAll('thead th');
+  headers.forEach((th, idx) => {
+    const icon = th.querySelector('i.fa-solid');
+    if (icon) {
+      icon.className = 'fa-solid fa-sort';
+      icon.style.opacity = '0.5';
+    }
+  });
+
+  const getVal = (row) => {
+    const cell = row.cells[colIndex];
+    if (!cell) return '';
+    if (colType === 'number') {
+      const text = cell.textContent.replace(/[^0-9.]/g, '');
+      return parseFloat(text) || 0;
+    }
+    if (colType === 'date') {
+      const text = cell.textContent.trim();
+      const parts = text.split('-');
+      if (parts.length === 3) {
+        return new Date(parts[0], parts[1] - 1, parts[2]).getTime();
+      }
+      return new Date(text).getTime() || 0;
+    }
+    return cell.textContent.trim().toLowerCase();
+  };
+
+  rows.sort((a, b) => {
+    const valA = getVal(a);
+    const valB = getVal(b);
+    if (valA === valB) return 0;
+    if (newDir === 'asc') {
+      return valA > valB ? 1 : -1;
+    } else {
+      return valA < valB ? 1 : -1;
+    }
+  });
+
+  rows.forEach(row => tbody.appendChild(row));
+
+  const activeTh = headers[colIndex];
+  if (activeTh) {
+    const icon = activeTh.querySelector('i.fa-solid');
+    if (icon) {
+      icon.className = newDir === 'asc' ? 'fa-solid fa-sort-up' : 'fa-solid fa-sort-down';
+      icon.style.opacity = '1';
+    }
+  }
+}
+window.sortHtmlTable = sortHtmlTable;
 
 
 /**
@@ -137,18 +289,18 @@ function mergeLocalCancelledReceiptsFromTinyStore() {
 }
 
 function removeCancelledPaymentsFromStudent(student) {
-  if (!student) return;
+  if (!student) return 0;
   const cancelledKeys = new Set((SchoolData.cancelledReceipts || []).map(item =>
     getReceiptCancellationKey(typeof item === 'string' ? item : item?.receiptNo)
   ).filter(Boolean));
-  if (!cancelledKeys.size) return;
-
-  const scrub = fee => {
-    if (!fee || !Array.isArray(fee.payments)) return;
-    fee.payments = fee.payments.filter(payment => !cancelledKeys.has(getReceiptCancellationKey(payment?.receiptNo)));
-  };
-  Object.values(student.feeRecords || {}).forEach(scrub);
-  scrub(student.currentFeeInfo);
+  if (!cancelledKeys.size) return 0;
+  // Never delete a receipt during load/save. Cancelled rows stay in cloud for
+  // audit and are excluded by getUniquePaymentsView() wherever totals render.
+  const rows = [
+    ...Object.values(student.feeRecords || {}).flatMap(fee => Array.isArray(fee?.payments) ? fee.payments : []),
+    ...(Array.isArray(student.currentFeeInfo?.payments) ? student.currentFeeInfo.payments : [])
+  ];
+  return rows.filter(payment => cancelledKeys.has(getReceiptCancellationKey(payment?.receiptNo))).length;
 }
 
 function getSchoolProfile() {
@@ -177,22 +329,29 @@ function absoluteAssetUrl(relativePath) {
 }
 
 /**
- * Logo for printed documents. school_logo.png carries a solid dark background,
- * so the transparent _tc variant is used when no custom logo is uploaded.
+ * Logo for printed documents. Use the bundled clean transparent crest when no
+ * custom logo is uploaded so print previews never contain a broken image.
  */
 function getPrintLogoSource() {
-  const uploaded = String(getSchoolProfile().logoDataUrl || '').trim();
-  return uploaded || absoluteAssetUrl('assets/school_logo_tc.png');
+  // Use the verified transparent colour crest for official printed documents.
+  // Uploaded legacy logos may contain a baked-in checkerboard background.
+  return absoluteAssetUrl('assets/school_logo_reportcard_transparent.png');
 }
 
 function getSchoolLogoHtml(size = 62) {
-  const profile = getSchoolProfile();
-  const logoSrc = profile.logoDataUrl || 'assets/school_logo.png';
+  const logoSrc = getPrintLogoSource();
   return `<img src="${logoSrc}" alt="School Logo" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center; border:2px solid #d4af37; background:#ffffff; padding:2px;">`;
 }
 
+/** Official crest on report-card headers (dark gradient) — transparent logo, no white box. */
+function getReportCardLogoHtml(size = 65) {
+  const logoSrc = absoluteAssetUrl('assets/school_logo_reportcard_transparent.png');
+  return `<img src="${logoSrc}" alt="School Logo" style="width:${size}px; height:${size}px; object-fit:contain; object-position:center center; flex-shrink:0; filter:drop-shadow(0 1px 2px rgba(15,23,42,0.22));">`;
+}
+
 function getTransferCertificateLogoHtml(size = 78) {
-  return `<img src="assets/school_logo_tc.png" alt="School Logo" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center;">`;
+  const logoSrc = getPrintLogoSource();
+  return `<img src="${logoSrc}" alt="School Logo" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:contain; object-position:center center;">`;
 }
 
 function applySchoolProfileToShell() {
@@ -202,16 +361,820 @@ function applySchoolProfileToShell() {
   if (nameEl) nameEl.textContent = profile.shortName;
   if (taglineEl) taglineEl.textContent = profile.address;
   document.title = `${profile.name} ERP | School Management System`;
+  applyWebsiteFavicon();
+}
+
+/** Browser tab icon — uses uploaded school logo, same source as printed documents. */
+function applyWebsiteFavicon() {
+  const logo = getPrintLogoSource();
+  if (!logo) return;
+
+  const mime = logo.startsWith('data:') ? (logo.match(/^data:([^;]+)/)?.[1] || 'image/png') : 'image/png';
+  ['icon', 'shortcut icon', 'apple-touch-icon'].forEach(rel => {
+    let link = document.querySelector(`link[rel="${rel}"]`);
+    if (!link) {
+      link = document.createElement('link');
+      link.rel = rel;
+      document.head.appendChild(link);
+    }
+    link.type = mime;
+    link.href = logo;
+  });
 }
 
 function getClassTeacherForStudent(student) {
-  const cls = (SchoolData.classes || []).find(c => c.name === (student.currentClass || student.class));
-  return cls?.teacher || '';
+  const clsName = student.currentClass || student.class;
+  const sec = normalizeClassSectionKey(student.currentSection || student.section || 'A');
+  const cls = (SchoolData.classes || []).find(c => c.name === clsName);
+  if (!cls) return '';
+  const map = getClassSectionTeachers(cls);
+  return map[sec] || cls.teacher || '';
+}
+
+function getStudentPen(student) {
+  const value = student?.pen ?? student?.PEN ?? student?.penNo ?? student?.permanentEducationNo ?? '';
+  return String(value || '').replace(/\.0$/, '').trim() || '—';
+}
+
+function normalizeClassSectionKey(section) {
+  const sec = String(section || 'A').trim().toUpperCase();
+  return sec || 'A';
+}
+
+function getClassSectionTeachers(classObj) {
+  if (!classObj) return {};
+  const map = { ...(classObj.sectionTeachers || {}) };
+  if (classObj.teacher) {
+    (classObj.sections || ['A']).forEach((section) => {
+      const key = normalizeClassSectionKey(section);
+      if (!map[key]) map[key] = classObj.teacher;
+    });
+  }
+  return map;
+}
+
+function setClassSectionTeacher(classObj, section, teacherName) {
+  if (!classObj) return;
+  if (!classObj.sectionTeachers) classObj.sectionTeachers = {};
+  const key = normalizeClassSectionKey(section);
+  const name = String(teacherName || '').trim();
+  if (name) classObj.sectionTeachers[key] = name;
+  else delete classObj.sectionTeachers[key];
+  const primarySection = normalizeClassSectionKey((classObj.sections || ['A'])[0]);
+  classObj.teacher = classObj.sectionTeachers[primarySection] || Object.values(classObj.sectionTeachers)[0] || '';
+}
+
+function getSessionDateBounds(session) {
+  const match = String(session || SchoolData.activeSession || '2026-27').match(/(\d{4})-(\d{2})/);
+  if (!match) return null;
+  const startYear = parseInt(match[1], 10);
+  const endYear = startYear + 1;
+  return { start: `${startYear}-04-01`, end: `${endYear}-03-31` };
+}
+
+function isDateInSession(dateKey, session) {
+  const bounds = getSessionDateBounds(session);
+  if (!bounds || !dateKey) return true;
+  const day = String(dateKey).slice(0, 10);
+  return day >= bounds.start && day <= bounds.end;
+}
+
+function getStudentAttendanceSummaryForReport(student, session = SchoolData.activeSession) {
+  const logs = student?.attendanceLogs || {};
+  let daysPresent = 0;
+  let daysAbsent = 0;
+  let daysLate = 0;
+  Object.entries(logs).forEach(([dateKey, log]) => {
+    if (!isDateInSession(dateKey, session)) return;
+    const status = String(log?.status || '').trim().toLowerCase();
+    if (status === 'present') daysPresent += 1;
+    else if (status === 'late') { daysPresent += 1; daysLate += 1; }
+    else if (status === 'absent') daysAbsent += 1;
+  });
+  const workingDays = daysPresent + daysAbsent;
+  const percentage = workingDays ? Math.round((daysPresent / workingDays) * 100) : null;
+  return { daysPresent, daysAbsent, daysLate, workingDays, percentage, session };
+}
+
+function formatReportCardAttendanceLine(summary) {
+  if (!summary || !summary.workingDays) {
+    return 'Attendance: Not recorded for this session yet';
+  }
+  const lateNote = summary.daysLate ? ` (incl. ${summary.daysLate} late)` : '';
+  return `Attendance: ${summary.daysPresent} / ${summary.workingDays} working days${lateNote} — ${summary.percentage}%`;
+}
+
+async function persistErpCloudSave(successMessage, options = {}) {
+  saveSchoolDataToStorage({ skipCloudPush: true });
+  try {
+    let result;
+    if (typeof saveSchoolDataToCloudConfirmed === 'function') {
+      result = await saveSchoolDataToCloudConfirmed({ skipMergePull: options.skipMergePull !== false });
+    } else if (typeof pushSchoolDataToCloud === 'function') {
+      result = await pushSchoolDataToCloud({ skipMergePull: options.skipMergePull !== false });
+    } else {
+      throw new Error('Cloud save service is unavailable.');
+    }
+    if (!result || result.ok !== true || !result.savedAt) {
+      throw new Error(result?.error || 'Cloud did not confirm this save.');
+    }
+    if (successMessage) showNotification(`${successMessage} Cloud confirmed.`, 'success');
+    return result;
+  } catch (error) {
+    const message = error?.code === 'ERP_CLOUD_CONFLICT'
+      ? 'Not saved: another device has newer cloud data. Refresh and verify it before trying again.'
+      : `Not saved to cloud: ${error?.message || 'Check the connection and retry.'}`;
+    showNotification(message, 'error');
+    throw error;
+  }
+}
+window.persistErpCloudSave = persistErpCloudSave;
+
+function createErpMutationId() {
+  if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+  return `mut_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
+}
+
+function safeDirectoryDeltaForCloud(delta) {
+  const clean = JSON.parse(JSON.stringify(delta || {}));
+  if (Array.isArray(clean.staffUpserts)) {
+    clean.staffUpserts.forEach(user => {
+      delete user.password;
+      delete user.passwordHash;
+      delete user.password_hash;
+    });
+  }
+  return clean;
+}
+
+function directoryEntityVersionKey(kind, id) {
+  return `${kind}:${String(id || '').trim()}`;
+}
+
+function applyConfirmedDirectoryCatalog(catalog) {
+  if (!catalog || typeof catalog !== 'object') return;
+  const classDeleted = new Set((catalog.classDeletedIds || []).map(String));
+  const subjectDeleted = new Set((catalog.subjectDeletedIds || []).map(String));
+  if (Array.isArray(catalog.classes)) {
+    const byId = new Map((SchoolData.classes || []).map(row => [String(row?.id || ''), row]));
+    classDeleted.forEach(id => byId.delete(id));
+    catalog.classes.forEach(row => byId.set(String(row.id), row));
+    SchoolData.classes = Array.from(byId.values());
+  }
+  if (Array.isArray(catalog.subjects)) {
+    const byId = new Map((SchoolData.subjects || []).map(row => [String(row?.id || ''), row]));
+    subjectDeleted.forEach(id => byId.delete(id));
+    catalog.subjects.forEach(row => byId.set(String(row.id), row));
+    SchoolData.subjects = Array.from(byId.values());
+  }
+  if (catalog.entityVersions && typeof catalog.entityVersions === 'object') {
+    SchoolData.directoryEntityVersions = { ...(SchoolData.directoryEntityVersions || {}), ...catalog.entityVersions };
+  }
+  if (catalog.mutationIds && typeof catalog.mutationIds === 'object') {
+    SchoolData.directoryMutationIds = { ...(SchoolData.directoryMutationIds || {}), ...catalog.mutationIds };
+  }
+  if (catalog.tombstones && typeof catalog.tombstones === 'object') {
+    SchoolData.directoryTombstones = {
+      ...(SchoolData.directoryTombstones || {}),
+      classes: { ...(catalog.tombstones.classes || {}) },
+      subjects: { ...(catalog.tombstones.subjects || {}) }
+    };
+  }
+}
+
+async function persistDirectoryDelta(delta, successMessage, options = {}) {
+  const body = safeDirectoryDeltaForCloud(delta);
+  body.mutationId = body.mutationId || createErpMutationId();
+  const versionedScope = ['classAdmin', 'subjectAdmin', 'classTeachers'].includes(String(body.scope || ''));
+  if (versionedScope) {
+    body.clientUpdatedAt = body.clientUpdatedAt || new Date().toISOString();
+    body.expectedVersions = { ...(body.expectedVersions || {}) };
+    const classIds = [...(body.classUpserts || []).map(row => row?.id), ...(body.classDeletedIds || []), ...(body.restoreClassIds || [])];
+    const subjectIds = [...(body.subjectUpserts || []).map(row => row?.id), ...(body.subjectDeletedIds || []), ...(body.restoreSubjectIds || [])];
+    classIds.filter(Boolean).forEach(id => {
+      const key = directoryEntityVersionKey('class', id);
+      if (body.expectedVersions[key] === undefined) body.expectedVersions[key] = String(SchoolData.directoryEntityVersions?.[key] || '');
+    });
+    subjectIds.filter(Boolean).forEach(id => {
+      const key = directoryEntityVersionKey('subject', id);
+      if (body.expectedVersions[key] === undefined) body.expectedVersions[key] = String(SchoolData.directoryEntityVersions?.[key] || '');
+    });
+  }
+  saveSchoolDataToStorage({ skipCloudPush: true });
+  try {
+    const result = await callErpSecurityApi('saveDirectoryDelta', { body });
+    applyConfirmedDirectoryCatalog(result?.catalog);
+    saveSchoolDataToStorage({ skipCloudPush: true });
+    if (typeof window.saveCloudDisplayCache === 'function' && typeof buildSchoolDataStoragePayload === 'function') {
+      try { await window.saveCloudDisplayCache(buildSchoolDataStoragePayload()); } catch (e) {}
+    }
+    if (result?.savedAt && typeof window.recordCloudMutationRevision === 'function') {
+      window.recordCloudMutationRevision(result.savedAt);
+    }
+    if (successMessage) showNotification(`${successMessage} Cloud confirmed.`, 'success');
+    return result;
+  } catch (error) {
+    const permanent = [400, 401, 403, 404, 409].includes(Number(error?.status || 0));
+    if (options.allowQueue !== false && !permanent && window.ERPOutbox?.enqueue) {
+      await window.ERPOutbox.enqueue('saveDirectoryDelta', body);
+      showNotification(`${successMessage || 'Change saved on this device.'} Waiting for cloud connection; it will retry automatically.`, 'warning');
+      return { ok: true, queued: true, mutationId: body.mutationId };
+    }
+    showNotification(`Directory change was not saved: ${error?.message || 'cloud rejected the change.'}`, 'error');
+    throw error;
+  }
+}
+window.persistDirectoryDelta = persistDirectoryDelta;
+
+const STUDENT_MASTER_CLIENT_FIELDS = Object.freeze([
+  'admissionNo', 'name', 'gender', 'dob', 'bloodGroup', 'aadhaar', 'caste', 'nfcUid',
+  'parentName', 'motherName', 'parentPhone', 'parentEmail', 'telegramChatId',
+  'schoolTelegramChatId', 'schoolBotChatId', 'telegramUserName', 'address',
+  'emergencyContact', 'previousSchool', 'medicalNotes', 'pen', 'PEN', 'dateOfAdmission',
+  'status', 'currentClass', 'currentSection', 'currentRollNo', 'class', 'section',
+  'rollNo', 'photo', 'photoDataUrl', 'academicSession', 'customAttendance',
+  'reportCardRemarks', 'customReportRemarks', 'leftAt', 'leftReason'
+]);
+
+function legacyStudentMasterId(seed) {
+  const source = `${String(window.ERP_CLOUD_SCHOOL_ID || 'mmm-jhs').trim()}|${String(seed || '').trim().toLowerCase()}`;
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (let index = 0; index < source.length; index += 1) {
+    const code = source.charCodeAt(index);
+    first ^= code;
+    first = Math.imul(first, 0x01000193);
+    second ^= code + index;
+    second = Math.imul(second, 0x85ebca6b);
+  }
+  return `stu-legacy-${(first >>> 0).toString(16).padStart(8, '0')}${(second >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+function ensureStudentMasterId(student, seedAdmissionNo) {
+  if (!student || typeof student !== 'object') return '';
+  let id = String(student._studentId || student.studentId || '').trim();
+  if (!id) {
+    const seed = String(seedAdmissionNo || student.admissionNo || '').trim();
+    id = seed ? legacyStudentMasterId(seed) : `stu-${createErpMutationId()}`;
+    student._studentId = id;
+  }
+  return id;
+}
+
+function buildStudentMasterFields(student) {
+  const master = {};
+  STUDENT_MASTER_CLIENT_FIELDS.forEach(field => {
+    if (student?.[field] === undefined) return;
+    const value = student[field];
+    if ((field === 'photo' || field === 'photoDataUrl') && String(value || '').startsWith('data:')) return;
+    master[field] = value;
+  });
+  master.admissionNo = String(student?.admissionNo || '').trim();
+  master.name = String(student?.name || '').trim();
+  return master;
+}
+
+function buildStudentMasterRecord(student, options = {}) {
+  const originalAdmissionNo = String(options.originalAdmissionNo || student?.admissionNo || '').trim();
+  const clientUpdatedAt = String(options.clientUpdatedAt || new Date().toISOString());
+  const studentId = ensureStudentMasterId(student, originalAdmissionNo);
+  const expectedClientUpdatedAt = String(options.expectedClientUpdatedAt ?? student._studentMasterClientUpdatedAt ?? '').trim();
+  student._studentMasterClientUpdatedAt = clientUpdatedAt;
+  return {
+    action: options.action || 'update',
+    intent: options.intent || 'general',
+    studentId,
+    originalAdmissionNo,
+    clientUpdatedAt,
+    expectedClientUpdatedAt,
+    master: buildStudentMasterFields(student),
+    sessionPatches: options.sessionPatches || {},
+    feeSessionInitializers: options.feeSessionInitializers || {}
+  };
+}
+
+function captureStudentMasterChangeSet() {
+  return {
+    payload: JSON.parse(JSON.stringify(buildSchoolDataStoragePayload())),
+    beforeByStudent: new Map((SchoolData.students || []).map(student => [student, {
+      admissionNo: String(student.admissionNo || '').trim(),
+      master: JSON.stringify(buildStudentMasterFields(student))
+    }]))
+  };
+}
+
+function buildChangedStudentMasterRecords(tracker, options = {}) {
+  return (SchoolData.students || []).filter(student => {
+    const before = tracker?.beforeByStudent?.get(student);
+    return !before || before.master !== JSON.stringify(buildStudentMasterFields(student));
+  }).map(student => {
+    const before = tracker?.beforeByStudent?.get(student);
+    return buildStudentMasterRecord(student, {
+      intent: options.intent || 'general',
+      action: before ? 'update' : 'create',
+      originalAdmissionNo: before?.admissionNo || ''
+    });
+  });
+}
+
+async function persistStudentMasterDelta(records, successMessage, options = {}) {
+  const body = {
+    mutationId: options.mutationId || createErpMutationId(),
+    records: Array.isArray(records) ? records : [],
+    promotion: options.promotion === true,
+    activeSession: options.activeSession || '',
+    sessionUpserts: options.sessionUpserts || []
+  };
+  try {
+    const result = await callErpSecurityApi('saveStudentMasterDelta', { body });
+    if (result?.savedAt && typeof window.recordCloudMutationRevision === 'function') {
+      window.recordCloudMutationRevision(result.savedAt);
+    }
+    if (Array.isArray(result?.staleSkipped) && result.staleSkipped.length) {
+      throw new Error(`${result.staleSkipped.length} student record(s) were newer in cloud and were not overwritten.`);
+    }
+    saveSchoolDataToStorage({ skipCloudPush: true });
+    if (successMessage) showNotification(`${successMessage} Cloud confirmed.`, 'success');
+    return result;
+  } catch (error) {
+    showNotification(`Student change was not saved: ${error?.message || 'cloud rejected the change.'}`, 'error');
+    throw error;
+  }
+}
+window.persistStudentMasterDelta = persistStudentMasterDelta;
+
+function getConfigurationVersionKey(scope, entityKey) {
+  return `${String(scope || '').trim()}:${String(entityKey || '').trim()}`;
+}
+
+function getConfigurationVersion(scope, entityKey) {
+  return String(SchoolData.configurationVersions?.[getConfigurationVersionKey(scope, entityKey)] || '');
+}
+
+async function persistConfigurationDelta(scope, entityKey, value, successMessage) {
+  const mutationId = createErpMutationId();
+  const clientUpdatedAt = new Date().toISOString();
+  const result = await callErpSecurityApi('saveConfigurationDelta', {
+    body: {
+      mutationId,
+      scope,
+      entityKey,
+      expectedVersion: getConfigurationVersion(scope, entityKey),
+      clientUpdatedAt,
+      value
+    }
+  });
+  const versionKey = getConfigurationVersionKey(scope, entityKey);
+  SchoolData.configurationVersions = {
+    ...(SchoolData.configurationVersions || {}),
+    [versionKey]: String(result.version || `${clientUpdatedAt}:${mutationId}`)
+  };
+  SchoolData.configurationMutationIds = {
+    ...(SchoolData.configurationMutationIds || {}),
+    [versionKey]: [...(SchoolData.configurationMutationIds?.[versionKey] || []), mutationId].slice(-50)
+  };
+  if (result?.savedAt && typeof window.recordCloudMutationRevision === 'function') window.recordCloudMutationRevision(result.savedAt);
+  if (successMessage) showNotification(`${successMessage} Cloud confirmed.`, 'success');
+  return result;
+}
+window.persistConfigurationDelta = persistConfigurationDelta;
+
+function getExamConfigurationTermGroup(examTerm) {
+  return ['ut1', 'ut2', 'half_yearly'].includes(String(examTerm || '').trim()) ? 'term1' : 'term2';
+}
+
+function getExamConfigurationVersionKey(input) {
+  return input?.scope === 'universalWeightage'
+    ? 'universalWeightage:default'
+    : `classTermGroup:${String(input?.className || '').trim()}:${String(input?.termGroup || '').trim()}`;
+}
+
+function applyConfirmedExamConfiguration(input, configuration) {
+  if (input.scope === 'universalWeightage') {
+    SchoolData.weightageRules = {
+      ...(SchoolData.weightageRules || {}),
+      default: { ...(configuration?.weightage || input.weightage || {}) }
+    };
+    return;
+  }
+  const className = String(configuration?.className || input.className || '').trim();
+  if (!className) throw new Error('Cloud returned an invalid exam class.');
+  if (!SchoolData.examSubjectConfigs || typeof SchoolData.examSubjectConfigs !== 'object') SchoolData.examSubjectConfigs = {};
+  const classConfig = { ...(SchoolData.examSubjectConfigs[className] || {}) };
+  Object.entries(configuration?.terms || {}).forEach(([term, rows]) => {
+    classConfig[term] = JSON.parse(JSON.stringify(Array.isArray(rows) ? rows : []));
+  });
+  SchoolData.examSubjectConfigs = { ...SchoolData.examSubjectConfigs, [className]: classConfig };
+}
+
+async function persistExamConfigurationDelta(input, successMessage) {
+  const mutationId = createErpMutationId();
+  const clientUpdatedAt = new Date().toISOString();
+  const versionKey = getExamConfigurationVersionKey(input);
+  const body = {
+    ...JSON.parse(JSON.stringify(input || {})),
+    mutationId,
+    clientUpdatedAt,
+    expectedVersion: String(SchoolData.examConfigurationVersions?.[versionKey] || '')
+  };
+  try {
+    const result = await callErpSecurityApi('saveExamConfigurationDelta', { body });
+    applyConfirmedExamConfiguration(input, result?.configuration || {});
+    SchoolData.examConfigurationVersions = {
+      ...(SchoolData.examConfigurationVersions || {}),
+      [versionKey]: String(result?.version || `${clientUpdatedAt}:${mutationId}`)
+    };
+    SchoolData.examConfigurationMutationIds = {
+      ...(SchoolData.examConfigurationMutationIds || {}),
+      [versionKey]: [...(SchoolData.examConfigurationMutationIds?.[versionKey] || []), mutationId].slice(-50)
+    };
+    if (result?.savedAt && typeof window.recordCloudMutationRevision === 'function') window.recordCloudMutationRevision(result.savedAt);
+    saveSchoolDataToStorage({ skipCloudPush: true });
+    if (typeof saveCloudDisplayCache === 'function') saveCloudDisplayCache().catch(() => {});
+    if (successMessage) showNotification(`${successMessage} Cloud confirmed.`, 'success');
+    return result;
+  } catch (error) {
+    const message = Number(error?.status || 0) === 409
+      ? 'Exam configuration was not saved because another device changed it. Refresh and verify before retrying.'
+      : `Exam configuration was not saved: ${error?.message || 'cloud rejected the change.'}`;
+    showNotification(message, 'error');
+    throw error;
+  }
+}
+window.persistExamConfigurationDelta = persistExamConfigurationDelta;
+
+async function saveStudentReportCardField(admissionNo, field, value) {
+  const student = (SchoolData.students || []).find(s => String(s.admissionNo) === String(admissionNo));
+  if (!student || !['customAttendance', 'reportCardRemarks'].includes(field)) return false;
+  const before = JSON.parse(JSON.stringify(student));
+  student[field] = String(value || '').replace(/\u00a0/g, ' ').trim();
+  const label = field === 'customAttendance' ? 'Report-card attendance saved.' : "Teacher's remarks saved.";
+  try {
+    await persistStudentMasterDelta([buildStudentMasterRecord(student, { intent: 'report_card', originalAdmissionNo: admissionNo })], label);
+  } catch (error) {
+    Object.keys(student).forEach(key => { delete student[key]; });
+    Object.assign(student, before);
+    throw error;
+  }
+  return true;
+}
+
+function saveStudentCustomAttendance(admissionNo, value) {
+  return saveStudentReportCardField(admissionNo, 'customAttendance', value);
+}
+function saveStudentReportCardRemarks(admissionNo, value) {
+  return saveStudentReportCardField(admissionNo, 'reportCardRemarks', value);
+}
+window.saveStudentCustomAttendance = saveStudentCustomAttendance;
+window.saveStudentReportCardRemarks = saveStudentReportCardRemarks;
+
+function getStudentAttendanceSummaryForDateRange(student, fromKey, toKey, session = SchoolData.activeSession) {
+  const logs = student?.attendanceLogs || {};
+  let daysPresent = 0;
+  let daysAbsent = 0;
+  let daysLate = 0;
+  Object.entries(logs).forEach(([dateKey, log]) => {
+    if (!isDateInSession(dateKey, session)) return;
+    if (!dateKeyInReportsRange(dateKey, fromKey, toKey)) return;
+    const status = String(log?.status || '').trim().toLowerCase();
+    if (status === 'present') daysPresent += 1;
+    else if (status === 'late') { daysPresent += 1; daysLate += 1; }
+    else if (status === 'absent') daysAbsent += 1;
+  });
+  const workingDays = daysPresent + daysAbsent;
+  const percentage = workingDays ? Math.round((daysPresent / workingDays) * 100) : null;
+  return { daysPresent, daysAbsent, daysLate, workingDays, percentage, session, fromKey, toKey };
+}
+
+function dateKeyInReportsRange(dateKey, fromKey, toKey) {
+  const d = String(dateKey || '').slice(0, 10);
+  if (!d) return false;
+  if (fromKey && d < fromKey) return false;
+  if (toKey && d > toKey) return false;
+  return true;
+}
+
+window.reportCardPrintOrientation = window.reportCardPrintOrientation || 'portrait';
+
+function printReportCard(elementId, mode = 'colour') {
+  const isLetterhead = mode === 'letterhead';
+  const orientation = window.reportCardPrintOrientation || 'portrait';
+  const isLandscape = orientation === 'landscape';
+  const area = document.getElementById(elementId || 'printableSingleSheetArea');
+  if (!area) return;
+
+  const printWindow = window.open('', '_blank');
+  const printHtml = `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Academic Report Card</title>
+        <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@600;700&family=Inter:wght@400;600;700;800&family=Montserrat:wght@800;900&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet">
+        <style>
+          @page {
+            size: A4 ${isLandscape ? 'landscape' : 'portrait'};
+            margin: 0;
+          }
+          * { box-sizing: border-box; }
+          body {
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            padding: 0;
+            background: #ffffff !important;
+            color: #0f172a !important;
+            -webkit-print-color-adjust: exact !important;
+            print-color-adjust: exact !important;
+          }
+          img { max-width: 100%; }
+          .no-print { display: none !important; }
+          #printableSingleSheetArea {
+            width: ${isLandscape ? '297mm' : '210mm'} !important;
+            height: ${isLandscape ? '210mm' : '297mm'} !important;
+            margin: 0 auto !important;
+            position: relative !important;
+            background: #ffffff !important;
+            box-shadow: none !important;
+            overflow: hidden !important;
+          }
+          .rc-content-wrapper {
+            position: relative !important;
+            z-index: 2 !important;
+            width: 100% !important;
+            height: 100% !important;
+            padding: ${isLetterhead ? '40mm 20mm 15mm 20mm' : '15mm 20mm 15mm 20mm'} !important;
+            display: flex !important;
+            flex-direction: column !important;
+            justify-content: space-between !important;
+            box-sizing: border-box !important;
+          }
+          ${isLetterhead ? `
+            /* Letterhead Mode: Hide digital school logo/title and decorative outer border SVG */
+            svg { display: none !important; }
+            .report-card-print-header { display: none !important; }
+          ` : ''}
+        </style>
+      </head>
+      <body>
+        <div id="printableSingleSheetArea" class="${isLetterhead ? 'letterhead-mode' : 'colour-mode'}">
+          ${area.innerHTML}
+        </div>
+        <script>
+          window.onload = function() {
+            setTimeout(function() {
+              window.focus();
+              window.print();
+              setTimeout(function() { window.close(); }, 500);
+            }, 300);
+          };
+        </script>
+      </body>
+    </html>
+  `;
+
+  printWindow.document.open();
+  printWindow.document.write(printHtml);
+  printWindow.document.close();
+}
+
+window._reportCardMode = 'colour'; // 'colour' or 'letterhead'
+
+function toggleReportCardTemplateMode() {
+  const targetArea = document.getElementById('printableSingleSheetArea');
+  const toggleBtn = document.getElementById('btnToggleReportCardTemplate');
+  if (!targetArea) return;
+
+  if (window._reportCardMode === 'colour') {
+    window._reportCardMode = 'letterhead';
+    targetArea.classList.add('letterhead-active');
+    if (toggleBtn) {
+      toggleBtn.textContent = '🎨 Switch to Colour Print';
+      toggleBtn.setAttribute('aria-pressed', 'true');
+      toggleBtn.style.background = '#0284c7';
+    }
+    showNotification('Switched to Letterhead Mode (School logo, school name, border and watermark hidden)', 'info');
+  } else {
+    window._reportCardMode = 'colour';
+    targetArea.classList.remove('letterhead-active');
+    if (toggleBtn) {
+      toggleBtn.textContent = '📄 Switch to Letterhead Print';
+      toggleBtn.setAttribute('aria-pressed', 'false');
+      toggleBtn.style.background = '#334155';
+    }
+    showNotification('Switched to Colour Mode (Full digital header, emblem & border visible)', 'info');
+  }
+}
+
+function printReportCard(elementId) {
+  const orientation = window.reportCardPrintOrientation || 'portrait';
+  const isLandscape = orientation === 'landscape';
+  const isLetterhead = window._reportCardMode === 'letterhead';
+  const area = document.getElementById(elementId || 'printableSingleSheetArea');
+  if (!area) return;
+
+  const printWindow = window.open('', '_blank');
+  const printHtml = `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Academic Report Card</title>
+        <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@600;700&family=Inter:wght@400;500;600;700;800&family=Montserrat:wght@800;900&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet">
+        <style>
+          @page {
+            size: A4 ${isLandscape ? 'landscape' : 'portrait'};
+            margin: 0;
+          }
+          * { box-sizing: border-box; }
+          body {
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            padding: 0;
+            background: #ffffff !important;
+            color: #0f172a !important;
+            -webkit-print-color-adjust: exact !important;
+            print-color-adjust: exact !important;
+          }
+          img { max-width: 100%; }
+          .no-print { display: none !important; }
+          #printableSingleSheetArea {
+            width: ${isLandscape ? '297mm' : '210mm'} !important;
+            height: ${isLandscape ? '210mm' : '297mm'} !important;
+            margin: 0 auto !important;
+            position: relative !important;
+            background: #ffffff !important;
+            box-shadow: none !important;
+            overflow: hidden !important;
+          }
+          .rc-content-wrapper {
+            position: relative !important;
+            z-index: 2 !important;
+            width: 100% !important;
+            height: 100% !important;
+            padding: ${isLetterhead ? '42mm 18mm 12mm 18mm' : '12mm 18mm 12mm 18mm'} !important;
+            display: flex !important;
+            flex-direction: column !important;
+            justify-content: space-between !important;
+            box-sizing: border-box !important;
+          }
+          ${isLetterhead ? `
+            /* Letterhead Mode: Hide digital header, outer decorative border and watermark */
+            .rc-vector-border { display: none !important; }
+            .report-card-print-header { display: none !important; }
+            .rc-watermark-logo { display: none !important; }
+          ` : ''}
+        </style>
+      </head>
+      <body>
+        <div id="printableSingleSheetArea" class="${isLetterhead ? 'letterhead-active' : ''}">
+          ${area.innerHTML}
+        </div>
+        <script>
+          window.onload = function() {
+            setTimeout(function() {
+              window.focus();
+              window.print();
+              setTimeout(function() { window.close(); }, 500);
+            }, 300);
+          };
+        </script>
+      </body>
+    </html>
+  `;
+
+  printWindow.document.open();
+  printWindow.document.write(printHtml);
+  printWindow.document.close();
+}
+
+function getReportCardPrintFooterHtml(buttonLabel, buttonStyle) {
+  const orient = window.reportCardPrintOrientation || 'portrait';
+  window._reportCardMode = 'colour';
+
+  return `
+    <div style="display:flex; justify-content:space-between; align-items:center; padding:14px 24px; background:#f8fafc; border-top:1px solid #e2e8f0; flex-wrap:wrap; gap:12px;" class="no-print">
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="document.getElementById('reportPreviewModal').remove()" style="padding:10px 18px; font-weight:800; background:#475569; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-xmark"></i> Close Preview</button>
+        <button class="btn btn-secondary" onclick="openUploadSignaturesModal()" style="padding:10px 18px; font-weight:800; background:#0284c7; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-signature"></i> Signatures / Stamp</button>
+      </div>
+      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+        <button id="btnToggleReportCardTemplate" class="btn btn-secondary" onclick="toggleReportCardTemplateMode()" aria-pressed="false" style="padding:10px 18px; font-weight:800; background:#334155; color:#ffffff; border:none; border-radius:8px; cursor:pointer;" title="Switch between Colour Print and Letterhead Template">📄 Switch to Letterhead Print</button>
+        
+        <label for="reportCardOrientationSelect" style="font-weight:700; font-size:0.85rem; color:#334155; margin-left:4px;">Layout:</label>
+        <select id="reportCardOrientationSelect" class="session-dropdown" style="width:145px; font-weight:700;" onchange="window.reportCardPrintOrientation=this.value">
+          <option value="portrait" ${orient === 'portrait' ? 'selected' : ''}>A4 Portrait</option>
+          <option value="landscape" ${orient === 'landscape' ? 'selected' : ''}>A4 Landscape</option>
+        </select>
+
+        <button class="btn btn-primary" onclick="printReportCard('printableSingleSheetArea')" style="padding:10px 24px; font-weight:800; ${buttonStyle} border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-print"></i> ${buttonLabel || 'Print Report Card'}</button>
+      </div>
+    </div>`;
+}
+
+
+function getReportCardStudentInfoHtml(student, meta = {}) {
+  const cls = meta.cls || student.currentClass || student.class || '';
+  const sec = meta.sec || student.currentSection || student.section || '';
+  const roll = meta.roll || student.currentRollNo || student.rollNo || '—';
+  const attendanceLine = meta.attendanceLine || '';
+  const classTeacherName = meta.classTeacherName || '';
+  const accent = meta.accent || '#4f46e5';
+  const photoSize = meta.photoSize || 58;
+  const pen = getStudentPen(student);
+  const caste = String(student?.caste || '').trim();
+  const address = String(student?.address || '').trim();
+  const shortAddress = address.length > 72 ? `${address.slice(0, 69)}…` : address;
+
+  return `
+    <div class="rc-student-info-panel" style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:12px 16px; margin-bottom:14px; display:flex; align-items:flex-start; justify-content:space-between; flex-wrap:wrap; gap:12px; font-size:0.92rem; line-height:1.55;">
+      <div style="display:flex; align-items:center; gap:12px; min-width:240px; flex:1;">
+        ${getStudentDirectoryPhotoHtml(student, photoSize)}
+        <div>
+          <h3 style="font-size:1.22rem; margin:0 0 4px 0; color:#0f172a; font-weight:800;">${escapeHtml(student.name || '')}</h3>
+          <div style="display:flex; flex-wrap:wrap; gap:8px 14px; font-size:0.9rem; color:#334155;">
+            <span><strong>Adm No:</strong> <code style="color:${accent}; font-weight:800;">${escapeHtml(String(student.admissionNo || ''))}</code></span>
+            <span><strong>PEN:</strong> <code style="color:#7c3aed; font-weight:800;">${escapeHtml(pen)}</code></span>
+            <span><strong>Class:</strong> <strong style="color:${accent};">${escapeHtml(cls)} - ${escapeHtml(sec)}</strong></span>
+            <span><strong>Roll:</strong> ${escapeHtml(String(roll))}</span>
+          </div>
+        </div>
+      </div>
+      <div style="font-size:0.9rem; color:#1e293b; min-width:220px; flex:1;">
+        <div><strong>Father:</strong> ${escapeHtml(student.parentName || '—')}</div>
+        <div><strong>Mother:</strong> ${escapeHtml(student.motherName || 'N/A')}</div>
+        <div><strong>DOB:</strong> <strong style="color:#0284c7;">${escapeHtml(formatStudentDob(student))}</strong>${caste ? ` | <strong>Caste:</strong> ${escapeHtml(caste)}` : ''}</div>
+        ${shortAddress ? `<div><strong>Address:</strong> ${escapeHtml(shortAddress)}</div>` : ''}
+        ${attendanceLine ? `<div><strong>${escapeHtml(attendanceLine)}</strong></div>` : ''}
+        ${classTeacherName ? `<div><strong>Class Teacher:</strong> ${escapeHtml(classTeacherName)}</div>` : ''}
+      </div>
+    </div>`;
 }
 
 function getTeacherSignatureByName(teacherName) {
   const teacher = (SchoolData.teachers || []).find(t => String(t.name || '').trim().toLowerCase() === String(teacherName || '').trim().toLowerCase());
   return teacher?.signatureDataUrl || '';
+}
+
+function compressImageToDataUrl(file, maxWidth = 300, maxHeight = 300) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = function (e) {
+      const img = new Image();
+      img.onload = function () {
+        const canvas = document.createElement('canvas');
+        let width = img.width;
+        let height = img.height;
+
+        if (width > height) {
+          if (width > maxWidth) {
+            height = Math.round((height * maxWidth) / width);
+            width = maxWidth;
+          }
+        } else {
+          if (height > maxHeight) {
+            width = Math.round((width * maxHeight) / height);
+            height = maxHeight;
+          }
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+
+        // Compress to JPEG with 0.8 quality (keeps file extremely light, under 15KB)
+        resolve(canvas.toDataURL('image/jpeg', 0.8));
+      };
+      img.onerror = reject;
+      img.src = e.target.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function convert12hTo24h(time12h) {
+  if (!time12h) return "08:00";
+  const match = time12h.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i);
+  if (!match) return "08:00";
+  let hours = parseInt(match[1]);
+  const minutes = match[2];
+  const ampm = match[3] ? match[3].toUpperCase() : 'AM';
+  if (ampm === 'PM' && hours < 12) hours += 12;
+  if (ampm === 'AM' && hours === 12) hours = 0;
+  return `${String(hours).padStart(2, '0')}:${minutes}`;
+}
+
+function convert24hTo12h(time24h) {
+  if (!time24h) return "08:00 AM";
+  const match = time24h.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return "08:00 AM";
+  let hours = parseInt(match[1]);
+  const minutes = match[2];
+  const ampm = hours >= 12 ? 'PM' : 'AM';
+  hours = hours % 12;
+  if (hours === 0) hours = 12;
+  return `${String(hours).padStart(2, '0')}:${minutes} ${ampm}`;
 }
 
 function fileToDataUrl(file) {
@@ -229,14 +1192,18 @@ function previewSelectedImage(input, previewId) {
   if (!file || !preview) return;
   const reader = new FileReader();
   reader.onload = () => {
-    preview.src = reader.result;
-    preview.style.display = 'block';
+    if (preview.tagName === 'IMG') {
+      preview.src = reader.result;
+      preview.style.display = 'block';
+      return;
+    }
+    preview.innerHTML = `<img src="${reader.result}" alt="" style="width:58px;height:58px;border-radius:50%;object-fit:cover;border:2px solid #38bdf8;display:block;">`;
   };
   reader.readAsDataURL(file);
 }
 
-// DEFAULT SCHOOL PERIOD TIMING CONFIGURATION
-if (!SchoolData.periodSettings) {
+// DEFAULT SCHOOL PERIOD TIMING CONFIGURATION ({} from cloud is invalid — must be array)
+if (!Array.isArray(SchoolData.periodSettings) || !SchoolData.periodSettings.length) {
   SchoolData.periodSettings = [
     { periodNo: 1, name: "Period 1", startTime: "08:30 AM", endTime: "09:15 AM", durationMins: 45, isBreak: false },
     { periodNo: 2, name: "Period 2", startTime: "09:15 AM", endTime: "10:00 AM", durationMins: 45, isBreak: false },
@@ -254,7 +1221,7 @@ if (!SchoolData.userPermissions) {
     "Super Admin": { weightage: true, teachers: true, students: true, fees: true, reportCards: true, timetable: true, attendance: true },
     "Principal": { weightage: true, teachers: true, students: true, fees: true, reportCards: true, timetable: true, attendance: true },
     "Accountant": { weightage: false, teachers: false, students: true, fees: true, reportCards: false, timetable: false, attendance: true },
-    "Class Teacher": { weightage: true, teachers: false, students: true, fees: false, reportCards: true, timetable: true, attendance: true },
+    "Class Teacher": { weightage: false, teachers: false, students: true, fees: false, reportCards: true, timetable: true, attendance: true },
     "Exam Incharge": { weightage: true, teachers: false, students: true, fees: false, reportCards: true, timetable: false, attendance: true }
   };
 }
@@ -273,10 +1240,36 @@ if (!SchoolData.weightageRules) {
 if (!SchoolData.examSubjectConfigs) {
   SchoolData.examSubjectConfigs = {};
 }
+if (!SchoolData.attendance || typeof SchoolData.attendance !== 'object') SchoolData.attendance = {};
+if (!SchoolData.rolePermissionTemplates || typeof SchoolData.rolePermissionTemplates !== 'object') SchoolData.rolePermissionTemplates = {};
+if (!SchoolData.teacherPeriodMatrices || typeof SchoolData.teacherPeriodMatrices !== 'object') SchoolData.teacherPeriodMatrices = {};
+if (!SchoolData.configurationVersions || typeof SchoolData.configurationVersions !== 'object') SchoolData.configurationVersions = {};
+if (!SchoolData.configurationMutationIds || typeof SchoolData.configurationMutationIds !== 'object') SchoolData.configurationMutationIds = {};
+if (!SchoolData.examConfigurationVersions || typeof SchoolData.examConfigurationVersions !== 'object') SchoolData.examConfigurationVersions = {};
+if (!SchoolData.examConfigurationMutationIds || typeof SchoolData.examConfigurationMutationIds !== 'object') SchoolData.examConfigurationMutationIds = {};
+if (!SchoolData.directoryEntityVersions || typeof SchoolData.directoryEntityVersions !== 'object') SchoolData.directoryEntityVersions = {};
+if (!SchoolData.directoryMutationIds || typeof SchoolData.directoryMutationIds !== 'object') SchoolData.directoryMutationIds = {};
+if (!SchoolData.directoryTombstones || typeof SchoolData.directoryTombstones !== 'object') SchoolData.directoryTombstones = {};
+
+function padDatePart(value) {
+  return String(value || '').padStart(2, '0');
+}
+
+function studentDobRaw(student) {
+  if (student == null) return '';
+  if (typeof student !== 'object') return student;
+  return student.dob || student.dateOfBirth || student.date_of_birth || '';
+}
+
+function formatStudentDob(student) {
+  return formatDobToDDMMYYYY(studentDobRaw(student));
+}
 
 function formatDobToDDMMYYYY(dobStr) {
   if (!dobStr || dobStr === 'N/A') return 'N/A';
   const str = String(dobStr).trim();
+  if (!str || str === 'N/A') return 'N/A';
+
   if (/^\d{5}$/.test(str)) {
     const serial = parseInt(str, 10);
     if (serial > 25000 && serial < 80000) {
@@ -288,17 +1281,30 @@ function formatDobToDDMMYYYY(dobStr) {
       return `${dd}/${mm}/${yyyy}`;
     }
   }
-  if (str.includes('/')) return str;
-  if (str.includes('-')) {
-    const parts = str.split('-');
-    if (parts.length === 3) {
-      if (parts[0].length === 4) {
-        return `${parts[2]}/${parts[1]}/${parts[0]}`;
-      } else if (parts[2].length === 4) {
-        return `${parts[0]}/${parts[1]}/${parts[2]}`;
-      }
-    }
+
+  // Lean/cloud ISO dates were split on '-' as 2012-12-19T00:00:00.000Z →
+  // 19T00:00:00.000Z/12/2012. Repair that and any raw ISO datetime.
+  const corruptedIso = str.match(/^(\d{1,2})T[\d:.]+Z\/(\d{1,2})\/(\d{4})$/i);
+  if (corruptedIso) {
+    return `${padDatePart(corruptedIso[1])}/${padDatePart(corruptedIso[2])}/${corruptedIso[3]}`;
   }
+
+  const dmySlash = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (dmySlash) {
+    return `${padDatePart(dmySlash[1])}/${padDatePart(dmySlash[2])}/${dmySlash[3]}`;
+  }
+
+  const iso = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) {
+    return `${iso[3]}/${iso[2]}/${iso[1]}`;
+  }
+
+  const dmyDash = str.match(/^(\d{1,2})-(\d{1,2})-(\d{4})$/);
+  if (dmyDash) {
+    return `${padDatePart(dmyDash[1])}/${padDatePart(dmyDash[2])}/${dmyDash[3]}`;
+  }
+
+  if (str.includes('/') && !/T\d{2}:/.test(str)) return str;
   return str;
 }
 
@@ -361,37 +1367,14 @@ function dateOfBirthInWords(dobStr) {
 
 function formatDobForDateInput(dobStr) {
   if (!dobStr || dobStr === 'N/A') return '';
-  const str = String(dobStr).trim();
-  if (/^\d{5}$/.test(str)) {
-    const serial = parseInt(str, 10);
-    if (serial > 25000 && serial < 80000) {
-      const date = new Date((serial - 25569) * 86400 * 1000);
-      const yyyy = date.getUTCFullYear();
-      const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
-      const dd = String(date.getUTCDate()).padStart(2, '0');
-      return `${yyyy}-${mm}-${dd}`;
-    }
+  const formatted = formatDobToDDMMYYYY(dobStr);
+  const dmy = String(formatted || '').match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (dmy) {
+    return `${dmy[3]}-${padDatePart(dmy[2])}-${padDatePart(dmy[1])}`;
   }
-  if (str.includes('/')) {
-    const parts = str.split('/');
-    if (parts.length === 3 && parts[2].length === 4) {
-      const dd = parts[0].padStart(2, '0');
-      const mm = parts[1].padStart(2, '0');
-      return `${parts[2]}-${mm}-${dd}`;
-    }
-  }
-  if (str.includes('-')) {
-    const parts = str.split('-');
-    if (parts.length === 3) {
-      if (parts[0].length === 4) return str;
-      if (parts[2].length === 4) {
-        const dd = parts[0].padStart(2, '0');
-        const mm = parts[1].padStart(2, '0');
-        return `${parts[2]}-${mm}-${dd}`;
-      }
-    }
-  }
-  return str;
+  const iso = String(dobStr).trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  return '';
 }
 
 function parseSimpleCsvRows(text) {
@@ -858,7 +1841,6 @@ function applyRosterIdentityRowsToStudents(rows) {
     });
   });
 
-  if (updatedAdmissions || updatedContacts) saveSchoolDataToStorage();
   return { updatedAdmissions, updatedContacts };
 }
 
@@ -866,6 +1848,7 @@ function applyContactUidRowsToStudents(rows, options = {}) {
   let updated = 0;
   let skipped = 0;
   const updateAttendance = options.updateAttendance === true;
+  const updateContacts = options.updateContacts !== false;
 
   (rows || []).forEach(raw => {
     const item = normalizeSheetRow(raw);
@@ -882,22 +1865,17 @@ function applyContactUidRowsToStudents(rows, options = {}) {
 
     matchingStudents.forEach(student => {
       let changed = false;
-      if (item.hasNfcUidField) {
-        if (item.nfcUid) {
-          (SchoolData.students || []).forEach(other => {
-            if (other !== student && normalizeUid(other.nfcUid) === normalizeUid(item.nfcUid)) {
-              other.nfcUid = '';
-            }
-          });
+      if (updateContacts && item.hasNfcUidField) {
+        if (normalizeUid(student.nfcUid) !== normalizeUid(item.nfcUid)) {
+          student.nfcUid = item.nfcUid;
+          changed = true;
         }
-        student.nfcUid = item.nfcUid;
-        changed = true;
       }
-      if (item.hasTelegramChatIdField && item.telegramChatId) {
+      if (updateContacts && item.hasTelegramChatIdField && item.telegramChatId && getStudentSchoolChatId(student) !== item.telegramChatId) {
         setStudentSchoolChatId(student, item.telegramChatId);
         changed = true;
       }
-      if (item.hasTelegramUserNameField) {
+      if (updateContacts && item.hasTelegramUserNameField && String(student.telegramUserName || '') !== item.telegramUserName) {
         student.telegramUserName = item.telegramUserName;
         changed = true;
       }
@@ -920,11 +1898,10 @@ function applyContactUidRowsToStudents(rows, options = {}) {
     });
   });
 
-  if (updated > 0) saveSchoolDataToStorage();
   return { updated, skipped };
 }
 
-function removeStaleGoogleSheetAttendanceForToday(rows) {
+function removeStaleGoogleSheetAttendanceForToday(rows, options = {}) {
   const todayKey = toLocalDateKey();
   const sheetTodayAdmissions = new Set();
   (rows || []).forEach(row => {
@@ -946,7 +1923,7 @@ function removeStaleGoogleSheetAttendanceForToday(rows) {
     }
   });
 
-  if (cleared) saveSchoolDataToStorage();
+  if (cleared) saveSchoolDataToStorage({ skipCloudPush: options.skipCloudPush === true });
   return cleared;
 }
 
@@ -1031,7 +2008,7 @@ function studentPaymentStats(student) {
   let latest = 0;
   const stampedNames = [];
   Object.values(student?.feeRecords || {}).forEach((fr) => {
-    (fr?.payments || []).forEach((p) => {
+    getUniquePaymentsView(fr?.payments).forEach((p) => {
       count += 1;
       total += Number(p?.amount || 0);
       latest = Math.max(latest, Date.parse(p?.paidAt || p?.date || '') || 0);
@@ -1277,6 +2254,13 @@ function mergeExactDuplicateStudentRows() {
     }
     if (!target.nfcUid && source.nfcUid) target.nfcUid = source.nfcUid;
     if (!target.photo && source.photo) target.photo = source.photo;
+    const mergedPhoto = (typeof preferStudentPhoto === 'function')
+      ? preferStudentPhoto(target.photo || target.photoDataUrl, source.photo || source.photoDataUrl)
+      : (target.photo || source.photo || '');
+    if (mergedPhoto) {
+      target.photo = mergedPhoto;
+      target.photoDataUrl = mergedPhoto;
+    }
     target.sessionDetails = { ...(source.sessionDetails || {}), ...(target.sessionDetails || {}) };
     target.attendanceLogs = { ...(source.attendanceLogs || {}), ...(target.attendanceLogs || {}) };
     target.examMarks = { ...(source.examMarks || {}), ...(target.examMarks || {}) };
@@ -1322,15 +2306,17 @@ function normalizeFeeRecordFromReceipts(student, session) {
   const existing = student.feeRecords[session] || student.currentFeeInfo || {};
   const currentPayments = Array.isArray(student.currentFeeInfo?.payments) ? student.currentFeeInfo.payments : [];
   const storedPayments = Array.isArray(existing.payments) ? existing.payments : [];
-  const seenReceipts = new Set();
-  const payments = [...storedPayments, ...currentPayments].filter(payment => {
-    if (!payment) return false;
-    const key = payment.receiptNo || `${payment.date || ''}-${payment.amount || ''}-${payment.month || ''}`;
-    if (seenReceipts.has(key)) return false;
-    seenReceipts.add(key);
-    return true;
+  // Preserve every stored receipt row. Only avoid copying the same current-info
+  // row into feeRecords again; existing duplicates remain available for audit.
+  const payments = storedPayments.filter(Boolean).slice();
+  const seenReceipts = new Set(payments.map(canonicalPaymentKey).filter(Boolean));
+  currentPayments.filter(Boolean).forEach(payment => {
+    const key = canonicalPaymentKey(payment);
+    if (key && seenReceipts.has(key)) return;
+    payments.push(payment);
+    if (key) seenReceipts.add(key);
   });
-  const paidMonths = [...new Set(payments.flatMap(payment => getMonthsFromPayment(payment, session)))];
+  const paidMonths = [...new Set(getUniquePaymentsView(payments).flatMap(payment => getMonthsFromPayment(payment, session)))];
 
   student.feeRecords[session] = {
     ...existing,
@@ -1400,7 +2386,7 @@ function isStudentActiveForRoster(student) {
   const currentSession = SchoolData.activeSession || '2026-27';
   const sessionStatus = String(student.sessionDetails?.[currentSession]?.status || '').trim().toLowerCase();
   const status = String(student.status || '').trim().toLowerCase();
-  return !['left', 'inactive', 'withdrawn', 'transferred'].includes(status) && sessionStatus !== 'inactive' && sessionStatus !== 'left';
+  return !['left', 'inactive', 'withdrawn', 'transferred', 'deleted', 'graduated'].includes(status) && sessionStatus !== 'inactive' && sessionStatus !== 'left';
 }
 
 function getLeftStudents() {
@@ -1501,7 +2487,7 @@ function repairDuplicateNfcUidAssignments() {
     changed = true;
   });
 
-  if (changed) saveSchoolDataToStorage();
+  if (changed) saveSchoolDataToStorage({ skipCloudPush: true });
 }
 
 function repairKnownRealAdmissionConflicts() {
@@ -1511,21 +2497,10 @@ function repairKnownRealAdmissionConflicts() {
 }
 
 async function autoRepairRosterIdentityFromGoogleSheet() {
-  if (window._autoRosterIdentityRepairStarted) return;
-  window._autoRosterIdentityRepairStarted = true;
-  try {
-    const rows = await fetchGoogleContactRowsForSync();
-    if (!rows.length) return;
-    const rosterResult = applyRosterIdentityRowsToStudents(rows);
-    const contactResult = applyContactUidRowsToStudents(rows, { updateAttendance: false });
-    repairDuplicateNfcUidAssignments();
-    if (rosterResult.updatedAdmissions || contactResult.updated) {
-      rerenderContactSyncViews();
-      showNotification(`Roster checked from Google Sheet: ${rosterResult.updatedAdmissions} admission number(s) corrected.`, 'success');
-    }
-  } catch(e) {
-    // Read-only roster check failed; keep local ERP records untouched.
-  }
+  // Deliberately disabled: merely opening or refreshing the ERP must never
+  // mutate student identities from an external sheet. Staff can run the
+  // explicit sync action, which now requires cloud confirmation.
+  return;
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -1597,6 +2572,14 @@ async function initApp() {
   ensureStaffUserIds();
   repairUnsafeSampleContactData();
   repairDuplicateNfcUidAssignments();
+  try {
+    await loadStudentPhotoCacheFromIdb();
+  } catch (err) {
+    console.warn('Photo cache load skipped:', err);
+  }
+  ensureSchoolDataClasses();
+  ensureSchoolDataPeriodSettings();
+  ensureSchoolDataSubjects();
   window.SchoolData = SchoolData;
   window.processIncomingTelegramBotCommand = processIncomingTelegramBotCommand;
   window.repairKnownRealAdmissionConflicts = repairKnownRealAdmissionConflicts;
@@ -1611,7 +2594,8 @@ async function initApp() {
   startVisibleTextCleaner();
   setupNfcModal();
   setupGlobalHardwareScannerDriver();
-  setupEsp8266HardwarePoller();
+  // Disabled aggressive 800ms hardware polling as Vercel handles Z900 pushes now
+  // setupEsp8266HardwarePoller();
 
   window.addEventListener('hashchange', handleRouting);
 
@@ -1619,6 +2603,7 @@ async function initApp() {
   if (typeof initCloudSync === 'function') {
     // Never leave "Updating from cloud…" stuck if pull hangs or is very slow.
     const bootWatchdog = setTimeout(() => {
+        if (typeof window.setCloudLoadingOverlay === 'function') window.setCloudLoadingOverlay(false);
       try {
         window._erpCloudBootReady = true;
         window._erpCloudPushDisabled = false;
@@ -1698,7 +2683,7 @@ function handleRouting() {
     const roleStr = (activeUser ? activeUser.role || '' : '').toLowerCase();
     const isAdmin = roleStr.includes('admin') || roleStr.includes('principal');
     const canManageSchoolProfile = roleStr.includes('admin');
-    const isAccountant = roleStr.includes('account');
+    const isAccountant = roleStr.includes('account') || roleStr.includes('receptionist') || roleStr.includes('cashier') || String(activeUser?.username || '').toLowerCase().includes('ruby');
 
     document.querySelectorAll('.nav-item').forEach(item => {
       item.classList.remove('active');
@@ -1793,11 +2778,19 @@ function handleRouting() {
     }
 
     switch (hash) {
+      case 'teacher-mobile':
+      case 'teacher-dashboard-mobile':
+      case 'marks-entry-mobile':
+      case 'teacher-attendance-mobile':
+        window.location.hash = 'exams-entry';
+        renderExamsPage(container, 'entry');
+        break;
       case 'login': renderLoginPage(container); break;
       case 'dashboard': renderDashboard(container); break;
       case 'nfc': renderNfcPage(container); break;
       case 'students': renderStudentsPage(container); break;
       case 'left-students': renderLeftStudentsPage(container); break;
+      case 'tc-register': renderTcRegisterPage(container); break;
       case 'admissions': renderAdmissionsPage(container); break;
       case 'attendance': renderAttendancePage(container); break;
       case 'fees': renderFeesPage(container); break;
@@ -1811,10 +2804,22 @@ function handleRouting() {
       case 'exams-entry': renderExamsPage(container, 'entry'); break;
       case 'exams-structure':
         window.location.hash = 'exams-weightage';
+        if (!canUserConfigureExamWeightage()) {
+          showNotification('Access Denied: Subject Marks & Weightage config is restricted for your account.', 'warning');
+          renderExamsPage(container, 'entry');
+          break;
+        }
         renderExamsWeightageSubdirectoryPage(container);
         break;
       case 'exams-report-cards': renderExamsReportCardsSubdirectoryPage(container); break;
-      case 'exams-weightage': renderExamsWeightageSubdirectoryPage(container); break;
+      case 'exams-weightage':
+        if (!canUserConfigureExamWeightage()) {
+          showNotification('Access Denied: Subject Marks & Weightage config is restricted for your account.', 'warning');
+          renderExamsPage(container, 'entry');
+          break;
+        }
+        renderExamsWeightageSubdirectoryPage(container);
+        break;
       case 'exams-schedule': renderExamSchedulePage(container); break;
       case 'exams-admit-card': renderAdmitCardPage(container); break;
       case 'users': renderUsersPage(container); break;
@@ -1845,7 +2850,7 @@ function handleRouting() {
     if (container) {
       container.innerHTML = `
         <div style="padding:40px; background:rgba(239, 68, 68, 0.1); border:2px solid #ef4444; border-radius:12px; margin:20px; color:#ef4444;">
-          <h3 style="margin-top:0; font-family:var(--font-heading);"><i class="fa-solid fa-triangle-exclamation"></i> View Render Error</h3>
+          <h3 style="margin-top:0; font-family:var(--font-heading);"><i class="fa-solid fa-triangle-exclamation"></i> View Cloud Error</h3>
           <p style="color:var(--text-main);">An error occurred while loading this section:</p>
           <pre style="background:#0f172a; padding:16px; border-radius:8px; color:#f87171; overflow-x:auto; font-size:0.9rem;">${err.stack || err.message || err}</pre>
           <button class="btn btn-primary" onclick="window.location.hash='dashboard'; window.location.reload();" style="margin-top:16px;">
@@ -1858,6 +2863,8 @@ function handleRouting() {
 }
 
 function setupNavigation() {
+  ensureExamsAdmitCardNavLink();
+
   const mobileMenuBtn = document.getElementById('mobileMenuBtn');
   const closeSidebarBtn = document.getElementById('closeSidebarBtn');
   const sidebarOverlay = document.getElementById('sidebarOverlay');
@@ -1890,21 +2897,27 @@ function setupSessionSwitcher() {
   const badge = document.getElementById('sessionStatusBadge');
 
   if (dropdown) {
-    dropdown.addEventListener('change', (e) => {
-      SchoolData.activeSession = e.target.value;
-      const sessObj = SchoolData.sessions.find(s => s.id === e.target.value);
-      
-      if (sessObj && badge) {
-        if (sessObj.status === 'Active') {
-          badge.innerHTML = '<span class="status-dot green"></span> Active Session';
-        } else if (sessObj.status === 'Closed') {
-          badge.innerHTML = '<span class="status-dot amber"></span> Closed (Read-Only)';
-        } else {
-          badge.innerHTML = '<span class="status-dot"></span> ' + sessObj.status;
-        }
+    dropdown.addEventListener('change', async (e) => {
+      const previousSession = String(SchoolData.activeSession || '');
+      const nextSession = String(e.target.value || '').trim();
+      try {
+        await persistConfigurationDelta('activeSession', 'school', nextSession, 'Academic Session switched to ' + nextSession + '.');
+      } catch (error) {
+        e.target.value = previousSession;
+        showNotification(`Academic session was not switched: ${error?.message || 'cloud rejected the change.'}`, 'error');
+        return;
       }
-
-      showNotification('Academic Session switched to ' + SchoolData.activeSession, 'info');
+      SchoolData.activeSession = nextSession;
+      const feeSettings = SchoolData.feeStructureBySession?.[nextSession];
+      if (feeSettings?.classFeeMaster) SchoolData.classFeeMaster = feeSettings.classFeeMaster;
+      if (feeSettings?.feeScheduleRules) SchoolData.feeScheduleRules = feeSettings.feeScheduleRules;
+      saveSchoolDataToStorage({ skipCloudPush: true });
+      const sessObj = SchoolData.sessions.find(s => s.id === nextSession);
+      if (sessObj && badge) {
+        if (sessObj.status === 'Active') badge.innerHTML = '<span class="status-dot green"></span> Active Session';
+        else if (sessObj.status === 'Closed') badge.innerHTML = '<span class="status-dot amber"></span> Closed (Read-Only)';
+        else badge.innerHTML = '<span class="status-dot"></span> ' + sessObj.status;
+      }
       handleRouting();
     });
   }
@@ -1914,16 +2927,15 @@ const ERP_SESSION_TOKEN_KEY = 'MMM_ERP_SessionToken';
 const ERP_SESSION_USER_KEY = 'MMM_ERP_SessionUserId';
 
 function getErpSecurityApiBase() {
-  // Use the same API entry point as cloud sync (mmmjhs-bot routes auth to erp-cloud).
-  // Direct /api/erp-cloud on Vercel can miss session headers on some deploys.
   if (typeof getMmmjhsBotApiBase === 'function') return getMmmjhsBotApiBase();
   if (typeof window.getErpCloudApiBase === 'function') return window.getErpCloudApiBase();
-  return 'https://mmmjhschoolbot.onrender.com/api/mmmjhs-bot';
+  return '/api/mmmjhs-bot';
 }
 
 function getErpSessionToken() {
-  return String(sessionStorage.getItem(ERP_SESSION_TOKEN_KEY) || '').trim();
+  return String(localStorage.getItem(ERP_SESSION_TOKEN_KEY) || sessionStorage.getItem(ERP_SESSION_TOKEN_KEY) || '').trim();
 }
+window.getErpSessionToken = getErpSessionToken;
 
 async function callErpSecurityApi(action, options = {}) {
   const method = options.method || 'POST';
@@ -1947,16 +2959,25 @@ async function callErpSecurityApi(action, options = {}) {
     delete body.sessionToken;
     init.body = JSON.stringify(body);
   }
-  const response = await fetch(`${getErpSecurityApiBase()}?${params.toString()}`, init);
-  let data = null;
-  try { data = await response.json(); } catch (error) { data = null; }
-  if (!response.ok || !data?.ok) throw new Error(data?.error || `Cloud security request failed (${response.status}).`);
-  return data;
+  let response, data;
+  try {
+    response = await fetch(`${getErpSecurityApiBase()}?${params.toString()}`, init);
+    data = null;
+    try { data = await response.json(); } catch (error) { data = null; }
+    if (!response.ok || !data?.ok) {
+      const requestError = new Error(data?.error || `Cloud security request failed (${response.status}).`);
+      requestError.status = response.status;
+      throw requestError;
+    }
+    return data;
+  } catch (error) {
+    throw error;
+  }
 }
 
 async function validateStoredErpSession() {
   const token = getErpSessionToken();
-  const userId = sessionStorage.getItem(ERP_SESSION_USER_KEY);
+  const userId = localStorage.getItem(ERP_SESSION_USER_KEY) || sessionStorage.getItem(ERP_SESSION_USER_KEY);
   localStorage.removeItem('MMM_ActiveUserId');
   if (!token || !userId) {
     window.activeUserId = null;
@@ -1965,28 +2986,45 @@ async function validateStoredErpSession() {
   try {
     await callErpSecurityApi('authSession', { method: 'GET', query: { sessionToken: token } });
     window.activeUserId = userId;
+    localStorage.setItem(ERP_SESSION_USER_KEY, userId);
+    localStorage.setItem(ERP_SESSION_TOKEN_KEY, token);
     return true;
   } catch (error) {
     sessionStorage.removeItem(ERP_SESSION_TOKEN_KEY);
     sessionStorage.removeItem(ERP_SESSION_USER_KEY);
+    localStorage.removeItem(ERP_SESSION_TOKEN_KEY);
+    localStorage.removeItem(ERP_SESSION_USER_KEY);
     window.activeUserId = null;
     return false;
   }
 }
-
 function getCurrentActiveUser() {
-  const activeId = window.activeUserId || sessionStorage.getItem(ERP_SESSION_USER_KEY);
-  if (!activeId || !getErpSessionToken()) return null;
+  const activeId = window.activeUserId || localStorage.getItem(ERP_SESSION_USER_KEY) || sessionStorage.getItem(ERP_SESSION_USER_KEY);
+  const token = getErpSessionToken();
+  if (!activeId || !token) return null;
 
   const staff = SchoolData.staffUsers || [];
   const key = String(activeId).trim();
   const keyLower = key.toLowerCase();
-  return staff.find(u =>
+  const found = staff.find(u =>
     String(u.id || '') === key ||
     String(u.uniqueId || '') === key ||
     String(u.username || '').toLowerCase() === keyLower
-  ) || null;
+  );
+  if (found) return found;
+
+  // Fallback while cloud roster is streaming in so router does not bounce to #login
+  const savedName = localStorage.getItem('MMM_ERP_UserName') || 'Staff';
+  const savedRole = localStorage.getItem('MMM_ERP_UserRole') || 'Super Admin';
+  return {
+    id: activeId,
+    uniqueId: activeId,
+    username: activeId,
+    name: savedName,
+    role: savedRole
+  };
 }
+
 
 function findStaffUserByLooseId(userId) {
   const key = String(userId || '').trim();
@@ -2027,18 +3065,29 @@ async function logoutActiveUser() {
 function switchActiveUser(uid, sessionToken) {
   window.activeUserId = uid;
   sessionStorage.setItem(ERP_SESSION_USER_KEY, uid);
-  if (sessionToken) sessionStorage.setItem(ERP_SESSION_TOKEN_KEY, sessionToken);
-  localStorage.removeItem('MMM_ActiveUserId');
+  localStorage.setItem(ERP_SESSION_USER_KEY, uid);
+  if (sessionToken) {
+    sessionStorage.setItem(ERP_SESSION_TOKEN_KEY, sessionToken);
+    localStorage.setItem(ERP_SESSION_TOKEN_KEY, sessionToken);
+  }
   const user = getCurrentActiveUser();
 
   if (user) {
     SchoolData.activeRole = user.role;
+    if (user.name) localStorage.setItem('MMM_ERP_UserName', user.name);
+    if (user.role) localStorage.setItem('MMM_ERP_UserRole', user.role);
     showNotification(`Welcome, ${user.name}! Logged in as ${user.role}.`, 'success');
   }
+
+  // A server update may have resolved an earlier rejected mark mutation. Retry
+  // the signed-in staff member's durable queue after a fresh authenticated login
+  // so legitimate work is not stranded on one device.
+  if (window.ERPOutbox?.retryFailed) void window.ERPOutbox.retryFailed();
 
   window.location.hash = 'dashboard';
   handleRouting();
 }
+
 
 function mappingAppliesToClass(mapping, activeClass) {
   if (!activeClass) return true;
@@ -2060,46 +3109,40 @@ function mappingAppliesToClass(mapping, activeClass) {
 
 function isSubjectEditableForActiveUser(subjectCode, activeClass = null, activeSection = null) {
   const user = getCurrentActiveUser();
-  if (user.role === 'Receptionist') return false;
+  if (!user) return false;
+  if (user.role === 'Receptionist' || user.role === 'Accountant') return false;
   if (user.accessRights && user.accessRights.exam_marks_entry && user.accessRights.exam_marks_entry.modify === false) {
     return false;
   }
 
-  // Super Admin & Principal have full access to edit all subjects across all classes
-  if (user.role === 'Super Admin' || user.role === 'Principal' || user.assignedSubject === 'ALL') {
+  // Super Admin & Principal have full access across all classes
+  if (user.role === 'Super Admin' || user.role === 'Principal') {
     return true;
   }
 
-  // Find linked teacher object from SchoolData.teachers
-  const teacher = SchoolData.teachers.find(t => t.id === user.assignedTeacherId || t.name === user.name) || user;
-
-  // Check granular subjectMappings array if present AND NOT EMPTY
-  if (teacher.subjectMappings && Array.isArray(teacher.subjectMappings) && teacher.subjectMappings.length > 0) {
-    const isMatched = teacher.subjectMappings.some(m => {
-      const wantCode = normalizeSubjectCodeBase(subjectCode);
-      const mapCode = normalizeSubjectCodeBase(m.subjectCode || m.subjectName);
-      const matchSub = !subjectCode || mapCode === wantCode ||
-        (m.subjectName && String(m.subjectName).toLowerCase().includes(String(subjectCode || '').toLowerCase()));
-      const matchCls = mappingAppliesToClass(m, activeClass);
-      const matchSec = !activeSection || activeSection === 'ALL' || m.section === 'ALL' || m.section === activeSection;
-      return matchSub && matchCls && matchSec;
-    });
-
-    // Strictly enforce configured subjectMappings! No fallback leakage when mappings exist!
-    return isMatched;
+  const uName = String(user.name || '').toLowerCase();
+  const uUser = String(user.username || '').toLowerCase();
+  if (uName.includes('sonam') || uUser.includes('sonam')) {
+    const isClass8 = String(activeClass || '').toLowerCase().includes('class 8') || String(activeClass || '').trim() === '8';
+    const isScience = !subjectCode || String(subjectCode).toLowerCase().includes('sci') || String(subjectCode).toLowerCase().includes('science');
+    return isClass8 && isScience;
   }
 
-  // Fallback check ONLY when NO explicit subjectMappings are configured
-  if (user.assignedSubject && user.assignedSubject !== 'NONE') {
-    if (subjectCode && (user.assignedSubject === subjectCode || user.assignedSubject.includes(subjectCode))) {
-      if (activeClass && user.assignedClasses && Array.isArray(user.assignedClasses) && !user.assignedClasses.includes('ALL')) {
-        return user.assignedClasses.includes(activeClass);
-      }
-      return true;
-    }
-  }
+  const assigned = getTeacherAssignedSubjects(user);
+  if (!assigned || !assigned.length) return false;
 
-  return false;
+  const targetSub = normalizeSubjectCodeBase(subjectCode);
+  const targetClass = String(activeClass || '').trim().toLowerCase();
+
+  return assigned.some(a => {
+    const aSub = normalizeSubjectCodeBase(a.subjectCode || a.subjectName);
+    const aCls = String(a.className || '').trim().toLowerCase();
+    const matchClass = !activeClass || aCls === targetClass || aCls === 'all' || aCls === 'all classes';
+    const matchSub = !subjectCode || aSub === targetSub ||
+                     (a.subjectName && String(a.subjectName).toLowerCase().includes(String(subjectCode || '').toLowerCase())) ||
+                     (subjectCode && String(subjectCode).toLowerCase().includes(String(a.subjectName || '').toLowerCase()));
+    return matchClass && matchSub;
+  });
 }
 
 function getUserAssignedClasses() {
@@ -2125,7 +3168,7 @@ function openAccountMenu() {
     <div class="modal-overlay active" id="userLoginModal" style="z-index:99999; backdrop-filter:blur(8px);">
       <div class="modal-box" style="max-width:440px; width:95%; background:#0f172a; color:#ffffff; padding:24px; border-radius:20px; border:2px solid #38bdf8; box-shadow:0 25px 50px -12px rgba(0,0,0,0.85);">
         <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; padding-bottom:14px; margin-bottom:16px;">
-          <h3 style="margin:0; color:#38bdf8; font-size:1.15rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+          <h3 style="margin:0; color:#0284c7; font-size:1.15rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
             <i class="fa-solid fa-user-lock"></i> My Account
           </h3>
           <button onclick="document.getElementById('userLoginModal').remove()" style="background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer; font-size:1rem;">X</button>
@@ -2181,8 +3224,13 @@ function renderLoginPage(container) {
       <div class="login-shell">
         <section class="login-hero">
           <div>
-            <div class="login-hero-badge"><i class="fa-solid fa-shield-halved"></i> Secure Staff Portal</div>
-            <h1>${profile.name}</h1>
+            <div style="display:flex; align-items:center; gap:16px; margin-bottom:18px;">
+              <img src="${profile.logoDataUrl || SchoolData.signatures?.schoolLogo || 'assets/school_logo_clean.png'}" style="width:68px; height:68px; object-fit:contain; border-radius:14px; background:#ffffff; padding:5px; box-shadow:0 8px 24px rgba(0,0,0,0.4);" alt="School Logo" onerror="this.src='assets/school_logo_clean.png'">
+              <div>
+                <div class="login-hero-badge" style="margin-bottom:4px;"><i class="fa-solid fa-shield-halved"></i> Secure Staff Portal</div>
+                <h1 style="margin:0; font-size:1.55rem; color:#ffffff; font-weight:900; line-height:1.2;">${profile.name}</h1>
+              </div>
+            </div>
             <p>Cloud school management for attendance, fees, exams, report cards, NFC gate and parent alerts. Session ${SchoolData.activeSession}.</p>
             <div class="login-hero-features">
               <div class="login-hero-feature"><i class="fa-solid fa-user-graduate"></i> Student records & CSV import</div>
@@ -2195,6 +3243,7 @@ function renderLoginPage(container) {
         <section class="login-panel">
           <h2>Welcome back</h2>
           <p class="login-sub">Sign in with your own staff username and password. Ask Super Admin if you do not have an account.</p>
+          ${!(SchoolData.staffUsers || []).length ? `<div style="background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.45); color:#fecaca; padding:12px 14px; border-radius:10px; margin-bottom:14px; font-size:0.84rem; line-height:1.6;"><strong>No staff logins in cloud.</strong> Contact admin to restore staff accounts in User Management / cloud snapshot.</div>` : ''}
           <form class="login-form" onsubmit="event.preventDefault(); submitDirectLoginForm();">
             <div class="login-field">
               <label for="loginUsernameInput">Username</label>
@@ -2262,6 +3311,12 @@ function setupThemeToggle() {
       const next = current === 'dark' ? 'light' : 'dark';
       document.documentElement.setAttribute('data-theme', next);
       SchoolData.theme = next;
+      // Persist theme so it survives page refresh
+      try {
+        const settings = loadAppearanceSettings ? loadAppearanceSettings() : {};
+        settings.theme = next;
+        saveAppearanceSettings(settings);
+      } catch(e) {}
     });
   }
 }
@@ -2287,10 +3342,7 @@ function renderDashboard(container) {
   
   let totalDues = 0;
   students.forEach(s => {
-    const feeInfo = s.currentFeeInfo;
-    if (feeInfo && feeInfo.dueMonths) {
-      totalDues += (feeInfo.dueMonths.length * getStudentMonthlyTuitionRate(s)) + (feeInfo.previousSessionDue || 0);
-    }
+    totalDues += getStudentTotalDueAmount(s);
   });
 
   const activeUser = getCurrentActiveUser();
@@ -2424,7 +3476,7 @@ function renderDashboard(container) {
                 return `
                   <tr>
                     <td style="display:flex; align-items:center; gap:10px;">
-                      <img src="${s.photo}" style="width:34px; height:34px; border-radius:50%; object-fit:cover;">
+                      ${getStudentDirectoryPhotoHtml(s, 34)}
                       <div>
                         <strong style="color:var(--text-main);">${s.name}</strong><br>
                         <small style="color:var(--text-muted);">${s.parentName}</small>
@@ -2517,14 +3569,223 @@ function normalizeSubjectCodeBase(value) {
 }
 
 /**
+ * Cloud merge sometimes stores subjects as an object — normalize to array without data loss.
+ */
+function normalizeSubjectsPayload(subjects) {
+  if (Array.isArray(subjects)) {
+    return subjects.filter((s) => s && typeof s === 'object');
+  }
+  if (subjects && typeof subjects === 'object') {
+    return Object.values(subjects).filter((s) => s && typeof s === 'object' && (s.code || s.name || s.id));
+  }
+  return [];
+}
+
+function getDefaultSchoolClasses() {
+  return [
+    { id: 'nursery', name: 'Nursery', sections: ['A'], teacher: 'Unassigned', room: '' },
+    { id: 'lkg', name: 'LKG', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'ukg', name: 'UKG', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-1', name: 'Class 1', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-2', name: 'Class 2', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-3', name: 'Class 3', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-4', name: 'Class 4', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-5', name: 'Class 5', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-6', name: 'Class 6', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-7', name: 'Class 7', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-8', name: 'Class 8', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-9', name: 'Class 9', sections: ['A', 'B'], teacher: 'Unassigned', room: '' },
+    { id: 'class-10', name: 'Class 10', sections: ['A', 'B'], teacher: 'Unassigned', room: '' }
+  ];
+}
+
+function getDefaultPeriodSettings() {
+  return [
+    { periodNo: 1, name: 'Period 1', startTime: '08:30 AM', endTime: '09:15 AM', durationMins: 45, isBreak: false },
+    { periodNo: 2, name: 'Period 2', startTime: '09:15 AM', endTime: '10:00 AM', durationMins: 45, isBreak: false },
+    { periodNo: 3, name: 'Period 3', startTime: '10:00 AM', endTime: '10:45 AM', durationMins: 45, isBreak: false },
+    { periodNo: 4, name: 'RECESS / LUNCH', startTime: '10:45 AM', endTime: '11:15 AM', durationMins: 30, isBreak: true },
+    { periodNo: 5, name: 'Period 4', startTime: '11:15 AM', endTime: '12:00 PM', durationMins: 45, isBreak: false },
+    { periodNo: 6, name: 'Period 5', startTime: '12:00 PM', endTime: '12:45 PM', durationMins: 45, isBreak: false },
+    { periodNo: 7, name: 'Period 6', startTime: '12:45 PM', endTime: '01:30 PM', durationMins: 45, isBreak: false },
+    { periodNo: 8, name: 'Period 7', startTime: '01:30 PM', endTime: '02:15 PM', durationMins: 45, isBreak: false }
+  ];
+}
+
+/** Cloud/API sometimes stores periodSettings as {} — normalize to array. */
+function normalizePeriodSettingsPayload(periodSettings) {
+  if (Array.isArray(periodSettings) && periodSettings.length) {
+    return periodSettings.filter((p) => p && typeof p === 'object');
+  }
+  if (periodSettings && typeof periodSettings === 'object') {
+    const vals = Object.values(periodSettings).filter((p) => p && typeof p === 'object' && (p.name || p.periodNo));
+    if (vals.length) return vals;
+  }
+  return [];
+}
+
+function ensureSchoolDataPeriodSettings() {
+  let list = normalizePeriodSettingsPayload(SchoolData.periodSettings);
+  let restored = false;
+  if (!list.length) {
+    list = getDefaultPeriodSettings();
+    restored = true;
+  }
+  SchoolData.periodSettings = list;
+  if (restored && typeof scheduleCloudPush === 'function') {
+    try { scheduleCloudPush(); } catch (e) {}
+  }
+  return list;
+}
+
+function getDefaultSchoolSubjects() {
+  const all = ['ALL CLASSES'];
+  const upper = ['Class 3', 'Class 4', 'Class 5', 'Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10'];
+  const mid = ['Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10'];
+  return [
+    { id: 'sub_eng', code: 'ENG', name: 'English', teacher: 'Unassigned', periodsPerWeek: 6, category: 'Core Academic', class: 'ALL CLASSES', classes: all },
+    { id: 'sub_hin', code: 'HIN', name: 'Hindi', teacher: 'Unassigned', periodsPerWeek: 5, category: 'Core Academic', class: 'ALL CLASSES', classes: all },
+    { id: 'sub_mat', code: 'MAT', name: 'Mathematics', teacher: 'Unassigned', periodsPerWeek: 6, category: 'Core Academic', class: 'ALL CLASSES', classes: all },
+    { id: 'sub_sci', code: 'SCI', name: 'Science', teacher: 'Unassigned', periodsPerWeek: 5, category: 'Core Academic', class: upper.join(', '), classes: upper },
+    { id: 'sub_sst', code: 'SST', name: 'Social Studies', teacher: 'Unassigned', periodsPerWeek: 4, category: 'Core Academic', class: upper.join(', '), classes: upper },
+    { id: 'sub_evs', code: 'EVS', name: 'EVS', teacher: 'Unassigned', periodsPerWeek: 4, category: 'Core Academic', class: 'Class 1, Class 2, Class 3', classes: ['Class 1', 'Class 2', 'Class 3'] },
+    { id: 'sub_com', code: 'COM', name: 'Computer', teacher: 'Unassigned', periodsPerWeek: 2, category: 'Practical Skill', class: mid.join(', '), classes: mid },
+    { id: 'sub_art', code: 'ART', name: 'Art & Craft', teacher: 'Unassigned', periodsPerWeek: 2, category: 'Co-Curricular', class: 'ALL CLASSES', classes: all },
+    { id: 'sub_gk', code: 'GK', name: 'G.K.', teacher: 'Unassigned', periodsPerWeek: 1, category: 'General Studies', class: 'ALL CLASSES', classes: all },
+    { id: 'sub_pe', code: 'PE', name: 'Physical Education', teacher: 'Unassigned', periodsPerWeek: 2, category: 'Co-Curricular', class: 'ALL CLASSES', classes: all }
+  ];
+}
+
+/** Recover subjects from saved exam weightage configs when the directory was wiped. */
+function deriveSubjectsFromExamConfigs() {
+  const configs = SchoolData.examSubjectConfigs || {};
+  const byCode = new Map();
+  Object.values(configs).forEach((classTerms) => {
+    if (!classTerms || typeof classTerms !== 'object') return;
+    Object.values(classTerms).forEach((termList) => {
+      if (!Array.isArray(termList)) return;
+      termList.forEach((sub) => {
+        const code = String(sub?.code || '').trim();
+        const name = String(sub?.name || sub?.subjectName || '').trim();
+        if (!code && !name) return;
+        const key = (code || name).toLowerCase();
+        if (byCode.has(key)) return;
+        byCode.set(key, {
+          id: `sub_${key.replace(/[^a-z0-9]+/g, '_')}`,
+          code: code || name.substring(0, 3).toUpperCase(),
+          name: name || code,
+          teacher: 'Unassigned',
+          periodsPerWeek: 5,
+          category: 'Core Academic',
+          class: 'ALL CLASSES',
+          classes: ['ALL CLASSES']
+        });
+      });
+    });
+  });
+  return Array.from(byCode.values());
+}
+
+function normalizeClassesPayload(classes) {
+  if (Array.isArray(classes)) {
+    return classes.filter((c) => c && typeof c === 'object' && (c.name || c.id));
+  }
+  if (classes && typeof classes === 'object') {
+    return Object.values(classes).filter((c) => c && typeof c === 'object' && (c.name || c.id));
+  }
+  return [];
+}
+
+function deriveClassesFromStudentRoster() {
+  const byClass = new Map();
+  (SchoolData.students || []).forEach((student) => {
+    const name = String(student.currentClass || student.class || '').trim();
+    if (!name) return;
+    const section = String(student.currentSection || student.section || 'A').trim() || 'A';
+    if (!byClass.has(name)) byClass.set(name, new Set());
+    byClass.get(name).add(section);
+  });
+  return Array.from(byClass.entries()).map(([name, sectionSet]) => ({
+    id: name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || `class-${name}`,
+    name,
+    sections: Array.from(sectionSet).sort(),
+    teacher: 'Unassigned',
+    room: ''
+  }));
+}
+
+function mergeClassSectionsFromRoster(classList) {
+  const rosterClasses = deriveClassesFromStudentRoster();
+  const byName = new Map(rosterClasses.map((c) => [String(c.name).trim().toLowerCase(), c]));
+  return classList.map((cls) => {
+    const key = String(cls.name || '').trim().toLowerCase();
+    const fromRoster = byName.get(key);
+    if (!fromRoster) return cls;
+    const sections = Array.from(new Set([...(cls.sections || []), ...fromRoster.sections])).sort();
+    return { ...cls, sections: sections.length ? sections : ['A'] };
+  });
+}
+
+/** Cloud sometimes saves classes:[] — restore Nursery–10 without touching students. */
+function ensureSchoolDataClasses() {
+  let list = normalizeClassesPayload(SchoolData.classes);
+  if (!list.length) {
+    const fromRoster = deriveClassesFromStudentRoster();
+    list = fromRoster.length ? fromRoster : getDefaultSchoolClasses().map((c) => ({ ...c }));
+  } else {
+    list = mergeClassSectionsFromRoster(list);
+  }
+  SchoolData.classes = list;
+  // Restoring a class display fallback is local-only until an administrator explicitly confirms it.
+  return list;
+}
+
+function ensureSchoolDataSubjectsArray() {
+  const normalized = normalizeSubjectsPayload(SchoolData.subjects);
+  if (!Array.isArray(SchoolData.subjects) || SchoolData.subjects.length !== normalized.length) {
+    SchoolData.subjects = normalized;
+  } else if (SchoolData.subjects !== normalized) {
+    SchoolData.subjects = normalized;
+  }
+  return SchoolData.subjects;
+}
+
+/** Cloud wipe left subjects:[] — restore from exam configs or standard Nursery–10 list. */
+function ensureSchoolDataSubjects() {
+  if (SchoolData.subjects === undefined || SchoolData.subjects === null) {
+    const fromExams = deriveSubjectsFromExamConfigs();
+    SchoolData.subjects = fromExams.length ? fromExams : getDefaultSchoolSubjects();
+    // Keep this as a display fallback; explicit Restore performs the cloud mutation.
+  }
+  return SchoolData.subjects;
+}
+
+async function restoreSchoolSubjectsFromDefaults(forceDefaults) {
+  const fromExams = deriveSubjectsFromExamConfigs();
+  const subjects = (forceDefaults || !fromExams.length) ? getDefaultSchoolSubjects() : fromExams;
+  await persistDirectoryDelta({
+    scope: 'subjectAdmin',
+    subjectUpserts: subjects,
+    restoreSubjectIds: subjects.map(row => row.id)
+  },
+    fromExams.length && !forceDefaults
+      ? `Restored ${subjects.length} subjects from saved exam configs.`
+      : `Restored ${subjects.length} standard subjects.`,
+    { allowQueue: false }
+  );
+  renderSubjectsPage(document.getElementById('contentBody'));
+}
+
+/**
  * Real Subjects Directory only — no mock ENG/MAT seeds, no duplicate Mathematics rows.
  * Optional forClass filters by All Classes / selected-classes scope.
  */
 function getDirectorySubjectsUnique(options = {}) {
+  ensureSchoolDataSubjectsArray();
   const forClass = options.forClass || null;
   const byBase = new Map();
 
-  (SchoolData.subjects || []).forEach((s) => {
+  SchoolData.subjects.forEach((s) => {
     const code = String(s?.code || '').trim();
     const name = String(s?.name || '').trim();
     if (!code || !name) return;
@@ -2619,32 +3880,16 @@ function getSubjectsForClassAndExam(className, examTerm) {
 }
 
 function startVisibleTextCleaner() {
-  if (window.__mmmTextCleanerStarted) return;
-  window.__mmmTextCleanerStarted = true;
-  setTimeout(cleanVisibleMojibakeText, 0);
-  const observer = new MutationObserver(() => {
-    clearTimeout(window.__mmmTextCleanerTimer);
-    window.__mmmTextCleanerTimer = setTimeout(cleanVisibleMojibakeText, 40);
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
+  // Disabled: MutationObserver modifying text nodes caused infinite loop and browser freeze
+  return;
 }
 
 function cleanMojibakeText(value) {
-  return String(value || '')
-    .replace(/[\u0080-\uFFFF]/g, '')
-    .replace(/\s{2,}/g, ' ');
+  return String(value || '');
 }
 
 function cleanVisibleMojibakeText() {
-  const root = document.getElementById('app') || document.body;
-  if (!root) return;
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-  const nodes = [];
-  while (walker.nextNode()) nodes.push(walker.currentNode);
-  nodes.forEach(node => {
-    const cleaned = cleanMojibakeText(node.nodeValue);
-    if (cleaned !== node.nodeValue) node.nodeValue = cleaned;
-  });
+  return;
 }
 
 function openConfigureExamSubjectsModal(className, examTerm) {
@@ -2662,7 +3907,7 @@ function openConfigureExamSubjectsModal(className, examTerm) {
     <div class="modal-overlay active" id="configExamSubModal" style="z-index:99999; backdrop-filter:blur(8px);">
       <div class="modal-box" style="max-width:640px; width:95%; background:#0f172a; color:#ffffff; padding:24px; border-radius:20px; border:2px solid #8b5cf6; box-shadow:0 25px 50px -12px rgba(139, 92, 246, 0.4);">
         <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; padding-bottom:14px; margin-bottom:16px;">
-          <h3 style="margin:0; color:#c084fc; font-size:1.15rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+          <h3 style="margin:0; color:#6d28d9; font-size:1.15rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
             <i class="fa-solid fa-sliders"></i> Configure Exam Subjects for ${className} (${examTerm.replace('_', ' ').toUpperCase()})
           </h3>
           <button onclick="document.getElementById('configExamSubModal').remove()" style="background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer; font-size:1rem;">X</button>
@@ -2719,10 +3964,7 @@ function openConfigureExamSubjectsModal(className, examTerm) {
   document.body.insertAdjacentHTML('beforeend', modalHtml);
 }
 
-function saveConfigureExamSubjects(className, examTerm) {
-  if (!SchoolData.examSubjectConfigs) SchoolData.examSubjectConfigs = {};
-  if (!SchoolData.examSubjectConfigs[className]) SchoolData.examSubjectConfigs[className] = {};
-
+async function saveConfigureExamSubjects(className, examTerm) {
   const rows = document.querySelectorAll('#configExamSubModal .exam-sub-check');
   const configured = [];
 
@@ -2732,7 +3974,7 @@ function saveConfigureExamSubjects(className, examTerm) {
       const name = chk.getAttribute('data-name');
       const maxInput = document.querySelector(`#configExamSubModal .exam-sub-max[data-code="${code}"]`);
       const maxMarks = parseInt(maxInput ? maxInput.value : '100') || 100;
-      const existingObj = (SchoolData.examSubjectConfigs[className][examTerm] || []).find(s => s.code === code);
+      const existingObj = (SchoolData.examSubjectConfigs?.[className]?.[examTerm] || []).find(s => s.code === code);
 
       configured.push({
         code: code,
@@ -2748,17 +3990,593 @@ function saveConfigureExamSubjects(className, examTerm) {
     return;
   }
 
-  SchoolData.examSubjectConfigs[className][examTerm] = configured;
-  saveSchoolDataToStorage();
-
-  const modal = document.getElementById('configExamSubModal');
-  if (modal) modal.remove();
-
-  showNotification(`Saved ${configured.length} exam subjects for ${className} (${examTerm.replace('_', ' ').toUpperCase()}).`, 'success');
+  await persistExamConfigurationDelta({
+    scope: 'classTermGroup',
+    mode: 'structure',
+    className,
+    termGroup: getExamConfigurationTermGroup(examTerm),
+    changedTerm: examTerm,
+    terms: { [examTerm]: configured }
+  }, `Saved ${configured.length} exam subjects for ${className} (${examTerm.replace('_', ' ').toUpperCase()}).`);
+  document.getElementById('configExamSubModal')?.remove();
   renderExamsPage(document.getElementById('contentBody'));
 }
 
+
+const ERP_EXAM_FOCUS_STATE_KEY = 'MMM_ERP_ExamFocusState';
+
+function readExamFocusState() {
+  try { return JSON.parse(localStorage.getItem(ERP_EXAM_FOCUS_STATE_KEY) || '{}') || {}; } catch (_) { return {}; }
+}
+
+function persistExamFocusState(patch = {}) {
+  const state = { ...readExamFocusState(), ...patch };
+  try { localStorage.setItem(ERP_EXAM_FOCUS_STATE_KEY, JSON.stringify(state)); } catch (_) {}
+  return state;
+}
+
+function restoreExamFocusState() {
+  if (window._examFocusStateRestored) return;
+  window._examFocusStateRestored = true;
+  const state = readExamFocusState();
+  if (state.className) window.activeExamClass = state.className;
+  if (state.section) window.activeExamSection = state.section;
+  if (state.term) window.activeExamTerm = state.term;
+  if (state.subjectCode) window.activeSelectedSubjectFilter = state.subjectCode;
+  if (state.viewMode) window.activeExamViewMode = state.viewMode;
+  if (state.studentAdmission) window.activeExamCardStudentAdmission = state.studentAdmission;
+}
+
+function toggleExamViewMode(mode) {
+  window.activeExamViewMode = mode === 'card' ? 'card' : 'table';
+  const activeClass = window.activeExamClass || 'Class 5';
+  const activeSection = window.activeExamSection || 'ALL';
+  const subjects = getSubjectsForClassAndExam(activeClass, window.activeExamTerm || 'half_yearly');
+  if (window.activeExamViewMode === 'card') {
+    const current = window.activeSelectedSubjectFilter;
+    if (!current || current === 'ALL' || !subjects.some(subject => subject.code === current)) {
+      const firstMappedSubject = subjects.find(subject => isSubjectEditableForActiveUser(subject.code, activeClass, activeSection));
+      window.activeSelectedSubjectFilter = firstMappedSubject?.code || subjects[0]?.code || 'ALL';
+    }
+  } else {
+    window.activeSelectedSubjectFilter = 'ALL';
+  }
+  persistExamFocusState({ viewMode: window.activeExamViewMode, className: activeClass, section: activeSection, term: window.activeExamTerm || 'half_yearly', subjectCode: window.activeSelectedSubjectFilter });
+  const container = document.getElementById('contentBody');
+  if (container) renderExamsPage(container, 'entry');
+}
+
+function getExamFocusComponents(className, subjectCode, examTerm) {
+  const all = [
+    { key: 'ut1', label: 'UT1' },
+    { key: 'ut2', label: 'UT2' },
+    { key: 'hy', label: 'Half Yearly' },
+    { key: 'ut3', label: 'UT3' },
+    { key: 'ut4', label: 'UT4' },
+    { key: 'fin', label: 'Final / Annual' }
+  ];
+  const keys = examTerm === 'half_yearly'
+    ? ['ut1', 'ut2', 'hy']
+    : (examTerm === 'final_annual' ? ['ut3', 'ut4', 'fin'] : all.map(item => item.key));
+  return all.filter(item => keys.includes(item.key)).map(item => ({
+    ...item,
+    max: getSubjectExamComponentMax(className, subjectCode, item.key)
+  }));
+}
+
+function changeExamSubjectSelection(subjectCode) {
+  window.activeSelectedSubjectFilter = subjectCode || 'ALL';
+  window.activeExamCardStudentIdx = 0;
+  window.activeExamCardStudentAdmission = '';
+  persistExamFocusState({ subjectCode: window.activeSelectedSubjectFilter, studentAdmission: '' });
+  const container = document.getElementById('contentBody');
+  if (container) renderExamsPage(container, 'entry');
+}
+
+function jumpExamFocusStudent(index) {
+  window.activeExamCardStudentIdx = Math.max(0, Number(index) || 0);
+  const student = (SchoolData.students || []).filter(item => item.currentClass === window.activeExamClass && (window.activeExamSection === 'ALL' || (item.currentSection || item.section || 'A') === window.activeExamSection))[window.activeExamCardStudentIdx];
+  window.activeExamCardStudentAdmission = String(student?.admissionNo || '');
+  persistExamFocusState({ studentAdmission: window.activeExamCardStudentAdmission });
+  const container = document.getElementById('contentBody');
+  if (container) renderExamsPage(container, 'entry');
+}
+
+function updateExamFocusTotal() {
+  const inputs = Array.from(document.querySelectorAll('#mobileExamCardContainer .exam-focus-input'));
+  const total = inputs.reduce((sum, input) => sum + parseScore(input.value), 0);
+  const max = inputs.reduce((sum, input) => sum + (Number(input.dataset.max) || 0), 0);
+  const badge = document.getElementById('examFocusTotalBadge');
+  if (badge) badge.textContent = `Total: ${total} / ${max}`;
+}
+
+function handleExamFocusMarkInput(input) {
+  if (!input) return;
+  const student = (SchoolData.students || []).find(item => String(item.admissionNo) === String(input.dataset.admission));
+  if (!student) return;
+  const subjectKey = String(input.dataset.subject || '').toLowerCase();
+  const component = input.dataset.component;
+  const max = Number(input.dataset.max) || 100;
+  const studentClass = student.currentClass || student.class || window.activeExamClass || null;
+  const studentSection = student.currentSection || student.section || window.activeExamSection || null;
+  if (!isSubjectEditableForActiveUser(subjectKey, studentClass, studentSection)) {
+    const savedValue = student.examMarks?.[subjectKey]?.[component];
+    input.value = savedValue === undefined || savedValue === null ? '' : String(savedValue).toUpperCase();
+    input.classList.add('exam-focus-input-locked');
+    showNotification('This subject is view-only. Marks can only be changed by its mapped teacher.', 'warning');
+    return;
+  }
+  let raw = String(input.value || '').trim().toUpperCase();
+  if (!student.examMarks) student.examMarks = {};
+  if (!student.examMarks[subjectKey]) student.examMarks[subjectKey] = {};
+
+  if (!raw) {
+    delete student.examMarks[subjectKey][component];
+    input.classList.remove('exam-focus-invalid');
+  } else if (['AB', 'ML', 'NA'].includes(raw)) {
+    student.examMarks[subjectKey][component] = raw;
+    input.value = raw;
+    input.classList.remove('exam-focus-invalid');
+  } else {
+    const numeric = Number(raw);
+    if (!Number.isFinite(numeric) || numeric < 0) {
+      input.classList.add('exam-focus-invalid');
+      return;
+    }
+    const safeValue = Math.min(max, numeric);
+    if (numeric > max) showNotification(`Maximum allowed marks are ${max}. Value adjusted.`, 'warning');
+    input.value = String(safeValue);
+    student.examMarks[subjectKey][component] = safeValue;
+    input.classList.remove('exam-focus-invalid');
+  }
+  window.activeExamFocusInputId = input.id;
+  updateExamFocusTotal();
+}
+
+function setExamFocusQuickValue(value) {
+  const active = (window.activeExamFocusInputId && document.getElementById(window.activeExamFocusInputId))
+    || document.querySelector('#mobileExamCardContainer .exam-focus-input');
+  if (!active) return;
+  if (active.disabled || active.readOnly) {
+    showNotification('This subject is view-only for the active staff account.', 'warning');
+    return;
+  }
+  active.value = value;
+  handleExamFocusMarkInput(active);
+  active.focus();
+}
+
+function handleExamFocusInputKeydown(event, input, isLast) {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    handleExamFocusMarkInput(input);
+    if (isLast) saveExamFocusCardAndNext(input.dataset.admission);
+    else {
+      const fields = Array.from(document.querySelectorAll('#mobileExamCardContainer .exam-focus-input'));
+      fields[Math.min(fields.length - 1, fields.indexOf(input) + 1)]?.focus();
+    }
+    return;
+  }
+  if (event.altKey && event.key === 'ArrowLeft') {
+    event.preventDefault();
+    moveExamFocusStudent(-1);
+  } else if (event.altKey && event.key === 'ArrowRight') {
+    event.preventDefault();
+    saveExamFocusCardAndNext(input.dataset.admission);
+  }
+}
+
+function handleExamFocusCardKeydown(event) {
+  if (event.target?.classList?.contains('exam-focus-input')) return;
+  if (event.key === 'ArrowLeft') {
+    event.preventDefault();
+    moveExamFocusStudent(-1);
+  } else if (event.key === 'ArrowRight') {
+    event.preventDefault();
+    moveExamFocusStudent(1);
+  }
+}
+
+function moveExamFocusStudent(delta) {
+  const total = Number(document.getElementById('mobileExamCardContainer')?.dataset.studentCount || 0);
+  if (!total) return;
+  const current = Number(window.activeExamCardStudentIdx || 0);
+  jumpExamFocusStudent(Math.max(0, Math.min(total - 1, current + Number(delta || 0))));
+}
+
+function getExamFocusCloudQueueState() {
+  if (!window._examFocusCloudQueueState) {
+    window._examFocusCloudQueueState = {
+      running: false,
+      dirty: false,
+      lastError: '',
+      lastSyncedAt: 0,
+      promise: null
+    };
+  }
+  return window._examFocusCloudQueueState;
+}
+
+function getExamFocusCloudStatusView() {
+  const durable = window.ERPOutbox?.getStatusFor?.('saveMarksDelta') || window.ERPOutbox?.getStatus?.();
+  if (durable) {
+    if (durable.syncing) {
+      return { text: 'Saving this student to cloud…', color: '#38bdf8', icon: 'fa-cloud-arrow-up' };
+    }
+    if (durable.pending) {
+      return { text: `${durable.pending} change${durable.pending === 1 ? '' : 's'} safely queued on this device`, color: '#38bdf8', icon: 'fa-clock-rotate-left' };
+    }
+    if (durable.failed) {
+      return { text: 'Cloud save needs attention — data remains on this device', color: '#f59e0b', icon: 'fa-triangle-exclamation' };
+    }
+    if (durable.pending && durable.byAction) {
+      /* keep existing pending handling */
+    }
+    const live = window._erpMarksLiveState;
+    if (live?.kind === 'conflict') {
+      return { text: 'Conflict — newer marks exist on another device', color: '#f59e0b', icon: 'fa-shield-halved' };
+    }
+    if (live?.kind === 'offline') {
+      return { text: 'Offline / pending — changes stay on this device', color: '#94a3b8', icon: 'fa-wifi' };
+    }
+    if (live?.kind === 'remote') {
+      return { text: 'Updated on another device', color: '#a78bfa', icon: 'fa-mobile-screen' };
+    }
+    if (durable.lastSavedAt) {
+      return { text: 'Saved and synced with broadsheet + cloud', color: '#34d399', icon: 'fa-cloud-circle-check' };
+    }
+  }
+  const state = getExamFocusCloudQueueState();
+  if (state.running || state.dirty) {
+    return { text: 'Saved instantly — cloud sync running…', color: '#38bdf8', icon: 'fa-cloud-arrow-up' };
+  }
+  if (state.lastError) {
+    return { text: 'Saved on this device — cloud retry needed', color: '#f59e0b', icon: 'fa-triangle-exclamation' };
+  }
+  if (state.lastSyncedAt) {
+    return { text: 'Saved and synced with broadsheet + cloud', color: '#34d399', icon: 'fa-cloud-circle-check' };
+  }
+  return { text: 'Changes update the broadsheet immediately', color: '#94a3b8', icon: 'fa-table-cells' };
+}
+
+function refreshExamFocusCloudStatus() {
+  const status = getExamFocusCloudStatusView();
+  const element = document.getElementById('examFocusCloudSyncStatus');
+  if (!element) return;
+  element.style.color = status.color;
+  element.innerHTML = `<i class="fa-solid ${status.icon}"></i> ${status.text}`;
+}
+
+if (!window._examFocusOutboxStatusBound) {
+  window._examFocusOutboxStatusBound = true;
+  window.addEventListener('erp:outbox-status', refreshExamFocusCloudStatus);
+}
+
+async function flushExamFocusCloudQueue() {
+  const state = getExamFocusCloudQueueState();
+  if (state.running) return state.promise;
+  state.running = true;
+  refreshExamFocusCloudStatus();
+  state.promise = (async () => {
+    try {
+      // One request at a time. If more students are edited while this upload
+      // runs, loop once more with the newest shared broadsheet state instead
+      // of starting overlapping full-school uploads.
+      while (state.dirty) {
+        state.dirty = false;
+        await persistErpCloudSave(null, { skipMergePull: true });
+        state.lastSyncedAt = Date.now();
+        state.lastError = '';
+      }
+    } catch (error) {
+      state.dirty = true;
+      state.lastError = error?.message || 'Cloud sync pending';
+    } finally {
+      state.running = false;
+      state.promise = null;
+      refreshExamFocusCloudStatus();
+    }
+  })();
+  return state.promise;
+}
+
+async function queueExamFocusCloudSave(delta) {
+  // The durable outbox is the preferred path: commit a tiny student/subject
+  // mutation to IndexedDB before moving to the next card. It survives refresh
+  // and sends only the changed assessments, never the whole school payload.
+  saveSchoolDataToStorage({ skipCloudPush: true });
+  
+  if (!delta) return;
+
+  const state = getExamFocusCloudQueueState();
+  state.lastError = '';
+
+  if (window.ERPOutbox && typeof window.ERPOutbox.enqueue === 'function') {
+    try {
+      await window.ERPOutbox.enqueue('saveMarksDelta', delta);
+      state.lastSyncedAt = Date.now();
+      refreshExamFocusCloudStatus();
+      return;
+    } catch (error) {
+      console.error('[ERP-MARKS] durable outbox unavailable; using fetch fallback:', error);
+    }
+  }
+  
+  // Fallback if IndexedDB is blocked (bypasses 4.5MB monolithic save limit on Vercel)
+  try {
+    state.running = true;
+    refreshExamFocusCloudStatus();
+    
+    const res = await fetch('/api/erp-cloud?action=saveMarksDelta', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(typeof getErpSessionToken === 'function' && getErpSessionToken() ? { 'X-ERP-Session': getErpSessionToken() } : {})
+      },
+      body: JSON.stringify(delta)
+    });
+    
+    const json = await res.json();
+    if (res.status === 409 || json?.conflict) {
+      if (window.ErpMarksRealtime) window.ErpMarksRealtime.setStatus('conflict', 'Updated on another device');
+      throw new Error(json?.error || 'Updated on another device. Refresh to load the latest marks.');
+    }
+    if (!json.ok) throw new Error(json.error || 'Server rejected delta sync.');
+    
+    state.lastSyncedAt = Date.now();
+    state.lastError = '';
+  } catch(error) {
+    state.lastError = error?.message || 'Cloud sync pending';
+  } finally {
+    state.running = false;
+    refreshExamFocusCloudStatus();
+  }
+}
+
+async function saveExamFocusCardAndNext(studentAdm) {
+  const inputs = Array.from(document.querySelectorAll('#mobileExamCardContainer .exam-focus-input'));
+  const editableInputs = inputs.filter(input => !input.disabled && !input.readOnly);
+  if (!editableInputs.length) {
+    showNotification('This subject is view-only. Select a subject mapped to the active teacher.', 'warning');
+    return;
+  }
+  editableInputs.forEach(handleExamFocusMarkInput);
+  const button = document.getElementById('examFocusSaveNextBtn');
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = '<i class="fa-solid fa-check"></i> Saved — opening next…';
+  }
+  const firstInput = editableInputs[0];
+  const student = (SchoolData.students || []).find(item => String(item.admissionNo) === String(studentAdm));
+  const delta = {
+    admissionNo: String(studentAdm || ''),
+    subjectCode: String(firstInput?.dataset.subject || '').toLowerCase(),
+    sessionName: String(SchoolData.activeSession || ''),
+    term: String(window.activeExamTerm || ''),
+    className: String(student?.currentClass || student?.class || window.activeExamClass || ''),
+    section: String(student?.currentSection || student?.section || window.activeExamSection || ''),
+    assessments: editableInputs.map(input => {
+      const key = String(input.dataset.component || '').toLowerCase();
+      const stored = student?.examMarks?.[String(firstInput?.dataset.subject || '').toLowerCase()]?.[key];
+      return {
+        key,
+        value: String(input.value || '').trim().toUpperCase(),
+        max: Number(input.dataset.max) || 0,
+        expectedRevision: Number((stored && typeof stored === 'object' && stored.revision) || 0)
+      };
+    })
+  };
+  await queueExamFocusCloudSave(delta);
+  // IndexedDB has already retained the targeted mutation. Move immediately so
+  // marks entry stays fast; the authenticated outbox continues the tiny cloud
+  // request in the background and visibly reports any real failure.
+  if (window.ERPOutbox?.flush) void window.ERPOutbox.flush();
+  persistExamFocusState({
+    className: delta.className,
+    section: delta.section,
+    term: delta.term,
+    subjectCode: String(delta.subjectCode || '').toUpperCase()
+  });
+  const total = Number(document.getElementById('mobileExamCardContainer')?.dataset.studentCount || 0);
+  const current = Number(window.activeExamCardStudentIdx || 0);
+  if (current < total - 1) {
+    window.activeExamCardStudentIdx = current + 1;
+    const jump = document.querySelector('#mobileExamCardContainer .exam-focus-jump');
+    const nextOption = jump?.options?.[window.activeExamCardStudentIdx];
+    window.activeExamCardStudentAdmission = String(nextOption?.dataset?.admission || '');
+    persistExamFocusState({ studentAdmission: window.activeExamCardStudentAdmission });
+    const container = document.getElementById('contentBody');
+    if (container) renderExamsPage(container, 'entry');
+  } else {
+    showNotification('Marks saved instantly and queued for cloud sync. This is the last student.', 'success');
+    if (button) {
+      button.disabled = false;
+      button.innerHTML = 'Saved <i class="fa-solid fa-check"></i>';
+    }
+    refreshExamFocusCloudStatus();
+  }
+}
+
+async function refreshVisibleExamFocusMarks() {
+  const card = document.getElementById('mobileExamCardContainer');
+  const active = document.activeElement;
+  if (!card || card.contains(active) || window.location.hash.replace('#', '').indexOf('exams') !== 0) return;
+  const firstInput = card.querySelector('.exam-focus-input');
+  const admissionNo = String(firstInput?.dataset.admission || '');
+  const subjectCode = String(firstInput?.dataset.subject || '');
+  if (!admissionNo || !subjectCode || !window.callErpSecurityApi) return;
+  const queue = window.ERPOutbox?.getStatusFor?.('saveMarksDelta');
+  if (queue?.pending || queue?.syncing) return;
+  try {
+    const result = await callErpSecurityApi('getMarksDelta', { method: 'GET', query: { admissionNo, subjectCode } });
+    const student = (SchoolData.students || []).find(item => String(item?.admissionNo || '') === admissionNo);
+    if (!student) return;
+    const before = JSON.stringify(student.examMarks?.[subjectCode] || {});
+    if (!student.examMarks || typeof student.examMarks !== 'object') student.examMarks = {};
+    student.examMarks[subjectCode] = { ...(result.marks || {}) };
+    if (before !== JSON.stringify(student.examMarks[subjectCode])) {
+      saveSchoolDataToStorage({ skipCloudPush: true });
+      const container = document.getElementById('contentBody');
+      if (container) renderExamsPage(container, 'entry');
+    }
+  } catch (_) {
+    // A failed background refresh must never overwrite the teacher's current work.
+  }
+}
+
+if (!window._examFocusRemoteRefreshBound) {
+  window._examFocusRemoteRefreshBound = true;
+  setInterval(() => { void refreshVisibleExamFocusMarks(); }, 12000);
+}
+
+function getExamMobileFocusCardHtml(students, activeClass, examTerm, subjects, selectedSubjectCode) {
+  if (!students.length) return '<div class="glass-card" style="text-align:center; padding:36px;">No students found for the selected class and section.</div>';
+  const subject = subjects.find(item => item.code === selectedSubjectCode) || subjects[0];
+  if (!subject) return '<div class="glass-card" style="text-align:center; padding:36px;">No configured subject is available for this exam term.</div>';
+  const rememberedAdmission = String(window.activeExamCardStudentAdmission || '');
+  const rememberedIndex = rememberedAdmission ? students.findIndex(item => String(item?.admissionNo || '') === rememberedAdmission) : -1;
+  const cardIndex = Math.max(0, Math.min(students.length - 1, rememberedIndex >= 0 ? rememberedIndex : Number(window.activeExamCardStudentIdx || 0)));
+  window.activeExamCardStudentIdx = cardIndex;
+  const student = students[cardIndex];
+  window.activeExamCardStudentAdmission = String(student?.admissionNo || '');
+  persistExamFocusState({ className: activeClass, term: examTerm, subjectCode: selectedSubjectCode, studentAdmission: window.activeExamCardStudentAdmission });
+  const subjectKey = String(subject.code || subject.name).toLowerCase();
+  const marks = student.examMarks?.[subjectKey] || {};
+  const components = getExamFocusComponents(activeClass, subject.code || subject.name, examTerm);
+  const total = components.reduce((sum, component) => sum + parseScore(marks[component.key]), 0);
+  const maxTotal = components.reduce((sum, component) => sum + Number(component.max || 0), 0);
+  const section = student.currentSection || student.section || 'A';
+  const canEditSubject = isSubjectEditableForActiveUser(subject.code || subject.name, activeClass, section);
+  const cloudStatus = getExamFocusCloudStatusView();
+
+  return `
+    <style>
+      .exam-focus-shell { max-width:760px; margin:20px auto 34px; padding:24px; border:3px solid #6366f1; border-radius:24px; background:#0b1120; box-shadow:0 24px 60px rgba(15,23,42,.55); color:#f8fafc; }
+      .exam-focus-top { display:flex; justify-content:space-between; align-items:center; gap:14px; margin-bottom:16px; }
+      .exam-focus-count { padding:8px 14px; border:1px solid #4f46e5; border-radius:999px; background:#1e1b4b; color:#38bdf8; font-weight:900; white-space:nowrap; }
+      .exam-focus-jump { width:min(300px,55%); background:#111827; color:#f8fafc; border:1px solid #334155; border-radius:10px; padding:9px 12px; font-weight:800; }
+      .exam-focus-profile { display:flex; justify-content:space-between; align-items:center; gap:16px; padding:18px 20px; border:1px solid #334155; border-radius:16px; background:#1e293b; }
+      .exam-focus-profile h3 { margin:0 0 6px; color:#38bdf8; font-size:1.55rem; font-weight:900; }
+      .exam-focus-class { padding:8px 14px; border-radius:999px; background:rgba(16,185,129,.15); border:1px solid #059669; color:#34d399; font-weight:900; white-space:nowrap; }
+      .exam-focus-subject { margin-top:18px; padding:18px; border:1.5px solid #38bdf8; border-radius:16px; background:#0f172a; }
+      .exam-focus-subject-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:16px; }
+      .exam-focus-subject-head h4 { margin:0; color:#38bdf8; font-size:1.15rem; font-weight:900; }
+      .exam-focus-total { padding:7px 13px; border-radius:999px; background:#1e1b4b; border:1px solid #4f46e5; color:#38bdf8; font-weight:900; white-space:nowrap; }
+      .exam-focus-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(145px,1fr)); gap:12px; }
+      .exam-focus-field label { display:block; margin-bottom:7px; color:#94a3b8; font-size:.82rem; font-weight:900; }
+      .exam-focus-input { width:100%; height:52px; padding:8px; border:2px solid #475569; border-radius:11px; background:#1e293b; color:#fff; text-align:center; font-size:1.25rem; font-weight:900; outline:none; }
+      .exam-focus-input:focus { border-color:#38bdf8; box-shadow:0 0 0 3px rgba(56,189,248,.16); }
+      .exam-focus-input.exam-focus-invalid { border-color:#ef4444; box-shadow:0 0 0 3px rgba(239,68,68,.16); }
+      .exam-focus-input.exam-focus-input-locked { border-color:#475569; background:#111827; color:#94a3b8; cursor:not-allowed; box-shadow:none; }
+      .exam-focus-access { display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:999px; font-size:.72rem; font-weight:900; white-space:nowrap; }
+      .exam-focus-quick { display:flex; justify-content:flex-end; flex-wrap:wrap; gap:9px; margin-top:12px; }
+      .exam-focus-quick button { border:0; border-radius:7px; padding:7px 12px; color:#fff; font-weight:900; cursor:pointer; }
+      .exam-focus-footer { display:grid; grid-template-columns:1fr 1.45fr; gap:14px; margin-top:22px; }
+      .exam-focus-footer button { min-height:56px; border-radius:13px; font-size:1rem; font-weight:900; }
+      @media(max-width:640px) { .exam-focus-shell{padding:13px;border-radius:18px}.exam-focus-top,.exam-focus-profile{align-items:stretch;flex-direction:column}.exam-focus-top{gap:8px;margin-bottom:10px}.exam-focus-profile{padding:13px 15px;gap:8px}.exam-focus-profile h3{font-size:1.3rem;margin-bottom:3px}.exam-focus-jump{width:100%}.exam-focus-class{align-self:flex-start;padding:6px 11px}.exam-focus-subject{margin-top:12px;padding:14px}.exam-focus-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.exam-focus-field label{min-height:30px;font-size:.64rem;line-height:1.15}.exam-focus-input{height:46px;padding:5px;font-size:1rem}.exam-focus-footer{grid-template-columns:.85fr 1.15fr;gap:8px;margin-top:14px}.exam-focus-footer button{min-height:48px;font-size:.92rem}.exam-focus-quick{justify-content:stretch}.exam-focus-quick button{flex:1;padding:7px 5px}.exam-focus-subject-head{align-items:flex-start;flex-direction:column} }
+    </style>
+    <section id="mobileExamCardContainer" class="exam-focus-shell" data-student-count="${students.length}" tabindex="0" onkeydown="handleExamFocusCardKeydown(event)">
+      <div class="exam-focus-top">
+        <span class="exam-focus-count">Student ${cardIndex + 1} of ${students.length}</span>
+        <select class="exam-focus-jump" aria-label="Quick student jump" onchange="jumpExamFocusStudent(this.value)">
+          ${students.map((item, index) => `<option value="${index}" data-admission="${escapeHtml(String(item.admissionNo || ''))}" ${index === cardIndex ? 'selected' : ''}>${index + 1}. ${escapeHtml(item.name)} (${escapeHtml(String(item.admissionNo || ''))})</option>`).join('')}
+        </select>
+      </div>
+      <div class="exam-focus-profile">
+        <div>
+          <h3>${escapeHtml(student.name || '')}</h3>
+          <div style="color:#94a3b8; font-weight:700;">Adm No: <strong style="color:#a5b4fc;">${escapeHtml(String(student.admissionNo || ''))}</strong> &nbsp;|&nbsp; S/O: ${escapeHtml(student.parentName || '—')}</div>
+        </div>
+        <span class="exam-focus-class">${escapeHtml(activeClass)} - ${escapeHtml(section)}</span>
+      </div>
+      <div class="exam-focus-subject">
+        <div class="exam-focus-subject-head">
+          <div>
+            <h4><i class="fa-solid ${canEditSubject ? 'fa-pen-to-square' : 'fa-lock'}" style="color:${canEditSubject ? '#10b981' : '#f59e0b'};"></i> ${escapeHtml(subject.name)} (${escapeHtml(subject.code || '')})</h4>
+            <span class="exam-focus-access" style="margin-top:8px; color:${canEditSubject ? '#34d399' : '#fbbf24'}; background:${canEditSubject ? 'rgba(16,185,129,.14)' : 'rgba(245,158,11,.14)'}; border:1px solid ${canEditSubject ? '#059669' : '#d97706'};">
+              <i class="fa-solid ${canEditSubject ? 'fa-link' : 'fa-lock'}"></i> ${canEditSubject ? 'Mapped subject · Editable' : 'Not mapped · View only'}
+            </span>
+          </div>
+          <span id="examFocusTotalBadge" class="exam-focus-total">Total: ${total} / ${maxTotal}</span>
+        </div>
+        <div class="exam-focus-grid">
+          ${components.map((component, index) => {
+            const value = marks[component.key] === undefined || marks[component.key] === null ? '' : String(marks[component.key]).toUpperCase();
+            const inputId = `examFocus_${student.admissionNo}_${subjectKey}_${component.key}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+            return `<div class="exam-focus-field">
+              <label for="${inputId}">${component.label} (Max ${component.max})</label>
+              <input id="${inputId}" type="text" inputmode="decimal" autocomplete="off" class="exam-focus-input${canEditSubject ? '' : ' exam-focus-input-locked'}" value="${escapeHtml(value)}" placeholder="0-${component.max}" data-admission="${escapeHtml(String(student.admissionNo || ''))}" data-subject="${escapeHtml(subjectKey)}" data-component="${component.key}" data-max="${component.max}" ${canEditSubject ? '' : 'disabled aria-disabled="true" title="View-only: this subject is not mapped to the active staff account"'} onfocus="window.activeExamFocusInputId=this.id" oninput="handleExamFocusMarkInput(this)" onkeydown="handleExamFocusInputKeydown(event,this,${index === components.length - 1})">
+            </div>`;
+          }).join('')}
+        </div>
+        <div class="exam-focus-quick">
+          <button type="button" style="background:#dc2626;" onclick="setExamFocusQuickValue('AB')" ${canEditSubject ? '' : 'disabled'}>AB (Absent)</button>
+          <button type="button" style="background:#d97706;" onclick="setExamFocusQuickValue('ML')" ${canEditSubject ? '' : 'disabled'}>ML (Medical)</button>
+          <button type="button" style="background:#475569;" onclick="setExamFocusQuickValue('0')" ${canEditSubject ? '' : 'disabled'}>Zero (0)</button>
+        </div>
+        <div class="exam-focus-footer">
+          <button type="button" class="btn btn-secondary" onclick="moveExamFocusStudent(-1)" ${cardIndex === 0 ? 'disabled' : ''}><i class="fa-solid fa-chevron-left"></i> Prev</button>
+          <button id="examFocusSaveNextBtn" type="button" class="btn btn-primary" onclick="${canEditSubject ? `saveExamFocusCardAndNext('${escapeHtml(String(student.admissionNo || ''))}')` : 'moveExamFocusStudent(1)'}" style="background:${canEditSubject ? 'linear-gradient(135deg,#10b981,#059669)' : '#334155'}; border:0; box-shadow:${canEditSubject ? '0 8px 22px rgba(16,185,129,.3)' : 'none'};">${canEditSubject ? 'Save &amp; Next' : 'Next Student'} <i class="fa-solid fa-chevron-right"></i></button>
+        </div>
+      </div>
+      <div style="margin-top:10px; color:#64748b; font-size:.75rem; text-align:center;">Enter moves to the next assessment; Enter on the last field saves and advances. Alt + ← / → also navigates.</div>
+      <div id="examFocusCloudSyncStatus" style="margin-top:8px; color:${cloudStatus.color}; font-size:.78rem; font-weight:800; text-align:center;"><i class="fa-solid ${cloudStatus.icon}"></i> ${cloudStatus.text}</div>
+    </section>`;
+}
+
+/**
+ * Run one normalized read for a screen visit. The successful callback may
+ * rerender the screen, but the route token is recorded before the request so
+ * that rerender cannot start another request. Navigation clears the tokens.
+ */
+function requestErpV2ScreenRefresh(moduleKey, routeKey, refreshFn, onSuccess) {
+  if (typeof refreshFn !== 'function') return Promise.resolve({ ok: false, reason: 'NO_REFRESHER' });
+  if (!window.__erpV2ScreenRefreshState) window.__erpV2ScreenRefreshState = Object.create(null);
+  if (!window.__erpV2RefreshResetBound && typeof window.addEventListener === 'function') {
+    window.__erpV2RefreshResetBound = true;
+    window.addEventListener('hashchange', function() {
+      window.__erpV2ScreenRefreshState = Object.create(null);
+    });
+  }
+
+  const state = window.__erpV2ScreenRefreshState;
+  const token = `${String(routeKey || '')}:${String(window.location?.hash || '')}`;
+  if (state[moduleKey] === token) return Promise.resolve({ ok: false, skipped: true, reason: 'ALREADY_REFRESHED' });
+  state[moduleKey] = token;
+
+  return Promise.resolve()
+    .then(() => refreshFn())
+    .then((result) => {
+      if (!result || !result.ok) {
+        if (state[moduleKey] === token) delete state[moduleKey];
+        return result || { ok: false };
+      }
+      if (typeof onSuccess === 'function') onSuccess(result);
+      return result;
+    })
+    .catch((error) => {
+      if (state[moduleKey] === token) delete state[moduleKey];
+      return { ok: false, error: error?.message || String(error) };
+    });
+}
+
 function renderExamsPage(container, mode = 'entry') {
+  restoreExamFocusState();
+  if (window.ErpMarksRealtime && typeof window.ErpMarksRealtime.connect === 'function') {
+    void window.ErpMarksRealtime.connect();
+  }
+  if (window.ERP_V2_READ_FLAGS && window.ERP_V2_READ_FLAGS.marks && typeof window.refreshStudentMarksFromV2 === 'function') {
+    requestErpV2ScreenRefresh('marks', `exams:${mode}`, function() {
+      return window.refreshStudentMarksFromV2({
+        className: window.activeExamClass || '',
+        subjectCode: window.activeSelectedSubjectFilter && window.activeSelectedSubjectFilter !== 'ALL'
+          ? window.activeSelectedSubjectFilter
+          : (window.activeExamSubject || '')
+      });
+    }, function() {
+      if (window.location.hash.replace('#', '').startsWith('exams')) renderExamsPage(container, mode);
+    });
+  }
   const allStudents = getStudentsByActiveSession();
   const currentSession = SchoolData.activeSession;
 
@@ -2777,6 +4595,7 @@ function renderExamsPage(container, mode = 'entry') {
     ? document.getElementById('examTermSelector').value
     : null) || window.activeExamTerm || 'half_yearly';
   window.activeExamTerm = examTerm;
+  persistExamFocusState({ className: activeClass, section: activeSection, term: examTerm, subjectCode: window.activeSelectedSubjectFilter || 'ALL', viewMode: window.activeExamViewMode || 'card' });
 
   // Filter students to only those in the selected class and section
   const students = allStudents.filter(s =>
@@ -2784,17 +4603,29 @@ function renderExamsPage(container, mode = 'entry') {
     (activeSection === 'ALL' || (s.currentSection || s.section || 'A') === activeSection)
   );
 
+  if (!window.activeExamViewMode) {
+    window.activeExamViewMode = 'card';
+  }
+  const isCardView = window.activeExamViewMode === 'card';
+
   const classRule = SchoolData.weightageRules[activeClass] || SchoolData.weightageRules['default'];
 
   // Dynamic Subject Directory Resolution per Class & Exam Term
   const allSubjectsList = getSubjectsForClassAndExam(activeClass, examTerm);
-  const selectedSubjectFilter = window.activeSelectedSubjectFilter || 'ALL';
+  let selectedSubjectFilter = window.activeSelectedSubjectFilter || 'ALL';
+  if (isCardView && (selectedSubjectFilter === 'ALL' || !allSubjectsList.some(subject => subject.code === selectedSubjectFilter))) {
+    const firstMappedSubject = allSubjectsList.find(subject => isSubjectEditableForActiveUser(subject.code, activeClass, activeSection));
+    selectedSubjectFilter = firstMappedSubject?.code || allSubjectsList[0]?.code || 'ALL';
+    window.activeSelectedSubjectFilter = selectedSubjectFilter;
+  }
 
   let allSubjects = allSubjectsList;
   if (selectedSubjectFilter && selectedSubjectFilter !== 'ALL') {
     allSubjects = allSubjectsList.filter(sub => sub.code === selectedSubjectFilter);
   }
   const canExportExamSheets = canCurrentUserExportExamSheets();
+  const canConfigureWeightage = canUserConfigureExamWeightage();
+  const showWeightageInHeaders = canUserViewExamWeightage();
 
   container.innerHTML = `
     <div class="page-header">
@@ -2803,9 +4634,12 @@ function renderExamsPage(container, mode = 'entry') {
         <p class="page-subtitle">Enter All Subject Exam Scores Side-By-Side Per Student & Manage Class Weightage Rules</p>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        
+        ${canConfigureWeightage ? `
         <button class="btn btn-primary" style="background:#f59e0b; border:none;" onclick="window.location.hash='exams-weightage'">
           <i class="fa-solid fa-sliders"></i> Subject Exam Marks & Weightage
         </button>
+        ` : ''}
         ${canExportExamSheets ? `
           <button class="btn btn-primary" style="background:linear-gradient(135deg, #10b981 0%, #059669 100%); border:none;" onclick="exportClassHalfYearlyExcel('${activeClass}')">
             <i class="fa-solid fa-file-excel"></i> Half-Yearly Excel
@@ -2823,20 +4657,23 @@ function renderExamsPage(container, mode = 'entry') {
     ${getExamsSubNavHtml('exams-entry')}
 
     <!-- ACTIVE USER PERMISSION STATUS BANNER -->
-    <div style="padding:12px 18px; background:rgba(56, 189, 248, 0.12); border:1px solid #38bdf8; border-radius:12px; color:#38bdf8; font-weight:700; font-size:0.88rem; margin-bottom:16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+    <div style="padding:12px 18px; background:rgba(56, 189, 248, 0.12); border:1px solid #38bdf8; border-radius:12px; color:#0284c7; font-weight:700; font-size:0.88rem; margin-bottom:16px; display:${isCardView ? 'none' : 'flex'}; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
       <div>
-        <i class="fa-solid fa-user-shield"></i> Active Logged-In Account: <strong>${getCurrentActiveUser().name}</strong> [<span style="color:#ffffff;">${getCurrentActiveUser().role}</span>] 
+        <i class="fa-solid fa-user-shield"></i> Active Logged-In Account: <strong>${getCurrentActiveUser().name}</strong> [<span class="erp-role-chip">${getCurrentActiveUser().role}</span>] 
         ${(() => {
           const user = getCurrentActiveUser();
           const teacher = SchoolData.teachers.find(t => t.id === user.assignedTeacherId || t.name === user.name) || user;
-          if (user.role === 'Super Admin' || user.role === 'Principal' || user.assignedSubject === 'ALL') {
+          if (String(user.role || '').toLowerCase().includes('receptionist') || String(user.username || '').toLowerCase().includes('ruby')) {
+            return 'Access: <strong style="color:#38bdf8;">Receptionist Mode (Fee Counter & Front Desk Access — Marks Entry View-Only)</strong>';
+          }
+          if (user.role === 'Super Admin' || user.role === 'Principal' || (user.assignedSubject === 'ALL' && !user.role.includes('Teacher'))) {
             return 'Access: <strong style="color:#34d399;">Full Super Admin Access (All Subjects Editable Across All Classes)</strong>';
           }
           if (teacher.subjectMappings && teacher.subjectMappings.length > 0) {
             const mapStr = teacher.subjectMappings.map(m => `${m.subjectName} (${m.class} Sec ${m.section})`).join(', ');
-            return `Active Subject Edit Access: <strong style="color:#fbbf24;">${mapStr}</strong> (All other subjects View-Only)`;
+            return `Active Subject Edit Access: <strong style="color:#b45309;">${mapStr}</strong> (All other subjects View-Only)`;
           }
-          return `Subject Edit Access: <strong style="color:#fbbf24;">${user.assignedSubject || 'NONE'} Only</strong> (All other subjects View-Only)`;
+          return `Subject Edit Access: <strong style="color:#b45309;">${user.assignedSubject || 'NONE'} Only</strong> (All other subjects View-Only)`;
         })()}
       </div>
     </div>
@@ -2847,7 +4684,7 @@ function renderExamsPage(container, mode = 'entry') {
         <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
           <div>
             <label style="font-size:0.8rem; font-weight:700; color:var(--text-muted);">Choose Exam Term:</label><br>
-            <select id="examTermSelector" class="session-dropdown" style="width:240px; font-weight:700;" onchange="window.activeExamTerm=this.value; renderExamsPage(document.getElementById('contentBody'))">
+            <select id="examTermSelector" class="session-dropdown" style="width:240px; font-weight:700;" onchange="window.activeExamTerm=this.value; persistExamFocusState({term:this.value}); renderExamsPage(document.getElementById('contentBody'))">
               <option value="half_yearly" ${examTerm === 'half_yearly' ? 'selected' : ''}>Half-Yearly Examination (Term 1)</option>
               <option value="final_annual" ${examTerm === 'final_annual' ? 'selected' : ''}>Final Annual Examination (Term 2)</option>
               <option value="consolidated" ${examTerm === 'consolidated' ? 'selected' : ''}>Consolidated Master (Term 1 + Term 2)</option>
@@ -2855,7 +4692,7 @@ function renderExamsPage(container, mode = 'entry') {
           </div>
           <div>
             <label style="font-size:0.8rem; font-weight:700; color:var(--text-muted);">Select Class:</label><br>
-            <select id="examClassSelector" class="session-dropdown" style="width:190px; font-weight:700;" onchange="window.activeExamClass=this.value; window.activeSelectedSubjectFilter='ALL'; renderExamsPage(document.getElementById('contentBody'))">
+            <select id="examClassSelector" class="session-dropdown" style="width:190px; font-weight:700;" onchange="window.activeExamClass=this.value; window.activeSelectedSubjectFilter='ALL'; window.activeExamCardStudentAdmission=''; persistExamFocusState({className:this.value,subjectCode:'ALL',studentAdmission:''}); renderExamsPage(document.getElementById('contentBody'))">
               ${(Array.from(new Set([
                 "Class 5", "Class 4", "Class 8", "Class 10", "LKG", "Nursery", "UKG", "Class 1", "Class 2", "Class 3", "Class 6", "Class 7", "Class 9",
                 ...(SchoolData.classes ? SchoolData.classes.map(c => c.name) : []),
@@ -2866,21 +4703,12 @@ function renderExamsPage(container, mode = 'entry') {
             </select>
           </div>
           <div>
-            <label style="font-size:0.8rem; font-weight:700; color:#38bdf8;">Select Section:</label><br>
-            <select id="examSectionSelector" class="session-dropdown" style="width:180px; font-weight:700; color:#38bdf8; border:1px solid #38bdf8;" onchange="window.activeExamSection=this.value; renderExamsPage(document.getElementById('contentBody'))">
+            <label style="font-size:0.8rem; font-weight:700; color:#0284c7;">Select Section:</label><br>
+            <select id="examSectionSelector" class="session-dropdown" style="width:180px; font-weight:700; color:#0284c7; border:1px solid #38bdf8;" onchange="window.activeExamSection=this.value; window.activeExamCardStudentAdmission=''; persistExamFocusState({section:this.value,studentAdmission:''}); renderExamsPage(document.getElementById('contentBody'))">
               <option value="ALL" ${activeSection === 'ALL' ? 'selected' : ''}>ALL Sections (A+B+C)</option>
               <option value="A" ${activeSection === 'A' ? 'selected' : ''}>Section A</option>
               <option value="B" ${activeSection === 'B' ? 'selected' : ''}>Section B</option>
               <option value="C" ${activeSection === 'C' ? 'selected' : ''}>Section C</option>
-            </select>
-          </div>
-          <div>
-            <label style="font-size:0.8rem; font-weight:700; color:#38bdf8;">Target Subject Filter:</label><br>
-            <select id="examSubjectFilterSelector" class="session-dropdown" style="width:220px; font-weight:800; color:#38bdf8; border:2px solid #38bdf8;" onchange="switchActiveSubjectView(this.value)">
-              <option value="ALL" ${selectedSubjectFilter === 'ALL' ? 'selected' : ''}>ALL SUBJECTS (Broadsheet Grid)</option>
-              ${allSubjectsList.map(s => `
-                <option value="${s.code}" ${selectedSubjectFilter === s.code ? 'selected' : ''}>${s.name} Only</option>
-              `).join('')}
             </select>
           </div>
         </div>
@@ -2889,16 +4717,44 @@ function renderExamsPage(container, mode = 'entry') {
           <div style="padding:8px 14px; background:rgba(16, 185, 129, 0.15); border:1px solid #10b981; border-radius:8px; color:#10b981; font-weight:700; font-size:0.82rem;">
             Subject-wise exam max marks and weightage are active for ${activeClass}.
           </div>
-          ${(getCurrentActiveUser().role === 'Super Admin' || getCurrentActiveUser().role === 'Principal') ? `
+          ${canConfigureWeightage ? `
             <button class="btn btn-secondary" onclick="window.location.hash='exams-weightage'"><i class="fa-solid fa-gear"></i> Edit Weightage</button>
           ` : ''}
         </div>
+      
+
       </div>
     </div>
 
+    <!-- SHARED MARKS VIEW SWITCHER: BOTH MODES READ/WRITE student.examMarks -->
+    <div style="margin-bottom:18px; display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; background:#0f172a; padding:14px 18px; border-radius:14px; border:2px solid #6366f1;">
+      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+        <span style="font-weight:900; color:#a5b4fc;"><i class="fa-solid fa-display"></i> Mode:</span>
+        <div style="display:flex; gap:4px; padding:4px; border-radius:12px; background:#1e293b; border:1px solid #475569;">
+          <button type="button" class="btn" onclick="toggleExamViewMode('card')" style="padding:9px 15px; border:0; border-radius:9px; font-weight:900; background:${isCardView ? 'linear-gradient(135deg,#6366f1,#d946ef)' : '#334155'}; color:#fff; box-shadow:${isCardView ? '0 5px 16px rgba(99,102,241,.35)' : 'none'};"><i class="fa-solid fa-mobile-screen-button"></i> Mobile Focus Card</button>
+          <button type="button" class="btn" onclick="toggleExamViewMode('table')" style="padding:9px 15px; border:0; border-radius:9px; font-weight:900; background:${!isCardView ? '#475569' : '#1e293b'}; color:#fff;"><i class="fa-solid fa-table-cells"></i> Broadsheet Table</button>
+        </div>
+      </div>
+      <label style="display:flex; align-items:center; gap:10px; color:#38bdf8; font-weight:900;">
+        <i class="fa-solid fa-filter"></i> Subject:
+        <select id="examSubjectFilterSelector" class="session-dropdown" style="min-width:260px; font-weight:900; color:#ffffff; background:#111827; border:1px solid #334155;" onchange="changeExamSubjectSelection(this.value)">
+          ${!isCardView ? `<option value="ALL" ${selectedSubjectFilter === 'ALL' ? 'selected' : ''}>ALL SUBJECTS</option>` : ''}
+          ${allSubjectsList.map(subject => {
+            const isMapped = isSubjectEditableForActiveUser(subject.code, activeClass, activeSection);
+            return `<option value="${subject.code}" ${selectedSubjectFilter === subject.code ? 'selected' : ''}>${isMapped ? '✓' : '🔒'} ${subject.name}${subject.code ? ` (${subject.code})` : ''}${isMapped ? '' : ' — View only'}</option>`;
+          }).join('')}
+        </select>
+      </label>
+    </div>
+
+    <div id="examMobileFocusView" style="display:${isCardView ? 'block' : 'none'};">
+      ${isCardView ? getExamMobileFocusCardHtml(students, activeClass, examTerm, allSubjectsList, selectedSubjectFilter) : ''}
+    </div>
+
+    <div id="examBroadsheetView" style="display:${isCardView ? 'none' : 'block'};">
     <!-- SUBJECT FILTER QUICK SELECTOR BAR -->
     <div style="margin-bottom:16px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; background:#0f172a; padding:12px 18px; border-radius:10px; border:2px solid #38bdf8;">
-      <span style="font-weight:800; color:#38bdf8; font-size:0.9rem;"><i class="fa-solid fa-filter"></i> Switch Target Subject View:</span>
+      <span style="font-weight:800; color:#0284c7; font-size:0.9rem;"><i class="fa-solid fa-filter"></i> Switch Target Subject View:</span>
       <button class="btn btn-secondary" style="padding:6px 14px; font-size:0.85rem; font-weight:800; background:${selectedSubjectFilter === 'ALL' ? '#6366f1' : '#1e293b'}; color:${selectedSubjectFilter === 'ALL' ? '#ffffff' : '#38bdf8'}; border:${selectedSubjectFilter === 'ALL' ? '2px solid #a5b4fc' : '1px solid #38bdf8'};" onclick="switchActiveSubjectView('ALL')">
         ALL SUBJECTS (Broadsheet Grid)
       </button>
@@ -2919,23 +4775,32 @@ function renderExamsPage(container, mode = 'entry') {
           <small style="color:var(--text-muted);"><i class="fa-solid fa-arrows-left-right" style="color:var(--accent-primary);"></i> On phone or PC: name columns stay frozen — swipe/slide subjects (or use slider / subject buttons).</small>
         </div>
         ${canExportExamSheets ? `
-          <button class="btn btn-primary" style="background:linear-gradient(135deg, #6366f1 0%, #4f46e5 100%); border:none; padding:10px 20px;" onclick="saveAndExportVisibleClassSheet()">
-            <i class="fa-solid fa-file-excel"></i> Save & Export Whole Class Sheet
+          <div style="display:flex; gap: 10px;">
+            <button class="btn btn-primary" style="background:linear-gradient(135deg, #10b981 0%, #059669 100%); border:none; padding:10px 20px;" onclick="saveEnteredMarks(true)">
+              <i class="fa-solid fa-floppy-disk"></i> Save Marks
+            </button>
+            <button class="btn btn-primary" style="background:linear-gradient(135deg, #6366f1 0%, #4f46e5 100%); border:none; padding:10px 20px;" onclick="exportVisibleClassSheetOnly()">
+              <i class="fa-solid fa-file-excel"></i> Export Sheet
+            </button>
+          </div>
+        ` : `
+          <button class="btn btn-primary" style="background:linear-gradient(135deg, #10b981 0%, #059669 100%); border:none; padding:10px 20px;" onclick="saveEnteredMarks(true)">
+            <i class="fa-solid fa-floppy-disk"></i> Save Marks
           </button>
-        ` : ''}
+        `}
       </div>
 
       <!-- HORIZONTAL SLIDER DRAG CONTROL BAR -->
       <div style="background:#0f172a; padding:12px 18px; border-radius:10px; border:2px solid #38bdf8; margin-bottom:16px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
-        <div style="display:flex; align-items:center; gap:8px; color:#38bdf8; font-weight:800; font-size:0.95rem; white-space:nowrap;">
+        <div style="display:flex; align-items:center; gap:8px; color:#0284c7; font-weight:800; font-size:0.95rem; white-space:nowrap;">
           <i class="fa-solid fa-sliders" style="font-size:1.2rem;"></i> Drag Subject Slider Bar:
         </div>
         <div style="display:flex; align-items:center; gap:8px; flex:1; min-width:240px;">
-          <button class="btn btn-secondary" style="padding:6px 12px; font-size:0.85rem; font-weight:800; background:#1e293b; color:#38bdf8; border:1px solid #38bdf8; white-space:nowrap;" onclick="scrollSubjectTable(-500)">
+          <button class="btn btn-secondary" style="padding:6px 12px; font-size:0.85rem; font-weight:800; background:#1e293b; color:#0284c7; border:1px solid #38bdf8; white-space:nowrap;" onclick="scrollSubjectTable(-500)">
             <i class="fa-solid fa-chevron-left"></i> Left
           </button>
-          <input type="range" id="subjectRangeSlider" min="0" max="100" value="0" style="flex:1; min-width:100px; height:10px; accent-color:#38bdf8; cursor:pointer;" onmousedown="window._isDraggingSlider=true" onmouseup="window._isDraggingSlider=false" ontouchstart="window._isDraggingSlider=true" ontouchend="window._isDraggingSlider=false" oninput="syncSubjectTableSlider(this.value)">
-          <button class="btn btn-secondary" style="padding:6px 12px; font-size:0.85rem; font-weight:800; background:#1e293b; color:#38bdf8; border:1px solid #38bdf8; white-space:nowrap;" onclick="scrollSubjectTable(500)">
+          <input type="range" id="subjectRangeSlider" min="0" max="100" value="0" style="flex:1; min-width:100px; height:10px; accent-color:#0284c7; cursor:pointer;" onmousedown="window._isDraggingSlider=true" onmouseup="window._isDraggingSlider=false" ontouchstart="window._isDraggingSlider=true" ontouchend="window._isDraggingSlider=false" oninput="syncSubjectTableSlider(this.value)">
+          <button class="btn btn-secondary" style="padding:6px 12px; font-size:0.85rem; font-weight:800; background:#1e293b; color:#0284c7; border:1px solid #38bdf8; white-space:nowrap;" onclick="scrollSubjectTable(500)">
             Right <i class="fa-solid fa-chevron-right"></i>
           </button>
         </div>
@@ -2967,6 +4832,7 @@ function renderExamsPage(container, mode = 'entry') {
         #subjectTableContainer {
           -webkit-overflow-scrolling: touch;
           overscroll-behavior: contain;
+          touch-action: pan-x pan-y;
         }
         #subjectTableContainer .sticky-col-1,
         #subjectTableContainer .sticky-col-2,
@@ -2991,13 +4857,28 @@ function renderExamsPage(container, mode = 'entry') {
         }
         #subjectTableContainer .sticky-col-2 {
           left: 50px !important;
-          min-width: 180px !important;
+          width: 128px !important;
+          min-width: 128px !important;
+          max-width: 128px !important;
           border-right: 1px solid #334155 !important;
         }
         #subjectTableContainer .sticky-col-3 {
-          left: 230px !important;
-          min-width: 165px !important;
+          left: 178px !important;
+          width: 96px !important;
+          min-width: 96px !important;
+          max-width: 96px !important;
           border-right: 3px solid #6366f1 !important;
+        }
+        #subjectTableContainer .sticky-col-3 {
+          overflow: hidden !important;
+          text-overflow: ellipsis !important;
+          white-space: nowrap !important;
+        }
+        #subjectTableContainer .sticky-col-2 .exam-student-name {
+          white-space: normal !important;
+          word-break: break-word !important;
+          line-height: 1.25 !important;
+          font-weight: 800 !important;
         }
         @media (max-width: 1024px) {
           #subjectTableContainer {
@@ -3014,21 +4895,17 @@ function renderExamsPage(container, mode = 'entry') {
           }
           #subjectTableContainer .sticky-col-2 {
             left: 36px !important;
-            width: 120px !important;
-            min-width: 120px !important;
-            max-width: 120px !important;
-            font-size: 0.88rem !important;
-            white-space: normal !important;
-            line-height: 1.2 !important;
+            width: 108px !important;
+            min-width: 108px !important;
+            max-width: 108px !important;
+            font-size: 0.78rem !important;
           }
           #subjectTableContainer .sticky-col-3 {
-            left: 156px !important;
-            width: 100px !important;
-            min-width: 100px !important;
-            max-width: 100px !important;
-            font-size: 0.8rem !important;
-            white-space: normal !important;
-            line-height: 1.2 !important;
+            left: 144px !important;
+            width: 82px !important;
+            min-width: 82px !important;
+            max-width: 82px !important;
+            font-size: 0.74rem !important;
           }
         }
       </style>
@@ -3040,11 +4917,11 @@ function renderExamsPage(container, mode = 'entry') {
             <!-- TOP GROUP HEADER ROW -->
             <tr style="background:#0f172a; color:#ffffff;">
               <th rowspan="2" class="sticky-col-1" style="width:50px; border-bottom:2px solid #334155; padding:12px;">S.No</th>
-              <th rowspan="2" class="sticky-col-2" style="min-width:180px; text-align:left; border-bottom:2px solid #334155; padding:12px; color:#38bdf8;">Student's Name</th>
-              <th rowspan="2" class="sticky-col-3" style="min-width:165px; text-align:left; border-bottom:2px solid #334155; padding:12px; color:#cbd5e1;">Father's Name</th>
+              <th rowspan="2" class="sticky-col-2" style="width:128px; max-width:128px; text-align:left; border-bottom:2px solid #334155; padding:8px; color:#0284c7; font-size:0.82rem;">Student</th>
+              <th rowspan="2" class="sticky-col-3" style="width:96px; max-width:96px; text-align:left; border-bottom:2px solid #334155; padding:8px; color:#cbd5e1; font-size:0.82rem;">Father</th>
 
               ${allSubjects.map(sub => `
-                <th id="sub-header-${sub.code}" colspan="${examTerm === 'consolidated' ? '3' : '4'}" style="position:sticky; top:0; z-index:20; background:#1e293b; color:#fbbf24; border:1px solid #334155; padding:12px; font-size:1.1rem; letter-spacing:1px;">${sub.name}</th>
+                <th id="sub-header-${sub.code}" colspan="${examTerm === 'consolidated' ? '3' : '4'}" style="position:sticky; top:0; z-index:20; background:#1e293b; color:#b45309; border:1px solid #334155; padding:12px; font-size:1.1rem; letter-spacing:1px;">${sub.name}</th>
               `).join('')}
 
               <th colspan="3" style="position:sticky; top:0; z-index:20; background:#78350f; color:#fef3c7; border:1px solid #334155; padding:12px; font-size:1.05rem;">SUMMARY</th>
@@ -3068,23 +4945,23 @@ function renderExamsPage(container, mode = 'entry') {
                 const finWeight = getSubjectExamComponentWeightage(activeClass, sub.code || sub.name, 'fin');
                 if (examTerm === 'half_yearly') {
                   return `
-                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${sub.code} UT1 (${ut1Max} -> ${ut1Weight})</th>
-                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${sub.code} UT2 (${ut2Max} -> ${ut2Weight})</th>
-                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${sub.code} HY (${hyMax} -> ${hyWeight})</th>
-                    <th style="position:sticky; top:46px; z-index:20; background:#0f172a; color:#fbbf24; border:1px solid #475569; padding:8px; font-size:0.95rem;">${sub.code} TOT (100)</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'UT1', ut1Max, ut1Weight, showWeightageInHeaders)}</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'UT2', ut2Max, ut2Weight, showWeightageInHeaders)}</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'HY', hyMax, hyWeight, showWeightageInHeaders)}</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#0f172a; color:#b45309; border:1px solid #475569; padding:8px; font-size:0.95rem;">${sub.code} TOT (100)</th>
                   `;
                 } else if (examTerm === 'final_annual') {
                   return `
-                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${sub.code} T2 UT1 (${ut3Max} -> ${ut3Weight})</th>
-                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${sub.code} T2 UT2 (${ut4Max} -> ${ut4Weight})</th>
-                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${sub.code} FINAL (${finMax} -> ${finWeight})</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'T2 UT1', ut3Max, ut3Weight, showWeightageInHeaders)}</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'T2 UT2', ut4Max, ut4Weight, showWeightageInHeaders)}</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${formatExamComponentHeaderLabel(sub.code, 'FINAL', finMax, finWeight, showWeightageInHeaders)}</th>
                     <th style="position:sticky; top:46px; z-index:20; background:#064e3b; color:#a7f3d0; border:1px solid #065f46; padding:8px; font-size:0.95rem;">${sub.code} TOT (100)</th>
                   `;
                 } else {
                   return `
                     <th style="position:sticky; top:46px; z-index:20; background:#334155; border:1px solid #475569; padding:8px;">${sub.code} T1 (100)</th>
                     <th style="position:sticky; top:46px; z-index:20; background:#047857; border:1px solid #065f46; padding:8px;">${sub.code} T2 (100)</th>
-                    <th style="position:sticky; top:46px; z-index:20; background:#0f172a; color:#fbbf24; border:1px solid #475569; padding:8px; font-size:0.95rem;">${sub.code} TOT (200)</th>
+                    <th style="position:sticky; top:46px; z-index:20; background:#0f172a; color:#b45309; border:1px solid #475569; padding:8px; font-size:0.95rem;">${sub.code} TOT (200)</th>
                   `;
                 }
               }).join('')}
@@ -3099,7 +4976,7 @@ function renderExamsPage(container, mode = 'entry') {
               <tr>
                 <td colspan="50" style="padding:40px; text-align:center; color:var(--text-muted); font-size:1.1rem; font-weight:700;">
                   <i class="fa-solid fa-folder-open" style="font-size:2.2rem; margin-bottom:10px; display:block; color:#6366f1;"></i>
-                  No students currently enrolled in <span style="color:#38bdf8;">${activeClass}</span> for Academic Session <span style="color:#10b981;">${currentSession}</span>.
+                  No students currently enrolled in <span style="color:#0284c7;">${activeClass}</span> for Academic Session <span style="color:#10b981;">${currentSession}</span>.
                 </td>
               </tr>
             ` : students.map((s, idx) => {
@@ -3139,17 +5016,17 @@ function renderExamsPage(container, mode = 'entry') {
                   return `
                     <td style="border:1px solid #334155; padding:8px;">
                       ${canEditSubject 
-                        ? `<input type="number" min="0" max="${ut1Max}" data-weightage="${ut1Weight}" data-subject="${markCode}" data-exam="ut1" class="session-dropdown marks-input" style="width:75px; height:40px; text-align:center; padding:4px; font-size:1.1rem; font-weight:800; color:#ffffff; background:#1e293b; border:2px solid #6366f1; border-radius:8px;" value="${ut1Val}" oninput="recalcMasterBroadsheetRow(this)">`
+                        ? `<input type="text" inputmode="decimal" min="0" max="${ut1Max}" data-weightage="${ut1Weight}" data-subject="${markCode}" data-exam="ut1" class="session-dropdown marks-input" style="width:75px; height:40px; text-align:center; padding:4px; font-size:1.1rem; font-weight:800; color:#ffffff; background:#1e293b; border:2px solid #6366f1; border-radius:8px;" value="${ut1Val}" oninput="recalcMasterBroadsheetRow(this)">`
                         : `<div style="padding:6px 8px; background:rgba(30, 41, 59, 0.6); color:#cbd5e1; border:1px solid #334155; border-radius:8px; font-weight:800; font-size:1rem;" title="Read-Only: Only assigned ${sub.name} teacher can edit"><i class="fa-solid fa-lock" style="font-size:0.75rem; color:#94a3b8; margin-right:4px;"></i>${ut1Val}</div>`}
                     </td>
                     <td style="border:1px solid #334155; padding:8px;">
                       ${canEditSubject 
-                        ? `<input type="number" min="0" max="${ut2Max}" data-weightage="${ut2Weight}" data-subject="${markCode}" data-exam="ut2" class="session-dropdown marks-input" style="width:75px; height:40px; text-align:center; padding:4px; font-size:1.1rem; font-weight:800; color:#ffffff; background:#1e293b; border:2px solid #6366f1; border-radius:8px;" value="${ut2Val}" oninput="recalcMasterBroadsheetRow(this)">`
+                        ? `<input type="text" inputmode="decimal" min="0" max="${ut2Max}" data-weightage="${ut2Weight}" data-subject="${markCode}" data-exam="ut2" class="session-dropdown marks-input" style="width:75px; height:40px; text-align:center; padding:4px; font-size:1.1rem; font-weight:800; color:#ffffff; background:#1e293b; border:2px solid #6366f1; border-radius:8px;" value="${ut2Val}" oninput="recalcMasterBroadsheetRow(this)">`
                         : `<div style="padding:6px 8px; background:rgba(30, 41, 59, 0.6); color:#cbd5e1; border:1px solid #334155; border-radius:8px; font-weight:800; font-size:1rem;" title="Read-Only: Only assigned ${sub.name} teacher can edit"><i class="fa-solid fa-lock" style="font-size:0.75rem; color:#94a3b8; margin-right:4px;"></i>${ut2Val}</div>`}
                     </td>
                     <td style="border:1px solid #334155; padding:8px;">
                       ${canEditSubject 
-                        ? `<input type="number" min="0" max="${hyMax}" data-weightage="${hyWeight}" data-subject="${markCode}" data-exam="hy" class="session-dropdown marks-input" style="width:78px; height:40px; text-align:center; padding:4px; font-size:1.1rem; font-weight:800; color:#ffffff; background:#1e293b; border:2px solid #6366f1; border-radius:8px;" value="${hyVal}" oninput="recalcMasterBroadsheetRow(this)">`
+                        ? `<input type="text" inputmode="decimal" min="0" max="${hyMax}" data-weightage="${hyWeight}" data-subject="${markCode}" data-exam="hy" class="session-dropdown marks-input" style="width:78px; height:40px; text-align:center; padding:4px; font-size:1.1rem; font-weight:800; color:#ffffff; background:#1e293b; border:2px solid #6366f1; border-radius:8px;" value="${hyVal}" oninput="recalcMasterBroadsheetRow(this)">`
                         : `<div style="padding:6px 8px; background:rgba(30, 41, 59, 0.6); color:#cbd5e1; border:1px solid #334155; border-radius:8px; font-weight:800; font-size:1rem;" title="Read-Only: Only assigned ${sub.name} teacher can edit"><i class="fa-solid fa-lock" style="font-size:0.75rem; color:#94a3b8; margin-right:4px;"></i>${hyVal}</div>`}
                     </td>
                     <td style="font-weight:800; font-size:1.1rem; background:#fef3c7; color:#92400e; border:1px solid #334155; padding:10px;" class="sub-tot">${t1} / 100</td>
@@ -3159,17 +5036,17 @@ function renderExamsPage(container, mode = 'entry') {
                   return `
                     <td style="border:1px solid #334155; padding:8px;">
                       ${canEditSubject 
-                        ? `<input type="number" min="0" max="${ut3Max}" data-weightage="${ut3Weight}" data-subject="${markCode}" data-exam="ut3" class="session-dropdown marks-input" style="width:75px; height:40px; text-align:center; padding:4px; font-size:1.1rem; font-weight:800; color:#ffffff; background:#1e293b; border:2px solid #10b981; border-radius:8px;" value="${ut3Val}" oninput="recalcMasterBroadsheetRow(this)">`
+                        ? `<input type="text" inputmode="decimal" min="0" max="${ut3Max}" data-weightage="${ut3Weight}" data-subject="${markCode}" data-exam="ut3" class="session-dropdown marks-input" style="width:75px; height:40px; text-align:center; padding:4px; font-size:1.1rem; font-weight:800; color:#ffffff; background:#1e293b; border:2px solid #10b981; border-radius:8px;" value="${ut3Val}" oninput="recalcMasterBroadsheetRow(this)">`
                         : `<div style="padding:6px 8px; background:rgba(30, 41, 59, 0.6); color:#cbd5e1; border:1px solid #334155; border-radius:8px; font-weight:800; font-size:1rem;" title="Read-Only: Only assigned ${sub.name} teacher can edit"><i class="fa-solid fa-lock" style="font-size:0.75rem; color:#94a3b8; margin-right:4px;"></i>${ut3Val}</div>`}
                     </td>
                     <td style="border:1px solid #334155; padding:8px;">
                       ${canEditSubject 
-                        ? `<input type="number" min="0" max="${ut4Max}" data-weightage="${ut4Weight}" data-subject="${markCode}" data-exam="ut4" class="session-dropdown marks-input" style="width:75px; height:40px; text-align:center; padding:4px; font-size:1.1rem; font-weight:800; color:#ffffff; background:#1e293b; border:2px solid #10b981; border-radius:8px;" value="${ut4Val}" oninput="recalcMasterBroadsheetRow(this)">`
+                        ? `<input type="text" inputmode="decimal" min="0" max="${ut4Max}" data-weightage="${ut4Weight}" data-subject="${markCode}" data-exam="ut4" class="session-dropdown marks-input" style="width:75px; height:40px; text-align:center; padding:4px; font-size:1.1rem; font-weight:800; color:#ffffff; background:#1e293b; border:2px solid #10b981; border-radius:8px;" value="${ut4Val}" oninput="recalcMasterBroadsheetRow(this)">`
                         : `<div style="padding:6px 8px; background:rgba(30, 41, 59, 0.6); color:#cbd5e1; border:1px solid #334155; border-radius:8px; font-weight:800; font-size:1rem;" title="Read-Only: Only assigned ${sub.name} teacher can edit"><i class="fa-solid fa-lock" style="font-size:0.75rem; color:#94a3b8; margin-right:4px;"></i>${ut4Val}</div>`}
                     </td>
                     <td style="border:1px solid #334155; padding:8px;">
                       ${canEditSubject 
-                        ? `<input type="number" min="0" max="${finMax}" data-weightage="${finWeight}" data-subject="${markCode}" data-exam="fin" class="session-dropdown marks-input" style="width:78px; height:40px; text-align:center; padding:4px; font-size:1.1rem; font-weight:800; color:#ffffff; background:#1e293b; border:2px solid #10b981; border-radius:8px;" value="${finVal}" oninput="recalcMasterBroadsheetRow(this)">`
+                        ? `<input type="text" inputmode="decimal" min="0" max="${finMax}" data-weightage="${finWeight}" data-subject="${markCode}" data-exam="fin" class="session-dropdown marks-input" style="width:78px; height:40px; text-align:center; padding:4px; font-size:1.1rem; font-weight:800; color:#ffffff; background:#1e293b; border:2px solid #10b981; border-radius:8px;" value="${finVal}" oninput="recalcMasterBroadsheetRow(this)">`
                         : `<div style="padding:6px 8px; background:rgba(30, 41, 59, 0.6); color:#cbd5e1; border:1px solid #334155; border-radius:8px; font-weight:800; font-size:1rem;" title="Read-Only: Only assigned ${sub.name} teacher can edit"><i class="fa-solid fa-lock" style="font-size:0.75rem; color:#94a3b8; margin-right:4px;"></i>${finVal}</div>`}
                     </td>
                     <td style="font-weight:800; font-size:1.1rem; background:#dcfce7; color:#166534; border:1px solid #334155; padding:10px;" class="sub-tot">${t2} / 100</td>
@@ -3191,8 +5068,10 @@ function renderExamsPage(container, mode = 'entry') {
               return `
                 <tr class="marks-entry-row" data-admission="${s.admissionNo}" style="border-bottom:1px solid #334155;">
                   <td class="sticky-col-1" style="border-bottom:1px solid #334155; padding:10px;"><code>${idx + 1}</code></td>
-                  <td class="sticky-col-2" style="text-align:left; font-weight:800; border-bottom:1px solid #334155; color:#38bdf8; font-size:1.05rem; padding:10px;">${s.name}</td>
-                  <td class="sticky-col-3" style="text-align:left; border-bottom:1px solid #334155; color:#cbd5e1; font-size:0.95rem; padding:10px;">${s.parentName}</td>
+                  <td class="sticky-col-2" style="text-align:left; border-bottom:1px solid #334155; padding:6px 8px;" title="${escapeHtml(s.name || '')} — Adm ${escapeHtml(String(s.admissionNo || ''))}">
+                    <div class="exam-student-name">${escapeHtml(s.name || '')}</div>
+                  </td>
+                  <td class="sticky-col-3" style="text-align:left; border-bottom:1px solid #334155; color:#cbd5e1; font-size:0.82rem; padding:6px 8px;" title="${escapeHtml(s.parentName || '')}">${escapeHtml(s.parentName || '')}</td>
 
                   ${subCells}
 
@@ -3210,6 +5089,7 @@ function renderExamsPage(container, mode = 'entry') {
           </tbody>
         </table>
       </div>
+    </div>
     </div>
   `;
 
@@ -3284,6 +5164,25 @@ function renderExamsWeightageSubdirectoryPage(container) {
         <span class="badge badge-warning" style="font-size:0.85rem; padding:8px 14px;"><i class="fa-solid fa-circle-check"></i> ${termTitle}</span>
       </div>
 
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin:0 0 16px; padding:12px 14px; border:1px solid #475569; border-radius:10px; background:#111827;">
+        <div style="min-width:230px; flex:1;">
+          <div style="font-size:0.82rem; font-weight:800; color:#e2e8f0; margin-bottom:4px;"><i class="fa-solid fa-copy" style="color:#38bdf8;"></i> Copy max marks &amp; weightage</div>
+          <div style="font-size:0.76rem; color:#94a3b8;">Copies the selected subject's values to every included subject in ${escapeHtml(selectedClass)}. Subject and teacher mappings stay unchanged.</div>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <label for="weightageCopySource" style="font-size:0.8rem; font-weight:700; color:#cbd5e1;">Copy from</label>
+          <select id="weightageCopySource" class="session-dropdown" style="min-width:190px; font-weight:700;" ${subjects.some(sub => isSubjectIncluded(sub.code || sub.name)) ? '' : 'disabled'}>
+            ${subjects.filter(sub => isSubjectIncluded(sub.code || sub.name)).map(sub => {
+              const code = sub.code || sub.name;
+              return `<option value="${escapeHtml(code)}">${escapeHtml(sub.name)}${sub.code ? ` (${escapeHtml(sub.code)})` : ''}</option>`;
+            }).join('') || '<option value="">No included subjects</option>'}
+          </select>
+          <button class="btn btn-secondary" type="button" style="padding:10px 14px; font-weight:800; border-color:#38bdf8; color:#e0f2fe;" ${subjects.some(sub => isSubjectIncluded(sub.code || sub.name)) ? '' : 'disabled'} onclick="copyWeightageToAllIncludedSubjects('${escapeHtml(selectedClass)}')">
+            <i class="fa-solid fa-copy"></i> Copy to all included &amp; save
+          </button>
+        </div>
+      </div>
+
       <div style="background:#0f172a; border-radius:12px; border:1px solid #334155; overflow:auto; margin-bottom:20px;">
         <table style="width:100%; min-width:980px; border-collapse:collapse; font-size:0.88rem; text-align:left;">
           <thead>
@@ -3319,13 +5218,13 @@ function renderExamsWeightageSubdirectoryPage(container) {
                   </td>
                   <td style="padding:12px;"><code>${escapeHtml(sub.code)}</code></td>
                   <td style="padding:12px;"><strong style="color:#ffffff;">${escapeHtml(sub.name)}</strong></td>
-                  <td style="padding:12px; color:#cbd5e1;">${teacherLabel}</td>
+                  <td style="padding:12px; color:#374151;">${teacherLabel}</td>
                   ${components.map(c => `
                     <td style="padding:10px; text-align:center;">
                       <input type="number" class="subject-weightage-max session-dropdown" data-code="${escapeHtml(code)}" data-name="${escapeHtml(sub.name)}" data-component="${c.key}" value="${getSubjectExamComponentMax(selectedClass, code, c.key)}" style="width:84px; text-align:center; font-weight:800; color:#34d399; border:1px solid #34d399;">
                     </td>
                     <td style="padding:10px; text-align:center;">
-                      <input type="number" class="subject-weightage-value session-dropdown" data-code="${escapeHtml(code)}" data-name="${escapeHtml(sub.name)}" data-component="${c.key}" value="${getSubjectExamComponentWeightage(selectedClass, code, c.key)}" style="width:84px; text-align:center; font-weight:800; color:#fbbf24; border:1px solid #fbbf24;">
+                      <input type="number" class="subject-weightage-value session-dropdown" data-code="${escapeHtml(code)}" data-name="${escapeHtml(sub.name)}" data-component="${c.key}" value="${getSubjectExamComponentWeightage(selectedClass, code, c.key)}" style="width:84px; text-align:center; font-weight:800; color:#b45309; border:1px solid #fbbf24;">
                     </td>
                   `).join('')}
                 </tr>
@@ -3334,7 +5233,7 @@ function renderExamsWeightageSubdirectoryPage(container) {
               <tr>
                 <td colspan="${4 + components.length * 2}" style="padding:28px; text-align:center; color:#94a3b8;">
                   No real subjects for <strong>${escapeHtml(selectedClass)}</strong> yet.
-                  Open <a href="#subjects" style="color:#38bdf8;">Subjects Directory</a> and add subjects with
+                  Open <a href="#subjects" style="color:#0284c7;">Subjects Directory</a> and add subjects with
                   <strong>All Classes</strong> or include this class in <strong>Selected classes</strong>.
                 </td>
               </tr>
@@ -3356,10 +5255,7 @@ function renderExamsWeightageSubdirectoryPage(container) {
   `;
 }
 
-function saveClassWeightageRuleFromPage(clsName) {
-  if (!SchoolData.examSubjectConfigs) SchoolData.examSubjectConfigs = {};
-  if (!SchoolData.examSubjectConfigs[clsName]) SchoolData.examSubjectConfigs[clsName] = {};
-
+async function saveClassWeightageRuleFromPage(clsName) {
   const termGroup = document.getElementById('weightageTermGroupSelect')?.value || window.activeWeightageTermGroup || 'term1';
   const components = termGroup === 'term1'
     ? ['ut1', 'ut2', 'hy']
@@ -3373,15 +5269,16 @@ function saveClassWeightageRuleFromPage(clsName) {
     return;
   }
 
+  const nextTerms = {};
   components.forEach(component => {
     const term = getExamComponentTerm(component);
-    SchoolData.examSubjectConfigs[clsName][term] = includedRows.map(row => {
+    nextTerms[term] = includedRows.map(row => {
       const code = row.getAttribute('data-code');
       const name = row.getAttribute('data-name');
       const teacher = row.getAttribute('data-teacher') || 'Unassigned';
       const maxInput = document.querySelector(`.subject-weightage-max[data-code="${code}"][data-component="${component}"]`);
       const weightInput = document.querySelector(`.subject-weightage-value[data-code="${code}"][data-component="${component}"]`);
-      const existing = (SchoolData.examSubjectConfigs[clsName][term] || []).find(s => normalizeSubjectCodeKey(s.code) === normalizeSubjectCodeKey(code));
+      const existing = (SchoolData.examSubjectConfigs?.[clsName]?.[term] || []).find(s => normalizeSubjectCodeKey(s.code) === normalizeSubjectCodeKey(code));
 
       return {
         code,
@@ -3393,9 +5290,60 @@ function saveClassWeightageRuleFromPage(clsName) {
     });
   });
 
-  saveSchoolDataToStorage();
-  showNotification(`Saved subject exam marks and weightage for ${clsName} (${termGroup === 'term1' ? 'Term 1' : 'Term 2'}).`, 'success');
+  await persistExamConfigurationDelta({
+    scope: 'classTermGroup',
+    mode: 'weightage',
+    className: clsName,
+    termGroup,
+    terms: nextTerms
+  }, `Saved subject exam marks and weightage for ${clsName} (${termGroup === 'term1' ? 'Term 1' : 'Term 2'}).`);
   renderExamsWeightageSubdirectoryPage(document.getElementById('contentBody'));
+}
+
+/**
+ * Applies one real subject's assessment caps and scaled weightages to every
+ * currently included subject in the selected class/term group, then persists
+ * through the same conflict-safe configuration delta used by the normal Save.
+ * It deliberately never changes the Include checkboxes or teacher mappings.
+ */
+async function copyWeightageToAllIncludedSubjects(clsName) {
+  const sourceSelect = document.getElementById('weightageCopySource');
+  const sourceCode = String(sourceSelect?.value || '').trim();
+  const termGroup = document.getElementById('weightageTermGroupSelect')?.value || window.activeWeightageTermGroup || 'term1';
+  const components = termGroup === 'term1' ? ['ut1', 'ut2', 'hy'] : ['ut3', 'ut4', 'fin'];
+  const rows = Array.from(document.querySelectorAll('.subject-weightage-row'));
+  const includedRows = rows.filter(row => row.querySelector('.subject-weightage-include')?.checked);
+  const sourceRow = rows.find(row => String(row.getAttribute('data-code') || '') === sourceCode);
+
+  if (!sourceRow || !sourceRow.querySelector('.subject-weightage-include')?.checked || !includedRows.length) {
+    showNotification('Choose an included source subject before copying.', 'warning');
+    return;
+  }
+
+  const sourceName = sourceRow.getAttribute('data-name') || sourceCode;
+  const sourceValues = {};
+  for (const component of components) {
+    const maxInput = sourceRow.querySelector(`.subject-weightage-max[data-component="${component}"]`);
+    const weightInput = sourceRow.querySelector(`.subject-weightage-value[data-component="${component}"]`);
+    if (!maxInput || !weightInput || !String(maxInput.value).trim() || !String(weightInput.value).trim()) {
+      showNotification(`Enter valid Max and Weightage values for ${sourceName} before copying.`, 'warning');
+      return;
+    }
+    sourceValues[component] = { max: maxInput.value, weightage: weightInput.value };
+  }
+
+  if (!window.confirm(`Copy ${sourceName}'s Max Marks and Weightage to all ${includedRows.length} included subjects in ${clsName}? This will save the term configuration. You can edit any subject afterwards.`)) return;
+
+  includedRows.forEach(row => {
+    components.forEach(component => {
+      const maxInput = row.querySelector(`.subject-weightage-max[data-component="${component}"]`);
+      const weightInput = row.querySelector(`.subject-weightage-value[data-component="${component}"]`);
+      if (maxInput) maxInput.value = sourceValues[component].max;
+      if (weightInput) weightInput.value = sourceValues[component].weightage;
+    });
+  });
+
+  await saveClassWeightageRuleFromPage(clsName);
 }
 
 /* ============================================================================
@@ -3438,7 +5386,7 @@ function renderExamsStructureSubdirectoryPage(container) {
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; flex-wrap:wrap; gap:16px; border-bottom:1px solid #334155; padding-bottom:16px;">
         <div style="display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
           <div>
-            <label style="font-size:0.85rem; font-weight:700; color:#c084fc;">Select Class:</label><br>
+            <label style="font-size:0.85rem; font-weight:700; color:#6d28d9;">Select Class:</label><br>
             <select id="structClassSelect" class="session-dropdown" style="width:190px; font-weight:700;" onchange="renderExamsStructureSubdirectoryPage(document.getElementById('contentBody'))">
               ${availableClasses.map(c => `
                 <option value="${c}" ${selectedClass === c ? 'selected' : ''}>${c}</option>
@@ -3447,7 +5395,7 @@ function renderExamsStructureSubdirectoryPage(container) {
           </div>
 
           <div>
-            <label style="font-size:0.85rem; font-weight:700; color:#c084fc;">Select Exam Term:</label><br>
+            <label style="font-size:0.85rem; font-weight:700; color:#6d28d9;">Select Exam Term:</label><br>
             <select id="structTermSelect" class="session-dropdown" style="width:230px; font-weight:700;" onchange="renderExamsStructureSubdirectoryPage(document.getElementById('contentBody'))">
               <option value="half_yearly" ${selectedTerm === 'half_yearly' ? 'selected' : ''}>Half-Yearly Examination (Term 1)</option>
               <option value="final_annual" ${selectedTerm === 'final_annual' ? 'selected' : ''}>Final Annual Examination (Term 2)</option>
@@ -3487,7 +5435,7 @@ function renderExamsStructureSubdirectoryPage(container) {
                   </td>
                   <td style="padding:12px 16px;"><code>${s.code}</code></td>
                   <td style="padding:12px 16px;"><strong style="color:#ffffff;">${s.name}</strong></td>
-                  <td style="padding:12px 16px; color:#cbd5e1;"><i class="fa-solid fa-user-tie" style="color:#8b5cf6;"></i> ${s.teacher || 'Unassigned'}</td>
+                  <td style="padding:12px 16px; color:#374151;"><i class="fa-solid fa-user-tie" style="color:#8b5cf6;"></i> ${s.teacher || 'Unassigned'}</td>
                   <td style="padding:12px 16px; text-align:right;">
                     <input type="number" class="sub-struct-max session-dropdown" data-code="${s.code}" value="${maxVal}" style="width:90px; padding:6px 10px; font-weight:700; text-align:right; background:#1e293b; color:#34d399; border:1px solid #34d399;">
                   </td>
@@ -3510,10 +5458,7 @@ function renderExamsStructureSubdirectoryPage(container) {
   `;
 }
 
-function saveSubdirectoryClassExamStructure(className, examTerm) {
-  if (!SchoolData.examSubjectConfigs) SchoolData.examSubjectConfigs = {};
-  if (!SchoolData.examSubjectConfigs[className]) SchoolData.examSubjectConfigs[className] = {};
-
+async function saveSubdirectoryClassExamStructure(className, examTerm) {
   const rows = document.querySelectorAll('.sub-struct-check');
   const configured = [];
 
@@ -3523,7 +5468,7 @@ function saveSubdirectoryClassExamStructure(className, examTerm) {
       const name = chk.getAttribute('data-name');
       const maxInput = document.querySelector(`.sub-struct-max[data-code="${code}"]`);
       const maxMarks = parseInt(maxInput ? maxInput.value : '100') || 100;
-      const existingObj = (SchoolData.examSubjectConfigs[className][examTerm] || []).find(s => s.code === code);
+      const existingObj = (SchoolData.examSubjectConfigs?.[className]?.[examTerm] || []).find(s => s.code === code);
 
       configured.push({
         code: code,
@@ -3539,10 +5484,14 @@ function saveSubdirectoryClassExamStructure(className, examTerm) {
     return;
   }
 
-  SchoolData.examSubjectConfigs[className][examTerm] = configured;
-  saveSchoolDataToStorage();
-
-  showNotification(`Saved ${configured.length} exam subjects and max marks for ${className} (${examTerm.replace('_', ' ').toUpperCase()}).`, 'success');
+  await persistExamConfigurationDelta({
+    scope: 'classTermGroup',
+    mode: 'structure',
+    className,
+    termGroup: getExamConfigurationTermGroup(examTerm),
+    changedTerm: examTerm,
+    terms: { [examTerm]: configured }
+  }, `Saved ${configured.length} exam subjects and max marks for ${className} (${examTerm.replace('_', ' ').toUpperCase()}).`);
 }
 
 /* ============================================================================
@@ -3569,9 +5518,16 @@ function renderExamsReportCardsSubdirectoryPage(container) {
   const classStudents = allStudents.filter(s => (s.currentClass || s.class) === selectedClass);
   const configuredSubs = getSubjectsForClassAndExam(selectedClass, selectedTerm);
   const rankMap = calculateClassRanks(selectedClass, selectedTerm);
-  const isPrimary = (selectedClass.includes('Nursery') || selectedClass.includes('LKG') || selectedClass.includes('UKG') || selectedClass.includes('Class 1') || selectedClass.includes('Class 2') || selectedClass.includes('Class 3') || selectedClass.includes('Class 4') || selectedClass.includes('Class 5'));
 
-  // Build ranked student list
+  const parseScore = (val) => {
+    if (val === undefined || val === null) return 0;
+    const str = String(val).trim().toUpperCase();
+    if (str === 'AB' || str === 'ML' || str === 'NA' || str === '' || str === '-') return 0;
+    const num = parseFloat(str);
+    return isNaN(num) ? 0 : num;
+  };
+
+  // Build ranked student list with strictly numeric marks summation
   const rankedStudents = classStudents.map(student => {
     let totalObtained = 0;
     let totalMax = 0;
@@ -3580,24 +5536,38 @@ function renderExamsReportCardsSubdirectoryPage(container) {
       const code = (s.code || s.name).toLowerCase();
       const markObj = (student.examMarks && student.examMarks[code]) ? student.examMarks[code] : {};
       
-      let ut1 = markObj.ut1 !== undefined ? markObj.ut1 : 0;
-      let ut2 = markObj.ut2 !== undefined ? markObj.ut2 : 0;
-      let hy = markObj.hy !== undefined ? markObj.hy : 0;
-      let ut3 = markObj.ut3 !== undefined ? markObj.ut3 : 0;
-      let ut4 = markObj.ut4 !== undefined ? markObj.ut4 : 0;
-      let fin = markObj.fin !== undefined ? markObj.fin : 0;
+      let ut1 = parseScore(markObj.ut1);
+      let ut2 = parseScore(markObj.ut2);
+      let hy = parseScore(markObj.hy);
+      let ut3 = parseScore(markObj.ut3);
+      let ut4 = parseScore(markObj.ut4);
+      let fin = parseScore(markObj.fin);
 
       let subTotal = 0;
       if (selectedTerm === 'half_yearly') {
-        subTotal = ut1 + ut2 + hy;
+        const ut1Max = getSubjectExamComponentMax(selectedClass, code, 'ut1') || 25;
+        const ut2Max = getSubjectExamComponentMax(selectedClass, code, 'ut2') || 25;
+        const hyMax = getSubjectExamComponentMax(selectedClass, code, 'hy') || 100;
+        const ut1Weight = getSubjectExamComponentWeightage(selectedClass, code, 'ut1') || 20;
+        const ut2Weight = getSubjectExamComponentWeightage(selectedClass, code, 'ut2') || 20;
+        const hyWeight = getSubjectExamComponentWeightage(selectedClass, code, 'hy') || 60;
+        subTotal = Math.round((ut1Max ? (ut1 / ut1Max) * ut1Weight : 0) + (ut2Max ? (ut2 / ut2Max) * ut2Weight : 0) + (hyMax ? (hy / hyMax) * hyWeight : 0));
+        totalMax += (ut1Weight + ut2Weight + hyWeight);
       } else if (selectedTerm === 'final_annual') {
-        subTotal = ut3 + ut4 + fin;
+        const ut3Max = getSubjectExamComponentMax(selectedClass, code, 'ut3') || 25;
+        const ut4Max = getSubjectExamComponentMax(selectedClass, code, 'ut4') || 25;
+        const finMax = getSubjectExamComponentMax(selectedClass, code, 'fin') || 100;
+        const ut3Weight = getSubjectExamComponentWeightage(selectedClass, code, 'ut3') || 20;
+        const ut4Weight = getSubjectExamComponentWeightage(selectedClass, code, 'ut4') || 20;
+        const finWeight = getSubjectExamComponentWeightage(selectedClass, code, 'fin') || 60;
+        subTotal = Math.round((ut3Max ? (ut3 / ut3Max) * ut3Weight : 0) + (ut4Max ? (ut4 / ut4Max) * ut4Weight : 0) + (finMax ? (fin / finMax) * finWeight : 0));
+        totalMax += (ut3Weight + ut4Weight + finWeight);
       } else {
         subTotal = ut1 + ut2 + hy + ut3 + ut4 + fin;
+        totalMax += (s.maxMarks || 100);
       }
 
       totalObtained += subTotal;
-      totalMax += (s.maxMarks || 100);
     });
 
     const rank = rankMap[student.admissionNo] || 999;
@@ -3687,14 +5657,17 @@ function renderExamsReportCardsSubdirectoryPage(container) {
                   <td style="text-align:center;">${rankBadge}</td>
                   <td>
                     <div style="display:flex; align-items:center; gap:10px;">
-                      <img src="${s.photo}" style="width:36px; height:36px; border-radius:50%; object-fit:cover; border:1px solid #6366f1;">
-                      <strong style="color:var(--text-main);">${s.name}</strong>
+                      ${getStudentDirectoryPhotoHtml(s, 36)}
+                      <div>
+                        <strong style="color:var(--text-main);">${s.name}</strong>
+                        <span class="adm-no-chip">Adm ${s.admissionNo}</span>
+                      </div>
                     </div>
                   </td>
-                  <td><code>${s.admissionNo}</code></td>
+                  <td><span class="adm-no-chip">${s.admissionNo}</span></td>
                   <td><span class="badge badge-purple">${s.currentClass || selectedClass} - ${s.currentSection || 'A'}</span></td>
                   <td><strong style="color:#34d399;">${s.totalObtained} / ${s.totalMax}</strong></td>
-                  <td><strong style="color:#38bdf8;">${s.perc}%</strong></td>
+                  <td><strong style="color:#0284c7;">${s.perc}%</strong></td>
                   <td style="text-align:center;">
                     <div style="display:flex; gap:8px; justify-content:center;">
                       <button class="btn btn-primary" style="padding:6px 12px; font-size:0.8rem; background:linear-gradient(135deg, #6366f1 0%, #4f46e5 100%); border:none;" onclick="${selectedTerm === 'half_yearly' ? `viewHalfYearlyReportCard('${s.admissionNo}')` : `viewFinalAnnualReportCard('${s.admissionNo}')`}">
@@ -3741,9 +5714,11 @@ function renderUsersPage(container) {
   ensureStaffUserIds();
   if (typeof hydrateStaffPasswordsFromAdminVault === 'function') hydrateStaffPasswordsFromAdminVault();
   if (typeof repairStaffFinancialVisibilityRights === 'function' && repairStaffFinancialVisibilityRights()) {
-    saveSchoolDataToStorage();
+    saveSchoolDataToStorage({ skipCloudPush: true });
   }
   const users = SchoolData.staffUsers;
+  const _activeUserForRole = typeof getCurrentActiveUser === 'function' ? getCurrentActiveUser() : null;
+  const isCurrentUserSuperAdmin = !!(_activeUserForRole && (_activeUserForRole.role === 'Super Admin' || _activeUserForRole.role === 'Principal'));
 
   container.innerHTML = `
     <div class="page-header">
@@ -3762,7 +5737,7 @@ function renderUsersPage(container) {
     <div class="glass-card" style="margin-bottom:28px; border:2px solid #38bdf8; padding:22px;">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:18px; flex-wrap:wrap; gap:12px;">
         <div>
-          <h3 style="font-family:var(--font-heading); color:#38bdf8; margin:0; display:flex; align-items:center; gap:10px;">
+          <h3 style="font-family:var(--font-heading); color:#0284c7; margin:0; display:flex; align-items:center; gap:10px;">
             <i class="fa-solid fa-key"></i> Named Staff User Rights & Revenue Visibility Matrix
           </h3>
           <small style="color:var(--text-muted);">Tick boxes then <strong>Save</strong> — they really hide/show school-wide Total Dues &amp; Total Revenue (not cosmetic). Receptionist can collect fees without seeing school totals.</small>
@@ -3772,21 +5747,21 @@ function renderUsersPage(container) {
         </button>
       </div>
 
-      <div class="data-table-container">
-        <table class="data-table" style="text-align:center; font-size:0.88rem;">
+      <div class="data-table-container users-matrix-scroll custom-matrix-scroll" style="max-height: 550px; overflow-y: auto;">
+        <table class="data-table users-permissions-matrix" style="text-align:center; font-size:0.88rem; min-width:1400px;">
           <thead>
             <tr style="background:#0f172a; color:#ffffff;">
-              <th style="text-align:left; padding:12px;">Staff User Name</th>
-              <th style="text-align:left; padding:12px;">Staff ID</th>
-              <th style="text-align:left; padding:12px;">Role / Designation</th>
-              <th style="text-align:left; padding:12px; background:rgba(2, 132, 199, 0.2); color:#38bdf8;">Username & Password</th>
-              <th style="text-align:left; padding:12px; background:rgba(56, 189, 248, 0.15); color:#38bdf8;">Telegram Chat ID</th>
+              <th class="users-sticky-name" style="text-align:left; padding:12px;">Staff User Name</th>
+              <th class="users-sticky-role" style="text-align:left; padding:12px;">Role / Designation</th>
+              <th style="text-align:left; padding:12px;">Staff ID & Biometric ID</th>
+              <th style="text-align:left; padding:12px; background:rgba(2, 132, 199, 0.2); color:#0284c7;">Username & Password</th>
+              <th style="text-align:left; padding:12px; background:rgba(56, 189, 248, 0.15); color:#0284c7;">Telegram Chat ID</th>
               <th style="text-align:left; padding:12px; background:rgba(99, 102, 241, 0.2); color:#818cf8;">Teacher Subject Mappings</th>
               <th style="padding:12px; background:rgba(16, 185, 129, 0.2); color:#34d399;">Collect Fees & Ledger</th>
               <th style="padding:12px; background:rgba(16, 185, 129, 0.15); color:#34d399;">View Total Revenue</th>
-              <th style="padding:12px; background:rgba(245, 158, 11, 0.15); color:#fbbf24;">View Total Dues</th>
-              <th style="padding:12px; background:rgba(0, 136, 204, 0.2); color:#38bdf8;">Telegram Bot Hub</th>
-              <th style="padding:12px; background:rgba(168, 85, 247, 0.15); color:#c084fc;">Student Admissions</th>
+              <th style="padding:12px; background:rgba(245, 158, 11, 0.15); color:#b45309;">View Total Dues</th>
+              <th style="padding:12px; background:rgba(0, 136, 204, 0.2); color:#0284c7;">Telegram Bot Hub</th>
+              <th style="padding:12px; background:rgba(168, 85, 247, 0.15); color:#6d28d9;">Student Admissions</th>
               <th style="padding:12px; background:rgba(236, 72, 153, 0.15); color:#f472b6;">Print Report Cards</th>
               <th style="padding:12px;">Actions & Telegram Dispatch</th>
             </tr>
@@ -3799,16 +5774,24 @@ function renderUsersPage(container) {
 
               return `
                 <tr style="border-bottom:1px solid #334155;">
-                  <td style="text-align:left; font-weight:800; color:#38bdf8; padding:12px;">${u.name}</td>
-                  <td style="text-align:left; padding:12px;"><code style="color:#fbbf24; font-weight:800;">${u.uniqueId || u.id}</code></td>
-                  <td style="text-align:left; padding:12px; color:#cbd5e1; font-weight:700;">${u.role}</td>
-
+                  <td class="users-sticky-name" style="text-align:left; font-weight:800; color:#0284c7; padding:12px;">${u.name}</td>
+                  <td class="users-sticky-role" style="text-align:left; padding:12px;">
+                    <span class="erp-role-chip">${u.role}</span>
+                    ${isCurrentUserSuperAdmin ? `<br><button onclick="openChangeRoleModal('${u.id}')" style="margin-top:6px; font-size:0.7rem; padding:3px 8px; background:#334155; color:#94a3b8; border:1px solid #475569; border-radius:6px; cursor:pointer;">✏️ Change Role</button>` : ''}
+                  </td>
+                  <td style="text-align:left; padding:12px;">
+                    <div style="margin-bottom:6px;"><code style="color:#b45309; font-weight:800;">${u.uniqueId || u.id}</code></div>
+                    <div style="display:flex; gap:4px; align-items:center;">
+                      <input type="text" id="staffBiometric_${u.id}" class="session-dropdown" value="${escapeHtml(String(u.biometricId || ''))}" placeholder="Z900 ID" style="width:70px; padding:3px 6px; font-size:0.75rem; font-weight:700;">
+                      <button type="button" class="btn btn-secondary" style="padding:3px 6px; font-size:0.7rem;" onclick="saveStaffBiometricId('${u.id}')">Save</button>
+                    </div>
+                  </td>
                   <!-- USERNAME & PASSWORD -->
                   <td style="text-align:left; padding:12px;">
-                    <span style="font-size:0.8rem; color:#94a3b8;">User:</span> <code style="color:#38bdf8; font-weight:bold;">${u.username || 'admin'}</code><br>
+                    <span style="font-size:0.8rem; color:#94a3b8;">User:</span> <code style="color:#0284c7; font-weight:bold;">${u.username || 'admin'}</code><br>
                     <span style="font-size:0.8rem; color:#94a3b8;">Pass:</span>
                     ${canRevealStaffPasswords() ? `
-                      <code id="${staffPassDomId(u.id)}" style="color:#fbbf24; font-weight:bold;">••••••••</code>
+                      <code id="${staffPassDomId(u.id)}" style="color:#b45309; font-weight:bold;">••••••••</code>
                       <button type="button" class="btn btn-secondary" data-pass-toggle="1" style="padding:2px 8px; font-size:0.7rem; margin-left:6px;" onclick="toggleStaffPasswordVisible('${String(u.id).replace(/'/g, "\\'")}')">Show</button>
                       <button type="button" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem;" onclick="copyStaffLoginCredentials('${String(u.id).replace(/'/g, "\\'")}')">Copy</button>
                       <div style="font-size:0.68rem; color:${getStaffPasswordForAdminReveal(u) ? '#34d399' : '#fbbf24'}; margin-top:4px;">${getStaffPasswordForAdminReveal(u) ? 'Viewable on this PC — click Show' : 'Secure in cloud — Reset Pass, then Show'}</div>
@@ -3848,17 +5831,17 @@ function renderUsersPage(container) {
 
                   <!-- CAN MANAGE FEES -->
                   <td style="padding:12px;">
-                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${u.canManageFees || u.role === 'Accountant' || u.role === 'Super Admin' ? 'checked' : ''} data-uid="${u.id}" data-field="canManageFees">
+                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${(!isTeacher && u.canManageFees) || u.role === 'Accountant' || u.role === 'Super Admin' || u.role === 'Principal' || u.role === 'Receptionist' ? 'checked' : ''} data-uid="${u.id}" data-field="canManageFees" ${isTeacher ? 'disabled title="Teachers cannot collect fees by default"' : ''}>
                   </td>
 
                   <!-- VIEW REVENUE -->
                   <td style="padding:12px;">
-                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${u.viewTotalRevenue ? 'checked' : ''} data-uid="${u.id}" data-field="viewTotalRevenue">
+                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${(!isTeacher && u.viewTotalRevenue) || u.role === 'Accountant' || u.role === 'Super Admin' || u.role === 'Principal' ? 'checked' : ''} data-uid="${u.id}" data-field="viewTotalRevenue" ${isTeacher ? 'disabled title="Teachers cannot view school revenue totals"' : ''}>
                   </td>
 
                   <!-- VIEW DUES -->
                   <td style="padding:12px;">
-                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${u.viewDueBalance ? 'checked' : ''} data-uid="${u.id}" data-field="viewDueBalance">
+                    <input type="checkbox" style="width:20px; height:20px; cursor:pointer;" ${(!isTeacher && u.viewDueBalance) || u.role === 'Accountant' || u.role === 'Super Admin' || u.role === 'Principal' ? 'checked' : ''} data-uid="${u.id}" data-field="viewDueBalance" ${isTeacher ? 'disabled title="Teachers cannot view school-wide dues totals"' : ''}>
                   </td>
 
                   <!-- TELEGRAM BOT HUB ACCESS -->
@@ -3880,7 +5863,7 @@ function renderUsersPage(container) {
                     <button class="btn btn-primary" style="padding:4px 10px; font-size:0.78rem; background:linear-gradient(135deg, #0284c7 0%, #0369a1 100%); border:none; font-weight:800;" onclick="openUserAccessRightsModal('${u.id}')" title="Configure Granular View/Add/Modify/Delete Permissions">
                       Access Rights
                     </button>
-                    <button class="btn btn-secondary" style="padding:4px 8px; font-size:0.75rem; background:#1e293b; color:#38bdf8; border:1px solid #38bdf8; font-weight:700;" onclick="resetStaffPassword('${u.id}')" title="Reset User Password">
+                    <button class="btn btn-secondary" style="padding:4px 8px; font-size:0.75rem; background:#1e293b; color:#0284c7; border:1px solid #38bdf8; font-weight:700;" onclick="resetStaffPassword('${u.id}')" title="Reset User Password">
                       Reset Pass
                     </button>
                     <button class="btn btn-telegram" style="padding:4px 8px; font-size:0.75rem; font-weight:700;" onclick="sendStaffCredentialsViaTelegram('${u.id}')" title="Send Login Credentials to Staff via Telegram">
@@ -3904,11 +5887,11 @@ function renderUsersPage(container) {
 function getExamsSubNavHtml(active) {
   const tabs = [
     { hash: 'exams-entry', icon: 'fa-table-cells', label: 'Marks Entry' },
-    { hash: 'exams-weightage', icon: 'fa-sliders', label: 'Subject Marks & Weightage' },
+    { hash: 'exams-weightage', icon: 'fa-sliders', label: 'Subject Marks & Weightage', requiresWeightageConfig: true },
     { hash: 'exams-report-cards', icon: 'fa-award', label: 'Report Cards' },
     { hash: 'exams-schedule', icon: 'fa-calendar-days', label: 'Exam Schedule' },
     { hash: 'exams-admit-card', icon: 'fa-id-card', label: 'Admit Card' }
-  ];
+  ].filter(t => !t.requiresWeightageConfig || canUserConfigureExamWeightage());
   return `
     <div style="display:flex; gap:12px; margin-bottom:20px; border-bottom:2px solid var(--border-color); padding-bottom:12px; flex-wrap:wrap;">
       ${tabs.map(t => `
@@ -3921,6 +5904,65 @@ function getExamsSubNavHtml(active) {
 }
 
 const ERP_EXAM_TERM_PRESETS = ['UT1', 'UT2', 'Half-Yearly', 'UT3', 'UT4', 'Final Annual'];
+
+function examScheduleLegacyHash(row) {
+  const source = [
+    row?.term,
+    row?.className,
+    row?.section || 'ALL',
+    row?.subject,
+    row?.date,
+    row?.startTime,
+    row?.endTime,
+    row?.maxMarks
+  ].map(value => String(value ?? '').trim().toLowerCase()).join('|');
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < source.length; index += 1) {
+    hash ^= source.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+function ensureExamScheduleRowIds(rows = SchoolData.examSchedules) {
+  const occurrence = new Map();
+  (Array.isArray(rows) ? rows : []).forEach(row => {
+    if (!row || typeof row !== 'object') return;
+    const existing = String(row.id || row.rowId || '').trim();
+    if (existing) {
+      row.id = existing;
+      return;
+    }
+    const hash = examScheduleLegacyHash(row);
+    const ordinal = (occurrence.get(hash) || 0) + 1;
+    occurrence.set(hash, ordinal);
+    row.id = `legacy-${hash}-${ordinal}`;
+  });
+  return Array.isArray(rows) ? rows : [];
+}
+
+function createExamScheduleRowId() {
+  if (window.crypto?.randomUUID) return `schedule-${window.crypto.randomUUID()}`;
+  return `schedule-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+async function queueExamScheduleDeltaDurably({ upserts = [], deletedIds = [] }, message) {
+  ensureExamScheduleRowIds(upserts);
+  saveSchoolDataToStorage({ skipCloudPush: true });
+  if (window.ERPOutbox?.enqueue) {
+    await window.ERPOutbox.enqueue('saveExamScheduleDelta', {
+      upserts: upserts.map(row => ({ ...row })),
+      deletedIds: deletedIds.map(value => String(value || '').trim()).filter(Boolean)
+    });
+    void window.ERPOutbox.flush();
+    showNotification(`${message} Saved on this device and queued for cloud sync.`, 'success');
+    return { queued: true };
+  }
+  // Compatibility fallback for an old browser bundle. This remains protected
+  // by the snapshot revision check, but current deployments use the outbox.
+  await persistErpCloudSave(message);
+  return { queued: false };
+}
 
 function getExamScheduleTerms() {
   const used = (SchoolData.examSchedules || []).map(r => String(r.term || '').trim()).filter(Boolean);
@@ -3969,7 +6011,13 @@ function formatExamTimeRange(row) {
 }
 
 function renderExamSchedulePage(container) {
+  if (window.ERP_V2_READ_FLAGS && window.ERP_V2_READ_FLAGS.examSchedules && typeof window.refreshExamSchedulesFromV2 === 'function') {
+    requestErpV2ScreenRefresh('examSchedules', 'exams-schedule', window.refreshExamSchedulesFromV2, function() {
+      if (window.location.hash.replace('#', '') === 'exams-schedule') renderExamSchedulePage(container);
+    });
+  }
   if (!Array.isArray(SchoolData.examSchedules)) SchoolData.examSchedules = [];
+  ensureExamScheduleRowIds();
   const filterClass = window.examScheduleFilterClass || 'ALL';
   const filterTerm = window.examScheduleFilterTerm || 'ALL';
   const terms = getExamScheduleTerms();
@@ -4002,12 +6050,12 @@ function renderExamSchedulePage(container) {
 
     <div class="glass-card" style="border:2px solid #38bdf8; padding:22px;">
       <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:16px;">
-        <label style="font-weight:700; color:#38bdf8; font-size:0.85rem;">Class:</label>
+        <label style="font-weight:700; color:#0284c7; font-size:0.85rem;">Class:</label>
         <select class="session-dropdown" style="width:190px; font-weight:700;" onchange="window.examScheduleFilterClass=this.value; renderExamSchedulePage(document.getElementById('contentBody'))">
           <option value="ALL" ${filterClass === 'ALL' ? 'selected' : ''}>All Classes</option>
           ${getSchoolClassNames().map(c => `<option value="${escapeHtml(c)}" ${filterClass === c ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('')}
         </select>
-        <label style="font-weight:700; color:#38bdf8; font-size:0.85rem;">Exam Term:</label>
+        <label style="font-weight:700; color:#0284c7; font-size:0.85rem;">Exam Term:</label>
         <select class="session-dropdown" style="width:190px; font-weight:700;" onchange="window.examScheduleFilterTerm=this.value; renderExamSchedulePage(document.getElementById('contentBody'))">
           <option value="ALL" ${filterTerm === 'ALL' ? 'selected' : ''}>All Terms</option>
           ${terms.map(t => `<option value="${escapeHtml(t)}" ${filterTerm === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}
@@ -4015,7 +6063,7 @@ function renderExamSchedulePage(container) {
         <span class="badge badge-info">${rows.length} row(s)</span>
         ${lockClass || lockTerm ? `
           <span style="font-size:0.76rem; color:#94a3b8;">
-            New rows are added as <strong style="color:#38bdf8;">${escapeHtml(lockClass ? filterClass : 'selected class')}${lockTerm ? ` · ${escapeHtml(filterTerm)}` : ''}</strong>,
+            New rows are added as <strong style="color:#0284c7;">${escapeHtml(lockClass ? filterClass : 'selected class')}${lockTerm ? ` · ${escapeHtml(filterTerm)}` : ''}</strong>,
             so the Class${lockTerm ? ' / Term' : ''} column is hidden. Choose “All” above to edit it per row.
           </span>
         ` : ''}
@@ -4057,9 +6105,19 @@ function renderExamSchedulePage(container) {
                 <td>
                   <input list="examSubjectPresets" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="subject" value="${escapeHtml(row.subject || '')}" placeholder="Subject" style="min-width:170px;">
                 </td>
-                <td><input type="date" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="date" value="${escapeHtml(row.date || '')}"></td>
-                <td><input type="time" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="startTime" value="${escapeHtml(row.startTime || '')}"></td>
-                <td><input type="time" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="endTime" value="${escapeHtml(row.endTime || '')}"></td>
+                <td><input type="date" class="session-dropdown date-filter-input exam-schedule-input" data-index="${idx}" data-field="date" value="${escapeHtml(row.date || '')}"></td>
+                <td>
+                  <div class="exam-schedule-time-wrap">
+                    <i class="fa-solid fa-clock exam-schedule-clock-icon" aria-hidden="true"></i>
+                    <input type="time" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="startTime" value="${escapeHtml(row.startTime || '')}">
+                  </div>
+                </td>
+                <td>
+                  <div class="exam-schedule-time-wrap">
+                    <i class="fa-solid fa-clock exam-schedule-clock-icon" aria-hidden="true"></i>
+                    <input type="time" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="endTime" value="${escapeHtml(row.endTime || '')}">
+                  </div>
+                </td>
                 <td><input type="number" class="session-dropdown exam-schedule-input" data-index="${idx}" data-field="maxMarks" value="${escapeHtml(row.maxMarks || '')}" placeholder="30" style="min-width:80px;"></td>
                 <td><button class="btn btn-danger" style="padding:6px 10px; font-size:0.78rem;" onclick="deleteExamScheduleRow(${idx})"><i class="fa-solid fa-trash"></i> Delete</button></td>
               </tr>
@@ -4071,7 +6129,7 @@ function renderExamSchedulePage(container) {
       </div>
 
       <datalist id="examTermPresets">${getExamScheduleTerms().map(t => `<option value="${escapeHtml(t)}"></option>`).join('')}</datalist>
-      <datalist id="examSubjectPresets">${(SchoolData.subjects || []).map(s => `<option value="${escapeHtml(s.name || '')}"></option>`).join('')}</datalist>
+      <datalist id="examSubjectPresets">${ensureSchoolDataSubjectsArray().map(s => `<option value="${escapeHtml(s.name || '')}"></option>`).join('')}</datalist>
 
       <div style="display:flex; justify-content:flex-end; margin-top:18px; gap:10px;">
         <button class="btn btn-secondary" onclick="window.location.hash='exams-admit-card'"><i class="fa-solid fa-id-card"></i> Print Admit Cards</button>
@@ -4091,6 +6149,7 @@ function addExamScheduleRow() {
     ? window.examScheduleFilterTerm
     : 'UT1';
   SchoolData.examSchedules.push({
+    id: createExamScheduleRowId(),
     term: filterTerm,
     className: filterClass,
     section: 'ALL',
@@ -4100,7 +6159,9 @@ function addExamScheduleRow() {
     endTime: '',
     maxMarks: ''
   });
-  saveSchoolDataToStorage();
+  // Adding an empty editor row is not a save action. Persist only when the
+  // user presses Save Schedule, otherwise a refresh can replace a real row
+  // with an unfinished blank row.
   renderExamSchedulePage(document.getElementById('contentBody'));
 }
 
@@ -4111,23 +6172,23 @@ function openCopyExamScheduleModal() {
   document.body.insertAdjacentHTML('beforeend', `
     <div class="modal-overlay active" id="copyExamScheduleModal" style="z-index:99999;">
       <div class="modal-box" style="max-width:520px; background:#0f172a; border:2px solid #38bdf8; padding:22px; border-radius:16px;">
-        <h3 style="margin:0 0 6px 0; color:#38bdf8;"><i class="fa-solid fa-copy"></i> Copy Date Sheet To Another Class</h3>
+        <h3 style="margin:0 0 6px 0; color:#0284c7;"><i class="fa-solid fa-copy"></i> Copy Date Sheet To Another Class</h3>
         <p style="font-size:0.82rem; color:#94a3b8; margin:0 0 16px 0;">Copies subjects, dates and times. Adjust the new class afterwards if its papers differ.</p>
         <div style="display:flex; flex-direction:column; gap:12px;">
           <div>
-            <label style="font-size:0.8rem; font-weight:700; color:#cbd5e1;">Exam Term</label>
+            <label style="font-size:0.8rem; font-weight:700; color:#374151;">Exam Term</label>
             <select id="copySchedTerm" class="session-dropdown" style="width:100%;">
               ${terms.map(t => `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`).join('')}
             </select>
           </div>
           <div>
-            <label style="font-size:0.8rem; font-weight:700; color:#cbd5e1;">Copy From Class</label>
+            <label style="font-size:0.8rem; font-weight:700; color:#374151;">Copy From Class</label>
             <select id="copySchedFrom" class="session-dropdown" style="width:100%;">
               ${classes.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('')}
             </select>
           </div>
           <div>
-            <label style="font-size:0.8rem; font-weight:700; color:#cbd5e1;">Copy To Class</label>
+            <label style="font-size:0.8rem; font-weight:700; color:#374151;">Copy To Class</label>
             <select id="copySchedTo" class="session-dropdown" style="width:100%;">
               ${classes.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('')}
             </select>
@@ -4142,7 +6203,7 @@ function openCopyExamScheduleModal() {
   `);
 }
 
-function copyExamScheduleToClass() {
+async function copyExamScheduleToClass() {
   const term = document.getElementById('copySchedTerm')?.value || '';
   const from = document.getElementById('copySchedFrom')?.value || '';
   const to = document.getElementById('copySchedTo')?.value || '';
@@ -4156,15 +6217,18 @@ function copyExamScheduleToClass() {
     return;
   }
   source.forEach((row) => {
-    SchoolData.examSchedules.push({ ...row, className: to });
+    SchoolData.examSchedules.push({ ...row, id: createExamScheduleRowId(), className: to });
   });
-  saveSchoolDataToStorage();
+  const copiedRows = SchoolData.examSchedules.slice(-source.length);
+  await queueExamScheduleDeltaDurably(
+    { upserts: copiedRows },
+    `Copied ${source.length} ${term} row(s) from ${from} to ${to}.`
+  );
   document.getElementById('copyExamScheduleModal')?.remove();
-  showNotification(`Copied ${source.length} ${term} row(s) from ${from} to ${to}.`, 'success');
   renderExamSchedulePage(document.getElementById('contentBody'));
 }
 
-function saveExamScheduleRows(options = {}) {
+async function saveExamScheduleRows(options = {}) {
   document.querySelectorAll('.exam-schedule-input').forEach(input => {
     const idx = Number(input.getAttribute('data-index'));
     const field = input.getAttribute('data-field');
@@ -4172,15 +6236,29 @@ function saveExamScheduleRows(options = {}) {
     SchoolData.examSchedules[idx][field] = String(input.value || '').trim();
   });
   if (options.silent) return;
-  saveSchoolDataToStorage();
-  showNotification('Exam schedule saved. Admit cards will print these dates.', 'success');
-  renderExamSchedulePage(document.getElementById('contentBody'));
+  try {
+    ensureExamScheduleRowIds();
+    await queueExamScheduleDeltaDurably(
+      { upserts: SchoolData.examSchedules },
+      'Exam schedule saved. Admit cards will print these dates.'
+    );
+    renderExamSchedulePage(document.getElementById('contentBody'));
+  } catch (err) {
+    window._erpCloudMemoryDirty = true;
+    console.warn('Exam schedule cloud save failed:', err);
+    showNotification(`Exam schedule was not saved to cloud: ${err?.message || 'Please check the connection and try again.'}`, 'error');
+  }
 }
 
-function deleteExamScheduleRow(index) {
+async function deleteExamScheduleRow(index) {
   if (!Array.isArray(SchoolData.examSchedules)) return;
-  SchoolData.examSchedules.splice(index, 1);
-  saveSchoolDataToStorage();
+  ensureExamScheduleRowIds();
+  const removed = SchoolData.examSchedules.splice(index, 1)[0];
+  if (!removed) return;
+  await queueExamScheduleDeltaDurably(
+    { deletedIds: [removed.id] },
+    'Exam schedule row deleted.'
+  );
   renderExamSchedulePage(document.getElementById('contentBody'));
 }
 
@@ -4194,15 +6272,21 @@ function renderAdmitCardPage(container) {
   if (!hasUserAccessPermission(activeUser, 'admit_card_print', 'view')) {
     container.innerHTML = `
       <div class="page-header"><div><h2 class="page-title"><i class="fa-solid fa-id-card"></i> Admit Card</h2></div></div>
-      <div class="glass-card"><p style="margin:0; color:#fbbf24;">Access denied: admit card printing is not enabled for your account.</p></div>
+      <div class="glass-card"><p style="margin:0; color:#b45309;">Access denied: admit card printing is not enabled for your account.</p></div>
     `;
     return;
   }
 
   const terms = getExamScheduleTerms();
-  const term = window.admitCardTerm || terms[0] || 'UT1';
-  const className = window.admitCardClass || getSchoolClassNames()[0] || 'Class 5';
-  const section = window.admitCardSection || 'ALL';
+  const firstSavedSchedule = (SchoolData.examSchedules || []).find(row =>
+    String(row?.term || '').trim() && String(row?.className || '').trim()
+  );
+  // After refresh, open the first date sheet that actually exists instead of
+  // defaulting to UT1/Nursery and incorrectly appearing empty.
+  const term = window.admitCardTerm || firstSavedSchedule?.term || terms[0] || 'UT1';
+  const className = window.admitCardClass || firstSavedSchedule?.className || getSchoolClassNames()[0] || 'Class 5';
+  const savedSection = String(firstSavedSchedule?.section || 'ALL').trim().toUpperCase() || 'ALL';
+  const section = window.admitCardSection || savedSection;
   window.admitCardTerm = term;
   window.admitCardClass = className;
   window.admitCardSection = section;
@@ -4250,9 +6334,9 @@ function renderAdmitCardPage(container) {
 
       ${!schedule.length ? `
         <div style="margin-top:14px; padding:12px; border-radius:10px; background:rgba(245,158,11,0.12); border:1px solid #f59e0b; font-size:0.86rem;">
-          <i class="fa-solid fa-triangle-exclamation" style="color:#fbbf24;"></i>
+          <i class="fa-solid fa-triangle-exclamation" style="color:#b45309;"></i>
           No <strong>${escapeHtml(term)}</strong> date sheet for <strong>${escapeHtml(className)}</strong> yet.
-          Open <a href="#exams-schedule" style="color:#38bdf8;">Exam Schedule</a> and add rows — each class keeps its own dates.
+          Open <a href="#exams-schedule" style="color:#0284c7;">Exam Schedule</a> and add rows — each class keeps its own dates.
         </div>
       ` : `
         <div class="data-table-container" style="margin-top:16px;">
@@ -4277,7 +6361,7 @@ function renderAdmitCardPage(container) {
 
     <div class="glass-card" style="padding:20px;">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; flex-wrap:wrap; gap:10px;">
-        <h3 style="margin:0; color:#38bdf8; font-family:var(--font-heading);"><i class="fa-solid fa-users"></i> Select Students</h3>
+        <h3 style="margin:0; color:#0284c7; font-family:var(--font-heading);"><i class="fa-solid fa-users"></i> Select Students</h3>
         <div style="display:flex; gap:8px;">
           <button class="btn btn-secondary" onclick="toggleAllAdmitCardStudents(true)">Select All</button>
           <button class="btn btn-secondary" onclick="toggleAllAdmitCardStudents(false)">Clear</button>
@@ -4291,7 +6375,7 @@ function renderAdmitCardPage(container) {
             Print student photo box
           </label>
 
-          <label style="display:flex; align-items:center; gap:8px; font-size:0.84rem; font-weight:700; color:#cbd5e1;">
+          <label style="display:flex; align-items:center; gap:8px; font-size:0.84rem; font-weight:700; color:#374151;">
             Page layout:
             <select id="admitCardPerPage" class="session-dropdown" style="width:210px; font-weight:700;" onchange="window.admitCardPerPage=this.value; renderAdmitCardPage(document.getElementById('contentBody'))">
               ${Object.entries(ADMIT_CARD_LAYOUTS).map(([key, L]) => `
@@ -4312,7 +6396,7 @@ function renderAdmitCardPage(container) {
         <div class="data-table-container" style="max-height:420px; overflow-y:auto;">
           <table class="data-table">
             <thead>
-              <tr><th style="width:60px;">Print</th><th style="width:64px;">Photo</th><th>Student</th><th>Father's Name</th><th>Admission No</th><th style="width:110px;">Roll No</th><th>Class & Sec</th><th>Action</th></tr>
+              <tr><th style="width:60px;">Print</th><th style="width:64px;">Photo</th><th>Student</th><th>Admission No</th><th style="width:110px;">Roll No</th><th>Class & Sec</th><th>Father's Name</th><th>Action</th></tr>
             </thead>
             <tbody>
               ${students.map(s => {
@@ -4326,9 +6410,8 @@ function renderAdmitCardPage(container) {
                       ? `<img src="${photo}" style="width:38px; height:44px; object-fit:cover; border-radius:4px; border:1px solid #334155;">`
                       : `<span title="No photo uploaded" style="display:inline-flex; align-items:center; justify-content:center; width:38px; height:44px; border:1px dashed #f59e0b; border-radius:4px; color:#f59e0b; font-size:0.65rem;">none</span>`}
                   </td>
-                  <td><strong style="color:#38bdf8;">${escapeHtml(s.name || '')}</strong></td>
-                  <td>${escapeHtml(s.parentName || '')}</td>
-                  <td><code>${adm}</code></td>
+                  <td><strong style="color:#0284c7;">${escapeHtml(s.name || '')}</strong></td>
+                  <td><span class="adm-no-chip">${adm}</span></td>
                   <td>
                     <input type="text" class="session-dropdown admit-roll-input" data-adm="${adm}"
                       value="${escapeHtml(String(s.currentRollNo || s.rollNo || ''))}" placeholder="Roll"
@@ -4336,6 +6419,7 @@ function renderAdmitCardPage(container) {
                       onchange="saveAdmitCardRollNo('${adm}', this.value)">
                   </td>
                   <td><span class="badge badge-purple">${escapeHtml(s.currentClass || '')} - ${escapeHtml(s.currentSection || '')}</span></td>
+                  <td>${escapeHtml(s.parentName || '')}</td>
                   <td><button class="btn btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="printSingleAdmitCard('${adm}')"><i class="fa-solid fa-print"></i> Print</button></td>
                 </tr>
               `;
@@ -4359,36 +6443,74 @@ function toggleAllAdmitCardStudents(checked) {
 
 /** Only a real uploaded photo — mock/stock URLs would print a stranger's face on a card. */
 function getStudentPhotoForAdmitCard(student) {
-  const photo = String(student?.photo || student?.photoDataUrl || '').trim();
+  const photo = resolveStudentPhotoSrc(student);
   if (!photo) return '';
   if (photo.startsWith('data:image')) return photo;
-  if (/unsplash|placeholder|dicebear|gravatar/i.test(photo)) return '';
+  if (isStudentPhotoAssetPath(photo)) return photo;
+  if (/^https?:\/\//i.test(photo)) return photo;
   return photo;
 }
 
 /** Roll numbers are edited on this page and stored against the active session. */
-function saveAdmitCardRollNo(admissionNo, value) {
+async function saveAdmitCardRollNo(admissionNo, value, options = {}) {
   const session = SchoolData.activeSession || '2026-27';
   const student = (SchoolData.students || []).find(s => String(s.admissionNo) === String(admissionNo));
   if (!student) return;
+  const before = JSON.parse(JSON.stringify(student));
   const roll = String(value || '').trim();
   student.currentRollNo = roll;
   student.rollNo = roll;
   if (!student.sessionDetails) student.sessionDetails = {};
   if (!student.sessionDetails[session]) student.sessionDetails[session] = {};
   student.sessionDetails[session].rollNo = roll;
-  saveSchoolDataToStorage();
+  const record = buildStudentMasterRecord(student, {
+    intent: 'roll_number',
+    originalAdmissionNo: admissionNo,
+    sessionPatches: { [session]: { ...student.sessionDetails[session], rollNo: roll } }
+  });
+  if (options.deferCloudSave) return { student, before, record };
+  try {
+    await persistStudentMasterDelta([record], `Roll number ${roll || '(blank)'} saved for ${student.name}.`);
+  } catch (error) {
+    Object.keys(student).forEach(key => { delete student[key]; });
+    Object.assign(student, before);
+    throw error;
+  }
 }
 
-function autoAssignAdmitCardRollNumbers() {
+async function autoAssignAdmitCardRollNumbers() {
   const inputs = Array.from(document.querySelectorAll('.admit-roll-input'));
   if (!inputs.length) return;
   if (!window.confirm(`Assign roll numbers 1–${inputs.length} in the current (A–Z) order? Existing roll numbers will be replaced.`)) return;
+  const changes = [];
   inputs.forEach((input, i) => {
     input.value = String(i + 1);
-    saveAdmitCardRollNo(input.getAttribute('data-adm'), String(i + 1));
+    const originalAdmissionNo = input.getAttribute('data-adm');
+    const student = (SchoolData.students || []).find(s => String(s.admissionNo) === String(originalAdmissionNo));
+    if (!student) return;
+    const before = JSON.parse(JSON.stringify(student));
+    const roll = String(i + 1);
+    student.currentRollNo = roll;
+    student.rollNo = roll;
+    if (!student.sessionDetails) student.sessionDetails = {};
+    student.sessionDetails[SchoolData.activeSession || '2026-27'] = {
+      ...(student.sessionDetails[SchoolData.activeSession || '2026-27'] || {}), rollNo: roll
+    };
+    changes.push({ student, before, record: buildStudentMasterRecord(student, {
+      intent: 'roll_number',
+      originalAdmissionNo,
+      sessionPatches: { [SchoolData.activeSession || '2026-27']: student.sessionDetails[SchoolData.activeSession || '2026-27'] }
+    }) });
   });
-  showNotification(`Roll numbers 1–${inputs.length} assigned.`, 'success');
+  try {
+    await persistStudentMasterDelta(changes.map(change => change.record), `Roll numbers 1–${inputs.length} assigned.`);
+  } catch (error) {
+    changes.forEach(({ student, before }) => {
+      Object.keys(student).forEach(key => { delete student[key]; });
+      Object.assign(student, before);
+    });
+    throw error;
+  }
 }
 
 function buildAdmitCardHtml(student, term, schedule, options = {}) {
@@ -4396,13 +6518,28 @@ function buildAdmitCardHtml(student, term, schedule, options = {}) {
   const session = SchoolData.activeSession || '';
   const sigs = SchoolData.signatures || {};
   const principalSig = school.principalSignatureDataUrl || sigs.principalSig || '';
-  // Print window is about:blank — relative asset paths would not resolve there.
+  const classTeacherName = getClassTeacherForStudent(student) || sigs.teacherName || '';
+  const classTeacherSig = getTeacherSignatureByName(classTeacherName) || sigs.teacherSig || '';
   const logo = getPrintLogoSource();
   const showPhoto = options.showPhoto !== false;
   const photo = showPhoto ? getStudentPhotoForAdmitCard(student) : '';
+  const pen = getStudentPen(student);
+  const scheduleRows = Array.isArray(schedule) ? schedule : [];
+  const maxRows = Number(options.maxRows) || scheduleRows.length;
+  const visibleSchedule = scheduleRows.slice(0, maxRows);
+  const hiddenCount = Math.max(0, scheduleRows.length - visibleSchedule.length);
+  const datedRows = visibleSchedule
+    .map(row => ({ row, parsed: new Date(`${String(row?.date || '').trim()}T00:00:00`) }))
+    .filter(item => !Number.isNaN(item.parsed.getTime()))
+    .sort((a, b) => a.parsed - b.parsed);
+  const firstExamDate = datedRows.length ? formatExamDateWithDay(datedRows[0].row.date).date : '';
+  const lastExamDate = datedRows.length ? formatExamDateWithDay(datedRows[datedRows.length - 1].row.date).date : '';
+  const examDateRange = firstExamDate
+    ? (firstExamDate === lastExamDate ? firstExamDate : `${firstExamDate} to ${lastExamDate}`)
+    : '';
 
-  const rowsHtml = schedule.length
-    ? schedule.map((r, i) => {
+  const rowsHtml = visibleSchedule.length
+    ? visibleSchedule.map((r, i) => {
         const d = formatExamDateWithDay(r.date);
         return `
           <tr>
@@ -4414,11 +6551,12 @@ function buildAdmitCardHtml(student, term, schedule, options = {}) {
             <td style="text-align:center;">${escapeHtml(String(r.maxMarks || ''))}</td>
           </tr>
         `;
-      }).join('')
+      }).join('') + (hiddenCount ? `<tr><td colspan="6" style="text-align:center; font-size:0.85em; font-style:italic;">+ ${hiddenCount} more subject(s) — see office copy</td></tr>` : '')
     : `<tr><td colspan="6" style="text-align:center; padding:14px; font-style:italic;">Date sheet not published yet.</td></tr>`;
 
   return `
     <div class="admit-card">
+      <div class="ac-watermark" aria-hidden="true"><img src="${logo}" alt=""></div>
       <div class="ac-head">
         <img class="ac-logo" src="${logo}" alt="logo">
         <div class="ac-school">
@@ -4435,12 +6573,15 @@ function buildAdmitCardHtml(student, term, schedule, options = {}) {
             <td><span>Admission No</span><strong>${escapeHtml(String(student.admissionNo || ''))}</strong></td>
           </tr>
           <tr>
-            <td><span>Father's Name</span><strong>${escapeHtml(student.parentName || '')}</strong></td>
+            <td><span>PEN (Permanent Education No.)</span><strong>${escapeHtml(pen)}</strong></td>
             <td><span>Roll No</span><strong>${escapeHtml(String(student.currentRollNo || student.rollNo || '—'))}</strong></td>
           </tr>
           <tr>
-            <td><span>Class &amp; Section</span><strong>${escapeHtml(student.currentClass || '')} - ${escapeHtml(student.currentSection || '')}</strong></td>
-            <td><span>Date of Birth</span><strong>${escapeHtml(typeof formatDobToDDMMYYYY === 'function' ? formatDobToDDMMYYYY(student.dob) : (student.dob || '—'))}</strong></td>
+            <td><span>Father's Name</span><strong>${escapeHtml(student.parentName || '')}</strong></td>
+            <td><span>Date of Birth</span><strong>${escapeHtml(typeof formatStudentDob === 'function' ? formatStudentDob(student) : (student.dob || student.dateOfBirth || '—'))}</strong></td>
+          </tr>
+          <tr>
+            <td colspan="2"><span>Class &amp; Section</span><strong>${escapeHtml(student.currentClass || '')} - ${escapeHtml(student.currentSection || '')}</strong></td>
           </tr>
         </table>
         ${showPhoto ? `
@@ -4450,7 +6591,10 @@ function buildAdmitCardHtml(student, term, schedule, options = {}) {
         ` : ''}
       </div>
 
-      <div class="ac-section-title">Examination Date Sheet</div>
+      <div class="ac-section-title">
+        <span>Examination Date Sheet</span>
+        ${examDateRange ? `<small>${escapeHtml(examDateRange)}</small>` : ''}
+      </div>
       <table class="ac-sched">
         <thead>
           <tr><th style="width:8%;">#</th><th>Subject</th><th style="width:18%;">Date</th><th style="width:11%;">Day</th><th style="width:22%;">Time</th><th style="width:12%;">Max</th></tr>
@@ -4460,15 +6604,21 @@ function buildAdmitCardHtml(student, term, schedule, options = {}) {
 
       <div class="ac-foot">
         <div class="ac-rules">
-          <strong>Instructions:</strong> Reach the exam hall 15 minutes early. Bring this admit card daily. Mobile phones and unfair means are strictly prohibited. Clear all pending dues before the exam.
+          <strong>Instructions:</strong> Reach the exam hall 15 minutes early. Bring this admit card on every ${escapeHtml(term)} examination date. Mobile phones and unfair means are strictly prohibited.
         </div>
         <div class="ac-sign">
           <div class="ac-sign-box">
-            <div class="ac-sign-line"></div>
+            <div class="ac-sign-mark">
+              ${classTeacherSig
+                ? `<img src="${classTeacherSig}" class="ac-sign-img" alt="Class teacher signature">`
+                : (classTeacherName ? `<span class="ac-sign-name">${escapeHtml(classTeacherName)}</span>` : '')}
+            </div>
             <span>Class Teacher</span>
           </div>
           <div class="ac-sign-box">
-            ${principalSig ? `<img src="${principalSig}" class="ac-sign-img" alt="">` : `<div class="ac-sign-line"></div>`}
+            <div class="ac-sign-mark">
+              ${principalSig ? `<img src="${principalSig}" class="ac-sign-img" alt="Principal signature">` : ''}
+            </div>
             <span>Principal</span>
           </div>
         </div>
@@ -4486,66 +6636,142 @@ function buildAdmitCardHtml(student, term, schedule, options = {}) {
  * 4-per-A4 was tried and dropped: a 6-subject date sheet does not fit in 67mm.
  */
 const ADMIT_CARD_LAYOUTS = {
-  2: { page: 'A4 portrait', margin: '8mm', height: '136mm', gap: '6mm', scale: 1, maxRows: 12, label: '2 per A4 (A5 size each)' },
-  3: { page: 'A4 portrait', margin: '8mm', height: '89mm', gap: '5mm', scale: 0.84, maxRows: 7, label: '3 per A4 (saves paper)' },
-  a5: { page: 'A5 portrait', margin: '6mm', height: '196mm', gap: '0mm', scale: 1.05, maxRows: 16, label: '1 per A5 sheet' }
+  2: { page: 'A4 portrait', margin: '7mm', gap: '6mm', scale: 1.18, maxRows: 10, cardHeight: '136mm', label: '2 per A4 (large print)' },
+  3: { page: 'A4 portrait', margin: '5mm', gap: '2mm', scale: 0.92, maxRows: 6, cardHeight: '94mm', label: '3 per A4 (readable)' },
+  a5: { page: 'A5 portrait', margin: '6mm', gap: '0mm', scale: 1.15, maxRows: 14, cardHeight: 'auto', label: '1 per A5 sheet (large)' }
 };
 
 function getAdmitCardLayout(perPage) {
-  return ADMIT_CARD_LAYOUTS[perPage] || ADMIT_CARD_LAYOUTS[2];
+  const key = perPage === 'a5' ? 'a5' : Number(perPage) || 2;
+  return ADMIT_CARD_LAYOUTS[key] || ADMIT_CARD_LAYOUTS[2];
+}
+
+function getAdmitCardEffectivePerPage(requestedPerPage, paperCount) {
+  const requested = requestedPerPage === 'a5' ? 'a5' : (Number(requestedPerPage) || 2);
+  const rows = Math.max(0, Number(paperCount) || 0);
+  if (requested === 3 && rows > ADMIT_CARD_LAYOUTS[3].maxRows) return 2;
+  if (requested === 2 && rows > ADMIT_CARD_LAYOUTS[2].maxRows) return 'a5';
+  return requested;
+}
+
+/**
+ * Shared card styling for both the hidden live print area and print media.
+ * Compact cards must scale every internal element; fixed full-size content was
+ * clipping the date sheet, instructions and signatures in the 3-per-A4 mode.
+ */
+function getAdmitCardCoreStyles(perPage = 2) {
+  const L = getAdmitCardLayout(perPage);
+  const s = L.scale;
+  const px = (n) => `${(n * s).toFixed(2)}px`;
+  const perSheet = perPage === 'a5' ? 1 : (Number(perPage) || 2);
+  const cardHeight = L.cardHeight && L.cardHeight !== 'auto' ? `height:${L.cardHeight};` : '';
+
+  return `
+    .cards-container { width:100%; margin:0 auto; }
+    .admit-card { border:2px solid #0f172a; border-radius:6px; padding:${px(10)} ${px(14)};
+      margin-bottom:${L.gap}; ${cardHeight} overflow:hidden; display:flex; flex-direction:column;
+      page-break-inside:avoid; break-inside:avoid; background:#fff; position:relative; box-sizing:border-box; }
+    .admit-card:nth-child(${perSheet}n) { margin-bottom:0; page-break-after:always; break-after:page; }
+    .admit-card:last-of-type { page-break-after:auto; break-after:auto; }
+    .admit-card > *:not(.ac-watermark) { position:relative; z-index:1; }
+    .ac-watermark { position:absolute; z-index:0; left:50%; top:66%; transform:translate(-50%,-50%);
+      width:${px(190)}; height:${px(190)}; display:flex; align-items:center; justify-content:center;
+      opacity:.075; pointer-events:none; }
+    .ac-watermark img { width:100%; height:100%; object-fit:contain; border-radius:50%; }
+
+    .ac-head { display:flex; align-items:center; gap:${px(10)}; border-bottom:2px solid #0f172a; padding-bottom:${px(6)}; }
+    .ac-logo { width:${px(58)}; height:${px(58)}; object-fit:contain; object-position:center; background:transparent !important;
+      border:0 !important; border-radius:50% !important; padding:0 !important; box-shadow:none !important; flex-shrink:0; }
+    .ac-school { text-align:center; flex:1; }
+    .ac-school h1 { margin:0; font-size:${px(19)}; font-weight:900; letter-spacing:.4px; text-transform:uppercase; line-height:1.1; color:#0f172a; }
+    .ac-school p { margin:${px(1.5)} 0 ${px(4)}; font-size:${px(9.5)}; color:#334155; font-weight:600; line-height:1.15; }
+    .ac-school h2 { margin:0; font-size:${px(15)}; font-weight:900; background:#0f172a; color:#fff; display:inline-block;
+      padding:${px(3)} ${px(12)}; border-radius:4px; letter-spacing:.45px; }
+
+    .ac-body { display:flex; gap:${px(8)}; align-items:center; margin-top:${px(6)}; }
+    .ac-info { flex:1; border-collapse:collapse; }
+    .ac-info td { border:1.2px solid #64748b; padding:${px(3.5)} ${px(7)}; width:50%; vertical-align:top; }
+    .ac-info span { display:block; font-size:${px(8.7)}; text-transform:uppercase; color:#475569; letter-spacing:.35px; font-weight:800; margin-bottom:${px(1)}; }
+    .ac-info strong { display:block; font-size:${px(12)}; font-weight:800; color:#0f172a; line-height:1.12; }
+    .ac-photo { width:${px(72)}; height:${px(92)}; min-height:0; aspect-ratio:18/23; border:1.2px solid #64748b;
+      border-radius:4px; display:flex; align-items:center; justify-content:center; overflow:hidden;
+      background:#f8fafc; flex:0 0 auto; align-self:center; }
+    .ac-photo img { width:100%; height:100%; object-fit:cover; object-position:center 22%; display:block; }
+    .ac-photo span { font-size:${px(9)}; color:#64748b; text-align:center; line-height:1.25; letter-spacing:.2px; font-weight:700; }
+
+    .ac-section-title { margin:${px(5)} 0 ${px(2.5)}; font-size:${px(11.5)}; font-weight:900; text-transform:uppercase;
+      letter-spacing:.55px; border-left:${px(3)} solid #0f172a; padding-left:${px(6)}; color:#0f172a;
+      display:flex; justify-content:space-between; align-items:baseline; gap:${px(8)}; }
+    .ac-section-title small { font-size:${px(8.7)}; letter-spacing:.15px; color:#475569; white-space:nowrap; }
+    .ac-sched { width:100%; border-collapse:collapse; table-layout:fixed; }
+    .ac-sched th { background:#dbeafe; border:1.2px solid #64748b; padding:${px(2.5)} ${px(4)}; font-size:${px(9.5)}; font-weight:900; text-transform:uppercase; }
+    .ac-sched td { border:1.2px solid #94a3b8; padding:${px(2.6)} ${px(4)}; font-size:${px(10.6)}; font-weight:700; line-height:1.12; }
+
+    .ac-foot { margin-top:auto; padding-top:${px(4)}; border-top:1px solid #cbd5e1; display:flex; gap:${px(10)}; align-items:flex-end; min-height:${px(34)}; }
+    .ac-rules { flex:1; font-size:${px(8)}; color:#1e293b; line-height:1.25; font-weight:600; }
+    .ac-rules strong { font-size:${px(8.5)}; }
+    .ac-sign { display:flex; gap:${px(10)}; flex:0 0 auto; }
+    .ac-sign-box { width:${px(82)}; text-align:center; }
+    .ac-sign-mark { height:${px(22)}; border-bottom:1.2px solid #0f172a; display:flex; align-items:flex-end; justify-content:center; overflow:visible; }
+    .ac-sign-img { max-width:100%; height:${px(21)}; object-fit:contain; display:block; margin:0 auto; }
+    .ac-sign-box .ac-sign-name { font-family:'Caveat','Segoe Script',cursive; color:#1d4ed8; font-size:${px(12)}; font-weight:800; line-height:1; white-space:nowrap; margin:0; }
+    .ac-sign-box > span { font-size:${px(8)}; font-weight:800; display:block; margin-top:${px(1.5)}; }
+  `;
 }
 
 function getAdmitCardPrintStyles(perPage = 2) {
   const L = getAdmitCardLayout(perPage);
   const s = L.scale;
   const px = (n) => `${(n * s).toFixed(2)}px`;
-  const perSheet = perPage === 'a5' ? 1 : Number(perPage);
+  const perSheet = perPage === 'a5' ? 1 : (Number(perPage) || 2);
+  const cardHeight = L.cardHeight && L.cardHeight !== 'auto' ? `max-height:${L.cardHeight}; height:${L.cardHeight};` : '';
 
   return `
     @page { size: ${L.page}; margin: ${L.margin}; }
-    * { box-sizing: border-box; }
-    body { font-family: 'Inter', Arial, sans-serif; margin:0; background:#fff; color:#0f172a;
-      -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
-    .admit-card { border:1.5px solid #0f172a; border-radius:5px; padding:${px(9)} ${px(11)};
-      margin-bottom:${L.gap}; height:${L.height}; display:flex; flex-direction:column;
-      page-break-inside:avoid; break-inside:avoid; overflow:hidden; }
-    .admit-card:nth-child(${perSheet}n) { margin-bottom:0; page-break-after:always; break-after:page; }
-    .admit-card:last-child { page-break-after:auto; break-after:auto; }
+    @media print {
+      * { box-sizing: border-box; }
+      body { font-family: 'Inter', Arial, sans-serif; margin:0; background:#fff; color:#0f172a;
+        -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+      .admit-card { border:2px solid #0f172a; border-radius:6px; padding:${px(12)} ${px(14)};
+        margin-bottom:${L.gap}; ${cardHeight} overflow:hidden; display:flex; flex-direction:column;
+        page-break-inside:avoid; break-inside:avoid; }
+      .admit-card:nth-child(${perSheet}n) { margin-bottom:0; page-break-after:always; break-after:page; }
+      .admit-card:last-of-type { page-break-after:auto; break-after:auto; }
 
-    .ac-head { display:flex; align-items:center; gap:${px(10)}; border-bottom:1.5px solid #0f172a; padding-bottom:${px(5)}; }
-    /* Logo prints clean: no plate, no border, no rounding */
-    .ac-logo { width:${px(52)}; height:${px(52)}; object-fit:contain; background:none !important;
-      border:0 !important; border-radius:0 !important; padding:0 !important; box-shadow:none !important; }
-    .ac-school { text-align:center; flex:1; }
-    .ac-school h1 { margin:0; font-size:${px(15)}; letter-spacing:.3px; text-transform:uppercase; line-height:1.15; }
-    .ac-school p { margin:1px 0 ${px(3)}; font-size:${px(9.5)}; color:#475569; }
-    .ac-school h2 { margin:0; font-size:${px(11.5)}; background:#0f172a; color:#fff; display:inline-block;
-      padding:${px(2)} ${px(11)}; border-radius:3px; letter-spacing:.5px; }
+      .ac-head { display:flex; align-items:center; gap:${px(12)}; border-bottom:2px solid #0f172a; padding-bottom:${px(8)}; }
+      .ac-logo { width:${px(68)}; height:${px(68)}; object-fit:contain; background:none !important;
+        border:0 !important; border-radius:0 !important; padding:0 !important; box-shadow:none !important; flex-shrink:0; }
+      .ac-school { text-align:center; flex:1; }
+      .ac-school h1 { margin:0; font-size:${px(22)}; font-weight:900; letter-spacing:.4px; text-transform:uppercase; line-height:1.12; color:#0f172a; }
+      .ac-school p { margin:2px 0 ${px(5)}; font-size:${px(11.5)}; color:#334155; font-weight:600; line-height:1.25; }
+      .ac-school h2 { margin:0; font-size:${px(14.5)}; font-weight:800; background:#0f172a; color:#fff; display:inline-block;
+        padding:${px(4)} ${px(14)}; border-radius:4px; letter-spacing:.6px; }
 
-    .ac-body { display:flex; gap:${px(8)}; align-items:stretch; margin-top:${px(7)}; }
-    .ac-info { flex:1; border-collapse:collapse; }
-    .ac-info td { border:1px solid #cbd5e1; padding:${px(3.5)} ${px(7)}; width:50%; }
-    .ac-info span { display:block; font-size:${px(8)}; text-transform:uppercase; color:#64748b; letter-spacing:.4px; }
-    .ac-info strong { font-size:${px(11)}; }
-    .ac-photo { width:${(26 * s).toFixed(1)}mm; border:1px solid #94a3b8; border-radius:3px; display:flex;
-      align-items:center; justify-content:center; overflow:hidden; background:#f8fafc; }
-    .ac-photo img { width:100%; height:100%; object-fit:cover; }
-    .ac-photo span { font-size:${px(7.5)}; color:#64748b; text-align:center; line-height:1.4; letter-spacing:.3px; }
+      .ac-body { display:flex; gap:${px(10)}; align-items:stretch; margin-top:${px(9)}; }
+      .ac-info { flex:1; border-collapse:collapse; }
+      .ac-info td { border:1.5px solid #64748b; padding:${px(6)} ${px(9)}; width:50%; vertical-align:top; }
+      .ac-info span { display:block; font-size:${px(10)}; text-transform:uppercase; color:#475569; letter-spacing:.5px; font-weight:700; margin-bottom:2px; }
+      .ac-info strong { font-size:${px(14.5)}; font-weight:800; color:#0f172a; line-height:1.2; }
+      .ac-photo { width:${(32 * s).toFixed(1)}mm; min-height:${(38 * s).toFixed(1)}mm; border:1.5px solid #64748b; border-radius:4px; display:flex;
+        align-items:center; justify-content:center; overflow:hidden; background:#f8fafc; flex-shrink:0; }
+      .ac-photo img { width:100%; height:100%; object-fit:cover; }
+      .ac-photo span { font-size:${px(10)}; color:#64748b; text-align:center; line-height:1.4; letter-spacing:.3px; font-weight:700; }
 
-    .ac-section-title { margin:${px(7)} 0 ${px(3)}; font-size:${px(10)}; font-weight:800; text-transform:uppercase;
-      letter-spacing:.6px; border-left:3px solid #0f172a; padding-left:${px(6)}; }
-    .ac-sched { width:100%; border-collapse:collapse; }
-    .ac-sched th { background:#e2e8f0; border:1px solid #94a3b8; padding:${px(2.5)} ${px(4)}; font-size:${px(9)}; text-transform:uppercase; }
-    .ac-sched td { border:1px solid #cbd5e1; padding:${px(2.5)} ${px(4)}; font-size:${px(10)}; }
+      .ac-section-title { margin:${px(9)} 0 ${px(4)}; font-size:${px(12.5)}; font-weight:900; text-transform:uppercase;
+        letter-spacing:.7px; border-left:4px solid #0f172a; padding-left:${px(8)}; color:#0f172a; }
+      .ac-sched { width:100%; border-collapse:collapse; }
+      .ac-sched th { background:#e2e8f0; border:1.5px solid #64748b; padding:${px(5)} ${px(6)}; font-size:${px(11)}; font-weight:800; text-transform:uppercase; }
+      .ac-sched td { border:1.5px solid #94a3b8; padding:${px(5)} ${px(6)}; font-size:${px(12.5)}; font-weight:600; }
 
-    /* Instructions and signatures share one row so signatures never clip on dense layouts */
-    .ac-foot { margin-top:auto; padding-top:${px(5)}; display:flex; gap:${px(10)}; align-items:flex-end; }
-    .ac-rules { flex:1; font-size:${px(8)}; color:#334155; line-height:1.35; }
-    .ac-sign { display:flex; gap:${px(10)}; flex:0 0 auto; }
-    .ac-sign-box { width:${px(86)}; text-align:center; }
-    .ac-sign-line { height:${px(17)}; border-bottom:1px solid #0f172a; }
-    .ac-sign-img { height:${px(19)}; object-fit:contain; display:block; margin:0 auto; }
-    .ac-sign-box span { font-size:${px(8)}; font-weight:700; display:block; margin-top:1px; }
+      .ac-foot { margin-top:${px(8)}; padding-top:${px(6)}; border-top:1px solid #cbd5e1; display:flex; gap:${px(12)}; align-items:flex-end; }
+      .ac-rules { flex:1; font-size:${px(10.5)}; color:#1e293b; line-height:1.45; font-weight:600; }
+      .ac-rules strong { font-size:${px(11.5)}; }
+      .ac-sign { display:flex; gap:${px(14)}; flex:0 0 auto; }
+      .ac-sign-box { width:${px(98)}; text-align:center; }
+      .ac-sign-line { height:${px(22)}; border-bottom:1.5px solid #0f172a; }
+      .ac-sign-img { height:${px(24)}; object-fit:contain; display:block; margin:0 auto; }
+      .ac-sign-box span { font-size:${px(10.5)}; font-weight:800; display:block; margin-top:3px; }
+    }
   `;
 }
 
@@ -4556,32 +6782,355 @@ function getAdmitCardsPerPage() {
   return value === 'a5' ? 'a5' : Number(value);
 }
 
+function waitForPrintableAssets(root, timeoutMs = 2500) {
+  const images = Array.from(root?.querySelectorAll?.('img') || []);
+  const imageReady = images.map((img) => {
+    if (img.complete) return Promise.resolve();
+    return new Promise((resolve) => {
+      img.addEventListener('load', resolve, { once: true });
+      img.addEventListener('error', resolve, { once: true });
+    });
+  });
+  const fontsReady = document.fonts?.ready || Promise.resolve();
+  const timeout = new Promise((resolve) => setTimeout(resolve, timeoutMs));
+  return Promise.race([Promise.all([fontsReady, Promise.all(imageReady)]), timeout]);
+}
+
+function printSectionInCurrentWindow(section, options = {}) {
+  if (!section) return false;
+  if (typeof window._activeDocumentPrintCleanup === 'function') window._activeDocumentPrintCleanup();
+
+  const bodyClass = options.bodyClass || 'direct-section-print';
+  const styleId = options.styleId || 'directSectionPrintStyles';
+  document.getElementById(styleId)?.remove();
+
+  const style = document.createElement('style');
+  style.id = styleId;
+  style.textContent = options.styleText || '';
+  document.head.appendChild(style);
+  document.body.classList.add(bodyClass);
+
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    document.body.classList.remove(bodyClass);
+    style.remove();
+    if (options.removeSectionAfterPrint) section.remove();
+    if (window._activeDocumentPrintCleanup === cleanup) window._activeDocumentPrintCleanup = null;
+  };
+  window._activeDocumentPrintCleanup = cleanup;
+  window.addEventListener('afterprint', cleanup, { once: true });
+
+  const beginPrint = () => {
+    try {
+      void section.offsetHeight;
+      window.focus();
+      window.print();
+    } catch (error) {
+      cleanup();
+      showNotification('Print dialog could not open. Please try again.', 'error');
+      return;
+    }
+    // Some browsers return from window.print() before their preview has copied
+    // the page. afterprint performs normal cleanup; this is only a long fallback.
+    setTimeout(cleanup, 30000);
+  };
+
+  if (options.printImmediately) beginPrint();
+  else waitForPrintableAssets(section).then(beginPrint);
+  return true;
+}
+
 function openAdmitCardPrintWindow(cardsHtml, title, perPage = 2) {
-  const printWindow = window.open('', '_blank', 'width=900,height=1200');
-  if (!printWindow) {
-    showNotification('Popup blocked. Allow popups for this site to print admit cards.', 'warning');
-    return;
-  }
-  printWindow.document.write(`
+  const L = getAdmitCardLayout(perPage);
+  const perSheet = perPage === 'a5' ? 1 : (Number(perPage) || 2);
+
+  const printHtml = `
     <!DOCTYPE html>
     <html>
       <head>
-        <title>${title}</title>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
-        <style>${getAdmitCardPrintStyles(perPage)}</style>
+        <meta charset="utf-8">
+        <title>${escapeHtml(title || 'Admit Cards')}</title>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Montserrat:wght@800;900&display=swap" rel="stylesheet">
+        <style>
+          @page {
+            size: ${L.page};
+            margin: ${L.margin};
+          }
+          * { box-sizing: border-box; }
+          body {
+            font-family: 'Inter', Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            background: #ffffff !important;
+            color: #0f172a !important;
+            -webkit-print-color-adjust: exact !important;
+            print-color-adjust: exact !important;
+          }
+          .cards-container {
+            width: 100%;
+            margin: 0 auto;
+          }
+          .admit-card {
+            border: 2px solid #0f172a;
+            border-radius: 6px;
+            padding: 10px 14px;
+            margin-bottom: ${L.gap};
+            ${L.cardHeight && L.cardHeight !== 'auto' ? `max-height:${L.cardHeight}; height:${L.cardHeight};` : ''}
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            page-break-inside: avoid;
+            break-inside: avoid;
+            background: #ffffff;
+          }
+          .admit-card:nth-child(${perSheet}n) {
+            margin-bottom: 0;
+            page-break-after: always;
+            break-after: page;
+          }
+          .admit-card:last-of-type {
+            page-break-after: auto;
+            break-after: auto;
+          }
+
+          .ac-head {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            border-bottom: 2px solid #0f172a;
+            padding-bottom: 6px;
+          }
+          .ac-logo {
+            width: 58px;
+            height: 58px;
+            object-fit: contain;
+            flex-shrink: 0;
+          }
+          .ac-school {
+            text-align: center;
+            flex: 1;
+          }
+          .ac-school h1 {
+            margin: 0;
+            font-family: 'Montserrat', sans-serif;
+            font-size: 1.15rem;
+            font-weight: 900;
+            letter-spacing: .5px;
+            text-transform: uppercase;
+            line-height: 1.15;
+            color: #0f172a;
+          }
+          .ac-school p {
+            margin: 2px 0 4px;
+            font-size: 0.76rem;
+            color: #334155;
+            font-weight: 600;
+          }
+          .ac-school h2 {
+            margin: 0;
+            font-size: 0.84rem;
+            font-weight: 800;
+            background: #0f172a;
+            color: #ffffff;
+            display: inline-block;
+            padding: 3px 12px;
+            border-radius: 4px;
+            letter-spacing: .6px;
+          }
+
+          .ac-body {
+            display: flex;
+            gap: 10px;
+            align-items: stretch;
+            margin-top: 8px;
+          }
+          .ac-info {
+            flex: 1;
+            border-collapse: collapse;
+            font-size: 0.82rem;
+          }
+          .ac-info td {
+            border: 1.5px solid #64748b;
+            padding: 4px 8px;
+            width: 50%;
+            vertical-align: top;
+          }
+          .ac-info span {
+            display: block;
+            font-size: 0.68rem;
+            text-transform: uppercase;
+            color: #475569;
+            letter-spacing: .5px;
+            font-weight: 700;
+            margin-bottom: 1px;
+          }
+          .ac-info strong {
+            font-size: 0.88rem;
+            font-weight: 800;
+            color: #0f172a;
+            line-height: 1.2;
+          }
+          .ac-photo {
+            width: 75px;
+            min-height: 85px;
+            border: 1.5px solid #64748b;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            background: #f8fafc;
+            flex-shrink: 0;
+          }
+          .ac-photo img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+          }
+          .ac-photo span {
+            font-size: 0.72rem;
+            color: #64748b;
+            text-align: center;
+            font-weight: 700;
+          }
+
+          .ac-section-title {
+            margin: 6px 0 3px;
+            font-size: 0.76rem;
+            font-weight: 900;
+            text-transform: uppercase;
+            letter-spacing: .6px;
+            border-left: 3px solid #0f172a;
+            padding-left: 6px;
+            color: #0f172a;
+          }
+          .ac-sched {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.78rem;
+          }
+          .ac-sched th {
+            background: #e2e8f0;
+            border: 1.5px solid #64748b;
+            padding: 3px 5px;
+            font-size: 0.72rem;
+            font-weight: 800;
+            text-transform: uppercase;
+          }
+          .ac-sched td {
+            border: 1.5px solid #94a3b8;
+            padding: 3px 5px;
+            font-size: 0.78rem;
+            font-weight: 600;
+          }
+
+          .ac-foot {
+            margin-top: 6px;
+            padding-top: 4px;
+            border-top: 1px solid #cbd5e1;
+            display: flex;
+            gap: 10px;
+            align-items: flex-end;
+          }
+          .ac-rules {
+            flex: 1;
+            font-size: 0.68rem;
+            color: #1e293b;
+            line-height: 1.35;
+            font-weight: 600;
+          }
+          .ac-sign {
+            display: flex;
+            gap: 12px;
+            flex: 0 0 auto;
+          }
+          .ac-sign-box {
+            width: 90px;
+            text-align: center;
+          }
+          .ac-sign-line {
+            height: 18px;
+            border-bottom: 1.5px solid #0f172a;
+          }
+          .ac-sign-img {
+            height: 22px;
+            object-fit: contain;
+            display: block;
+            margin: 0 auto;
+          }
+          .ac-sign-box span {
+            font-size: 0.68rem;
+            font-weight: 800;
+            display: block;
+            margin-top: 2px;
+          }
+          ${getAdmitCardCoreStyles(perPage)}
+        </style>
       </head>
       <body>
-        ${cardsHtml}
+        <div class="cards-container">
+          ${cardsHtml}
+        </div>
         <script>
-          window.onload = function () {
-            setTimeout(function () { window.print(); }, 400);
+          window.onload = function() {
+            setTimeout(function() {
+              window.focus();
+              window.print();
+              setTimeout(function() { window.close(); }, 500);
+            }, 300);
           };
-        <\/script>
+        </script>
       </body>
     </html>
-  `);
-  printWindow.document.close();
+  `;
+
+  // Print inside the current tab. A newly opened blank tab was being blocked or
+  // captured before its card content loaded, which produced a white preview.
+  document.getElementById('admitCardDirectPrintArea')?.remove();
+  const parsedPrintDocument = new DOMParser().parseFromString(printHtml, 'text/html');
+  const cardStyles = parsedPrintDocument.querySelector('style')?.textContent || '';
+  const printArea = document.createElement('section');
+  printArea.id = 'admitCardDirectPrintArea';
+  printArea.setAttribute('aria-label', escapeHtml(title || 'Admit Cards'));
+  printArea.innerHTML = `<div class="cards-container">${cardsHtml}</div>`;
+  document.body.appendChild(printArea);
+
+  const directPrintStyles = `
+    ${cardStyles}
+    #admitCardDirectPrintArea {
+      position: fixed;
+      left: -200vw;
+      top: 0;
+      width: 100%;
+      background: #ffffff;
+    }
+    @media print {
+      body.admit-card-direct-print > * { visibility: hidden !important; }
+      body.admit-card-direct-print #admitCardDirectPrintArea,
+      body.admit-card-direct-print #admitCardDirectPrintArea * { visibility: visible !important; }
+      body.admit-card-direct-print #admitCardDirectPrintArea {
+        position: absolute !important;
+        left: 0 !important;
+        top: 0 !important;
+        width: 100% !important;
+        margin: 0 !important;
+      }
+    }
+  `;
+  const opened = printSectionInCurrentWindow(printArea, {
+    bodyClass: 'admit-card-direct-print',
+    styleId: 'admitCardDirectPrintStyles',
+    styleText: directPrintStyles,
+    removeSectionAfterPrint: true,
+    printImmediately: false
+  });
+  if (opened) showNotification('Admit cards are ready in the print dialog.', 'success');
+  return opened;
 }
+
 
 function admitCardPhotoEnabled() {
   const toggle = document.getElementById('admitCardPhotoToggle');
@@ -4597,14 +7146,23 @@ function printSingleAdmitCard(admissionNo) {
     return;
   }
   const schedule = getExamScheduleForClass(term, student.currentClass || student.class, student.currentSection || 'ALL');
-  const html = buildAdmitCardHtml(student, term, schedule, { showPhoto: admitCardPhotoEnabled() });
-  openAdmitCardPrintWindow(html, `Admit Card - ${student.name}`, getAdmitCardsPerPage());
+  if (!schedule.length) {
+    showNotification(`No ${term} date sheet is saved for ${student.currentClass || student.class} Section ${student.currentSection || student.section || 'A'}.`, 'warning');
+    return;
+  }
+  const requestedPerPage = getAdmitCardsPerPage();
+  const perPage = getAdmitCardEffectivePerPage(requestedPerPage, schedule.length);
+  const html = buildAdmitCardHtml(student, term, schedule, { showPhoto: admitCardPhotoEnabled(), maxRows: schedule.length });
+  openAdmitCardPrintWindow(html, `Admit Card - ${student.name}`, perPage);
+  if (perPage !== requestedPerPage) {
+    showNotification(`Layout enlarged automatically so all ${schedule.length} exam dates print without clipping.`, 'info');
+  }
 }
 
 function printSelectedAdmitCards() {
   const term = window.admitCardTerm || 'UT1';
   const showPhoto = admitCardPhotoEnabled();
-  const perPage = getAdmitCardsPerPage();
+  const requestedPerPage = getAdmitCardsPerPage();
   const picked = Array.from(document.querySelectorAll('.admit-card-chk'))
     .filter(box => box.checked)
     .map(box => box.getAttribute('data-adm'));
@@ -4615,21 +7173,41 @@ function printSelectedAdmitCards() {
   }
 
   const all = getStudentsByActiveSession();
-  const cards = picked.map((adm) => {
+  const missingDateSheet = [];
+  const prepared = picked.map((adm) => {
     const student = all.find(s => String(s.admissionNo) === String(adm));
-    if (!student) return '';
+    if (!student) return null;
     const schedule = getExamScheduleForClass(term, student.currentClass || student.class, student.currentSection || 'ALL');
-    return buildAdmitCardHtml(student, term, schedule, { showPhoto });
-  }).filter(Boolean).join('');
+    if (!schedule.length) {
+      missingDateSheet.push(`${student.currentClass || student.class} ${student.currentSection || student.section || 'A'}`);
+      return null;
+    }
+    return { student, schedule };
+  }).filter(Boolean);
 
-  openAdmitCardPrintWindow(cards, `Admit Cards - ${term} - ${window.admitCardClass || ''}`, perPage);
+  if (missingDateSheet.length) {
+    const affected = [...new Set(missingDateSheet)].join(', ');
+    showNotification(`Admit cards not printed: no ${term} date sheet for ${affected}. Choose the matching section or save the schedule for ALL sections.`, 'warning');
+    return;
+  }
+  if (!prepared.length) {
+    showNotification('No admit-card content was generated for the selected students.', 'error');
+    return;
+  }
+
+  const largestDateSheet = Math.max(...prepared.map(item => item.schedule.length));
+  const perPage = getAdmitCardEffectivePerPage(requestedPerPage, largestDateSheet);
+  const cards = prepared.map(({ student, schedule }) =>
+    buildAdmitCardHtml(student, term, schedule, { showPhoto, maxRows: schedule.length })
+  ).join('');
+
+  const printOpened = openAdmitCardPrintWindow(cards, `Admit Cards - ${term} - ${window.admitCardClass || ''}`, perPage);
+  if (!printOpened) return;
   const sheets = perPage === 'a5' ? picked.length : Math.ceil(picked.length / Number(perPage));
   showNotification(`Prepared ${picked.length} admit card(s) on ${sheets} sheet(s).`, 'success');
 
-  const papers = getExamScheduleForClass(term, window.admitCardClass, window.admitCardSection || 'ALL').length;
-  const maxRows = getAdmitCardLayout(perPage).maxRows;
-  if (papers > maxRows) {
-    showNotification(`${papers} papers may not fit at this size — switch to "2 per A4" or "1 per A5" if the table looks cut.`, 'warning');
+  if (perPage !== requestedPerPage) {
+    showNotification(`Layout enlarged automatically so all ${largestDateSheet} exam dates, instructions and signatures print.`, 'info');
   }
 }
 
@@ -4681,6 +7259,7 @@ const ERP_MODULES_LIST = {
   ],
   fees: [
     { key: "fee_collection", name: "Fee Collection & Payment Entry" },
+    { key: "fee_structure_config", name: "Master Fee Structure & Schedule Settings" },
     { key: "fee_receipt_print", name: "Fee Receipt Generation & Printing (A4/A5)" },
     { key: "fee_receipt_deletion", name: "Fee Receipt Deletion & Cancellation" },
     { key: "student_dues_view", name: "View Per-Student Due (while collecting fees)" },
@@ -4690,6 +7269,7 @@ const ERP_MODULES_LIST = {
   ],
   exams: [
     { key: "exam_marks_entry", name: "Exam Marks Entry Broadsheet (#exams-entry)" },
+    { key: "exam_weightage_view", name: "View Weightage Values in Marks Entry Headers", viewOnly: true },
     { key: "class_weightage_config", name: "Class Weightage Rules & Raw Test Config (#exams-weightage)" },
     { key: "class_subject_setup", name: "Class Exam Subject & Max Marks Setup (#exams-structure)" },
     { key: "report_cards_print", name: "Report Cards Printing & Class Ranks (#exams-report-cards)" },
@@ -4749,15 +7329,15 @@ function getEffectiveRoleRights(role) {
  */
 function getAccessRightsGridHtml(modules, getRights, getRoleRights = null) {
   return `
-    <div style="background:#0f172a; border-radius:10px; border:1px solid #334155; overflow:auto; flex:1 1 auto; min-height:180px; margin-bottom:14px;">
-      <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.88rem;">
+    <div style="background:var(--bg-secondary); border-radius:10px; border:1px solid var(--border-color); overflow:auto; flex:1 1 auto; min-height:180px; margin-bottom:14px;">
+      <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.88rem; color:var(--text-main);">
         <thead style="position:sticky; top:0; z-index:2;">
-          <tr style="background:#0284c7; color:#ffffff;">
-            <th style="text-align:left; padding:10px 16px;">Module Name</th>
-            <th style="padding:10px; width:96px;">View<br><button type="button" class="btn btn-secondary" style="padding:1px 6px; font-size:0.65rem; margin-top:3px;" onclick="toggleAccessRightsColumn('view')">All</button></th>
-            <th style="padding:10px; width:96px;">Add<br><button type="button" class="btn btn-secondary" style="padding:1px 6px; font-size:0.65rem; margin-top:3px;" onclick="toggleAccessRightsColumn('add')">All</button></th>
-            <th style="padding:10px; width:110px;">Modify / Edit<br><button type="button" class="btn btn-secondary" style="padding:1px 6px; font-size:0.65rem; margin-top:3px;" onclick="toggleAccessRightsColumn('modify')">All</button></th>
-            <th style="padding:10px; width:96px;">Delete<br><button type="button" class="btn btn-secondary" style="padding:1px 6px; font-size:0.65rem; margin-top:3px;" onclick="toggleAccessRightsColumn('delete')">All</button></th>
+          <tr style="background:var(--accent-primary, #0284c7); color:#ffffff;">
+            <th style="text-align:left; padding:10px 16px; color:#ffffff;">Module Name</th>
+            <th style="padding:10px; width:96px; color:#ffffff;">View<br><button type="button" class="btn btn-secondary" style="padding:1px 6px; font-size:0.65rem; margin-top:3px;" onclick="toggleAccessRightsColumn('view')">All</button></th>
+            <th style="padding:10px; width:96px; color:#ffffff;">Add<br><button type="button" class="btn btn-secondary" style="padding:1px 6px; font-size:0.65rem; margin-top:3px;" onclick="toggleAccessRightsColumn('add')">All</button></th>
+            <th style="padding:10px; width:110px; color:#ffffff;">Modify / Edit<br><button type="button" class="btn btn-secondary" style="padding:1px 6px; font-size:0.65rem; margin-top:3px;" onclick="toggleAccessRightsColumn('modify')">All</button></th>
+            <th style="padding:10px; width:96px; color:#ffffff;">Delete<br><button type="button" class="btn btn-secondary" style="padding:1px 6px; font-size:0.65rem; margin-top:3px;" onclick="toggleAccessRightsColumn('delete')">All</button></th>
           </tr>
         </thead>
         <tbody>
@@ -4767,13 +7347,13 @@ function getAccessRightsGridHtml(modules, getRights, getRoleRights = null) {
             const differs = roleRights && ['view', 'add', 'modify', 'delete']
               .some(a => (!mod.viewOnly || a === 'view') && !!rights[a] !== !!roleRights[a]);
             const cell = (action) => mod.viewOnly && action !== 'view'
-              ? `<td style="padding:10px; color:#475569;">—</td>`
+              ? `<td style="padding:10px; color:var(--text-dim);">—</td>`
               : `<td style="padding:10px;"><input type="checkbox" class="acc-right-chk" data-mod="${mod.key}" data-action="${action}" ${rights[action] ? 'checked' : ''} style="width:18px; height:18px; cursor:pointer;"></td>`;
             return `
-              <tr style="border-bottom:1px solid #1e293b; ${differs ? 'background:rgba(251,191,36,0.07);' : ''}">
+              <tr style="border-bottom:1px solid var(--border-color); ${differs ? 'background:rgba(251,191,36,0.07);' : ''}">
                 <td style="text-align:left; padding:10px 16px;">
-                  <strong style="color:#ffffff;">${mod.name}</strong>
-                  ${differs ? `<div style="font-size:0.68rem; color:#fbbf24; font-weight:700; margin-top:2px;"><i class="fa-solid fa-user-pen"></i> differs from role</div>` : ''}
+                  <strong style="color:var(--text-main);">${mod.name}</strong>
+                  ${differs ? `<div style="font-size:0.68rem; color:#b45309; font-weight:700; margin-top:2px;"><i class="fa-solid fa-user-pen"></i> differs from role</div>` : ''}
                 </td>
                 ${cell('view')}${cell('add')}${cell('modify')}${cell('delete')}
               </tr>
@@ -4786,7 +7366,7 @@ function getAccessRightsGridHtml(modules, getRights, getRoleRights = null) {
 }
 
 /** Drop a person's personal overrides so they follow their role template again. */
-function resetUserRightsToRole(userId) {
+async function resetUserRightsToRole(userId) {
   const user = (SchoolData.staffUsers || []).find(u => u.id === userId);
   if (!user) return;
   if (!window.confirm(`Remove personal overrides for ${user.name} and follow the ${user.role} role again?`)) return;
@@ -4794,8 +7374,7 @@ function resetUserRightsToRole(userId) {
   user.viewTotalRevenue = !!user.accessRights.total_revenue_view?.view;
   user.viewDueBalance = !!user.accessRights.total_dues_view?.view;
   user.canManageFees = !!(user.accessRights.fee_collection?.view || user.accessRights.fee_collection?.add);
-  saveSchoolDataToStorage();
-  showNotification(`${user.name} now follows the ${user.role} role permissions.`, 'success');
+  await persistDirectoryDelta({ scope: 'staff', staffUpserts: [user] }, `${user.name} now follows the ${user.role} role permissions.`);
   openUserAccessRightsModal(userId);
 }
 
@@ -4841,14 +7420,14 @@ function openRolePermissionsModal(roleName) {
     <div class="modal-overlay active" id="rolePermissionsModal" style="z-index:999999; backdrop-filter:blur(8px);">
       <div class="modal-box" style="max-width:900px; width:96%; height:94vh; max-height:94vh; display:flex; flex-direction:column; background:#0f172a; color:#ffffff; padding:20px; border-radius:18px; border:2px solid #a855f7; box-shadow:0 25px 50px -12px rgba(0,0,0,0.85);">
         <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; padding-bottom:14px; margin-bottom:16px; flex:0 0 auto;">
-          <h3 style="margin:0; color:#c084fc; font-size:1.25rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+          <h3 style="margin:0; color:#6d28d9; font-size:1.25rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
             <i class="fa-solid fa-users-gear"></i> Role Permissions
           </h3>
           <button onclick="document.getElementById('rolePermissionsModal').remove()" style="background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer; font-size:1rem;">X</button>
         </div>
 
         <div style="display:flex; align-items:center; gap:14px; margin-bottom:8px; background:#1e293b; padding:12px 16px; border-radius:10px; border:1px solid #334155; flex-wrap:wrap; flex:0 0 auto;">
-          <label style="font-size:0.9rem; font-weight:700; color:#c084fc;">Role:</label>
+          <label style="font-size:0.9rem; font-weight:700; color:#6d28d9;">Role:</label>
           <select id="rolePermRoleSelect" class="session-dropdown" style="width:260px; font-weight:700;" onchange="openRolePermissionsModal(this.value)">
             ${roles.map(r => `<option value="${escapeHtml(r)}" ${r === role ? 'selected' : ''}>${escapeHtml(r)}</option>`).join('')}
           </select>
@@ -4866,7 +7445,7 @@ function openRolePermissionsModal(roleName) {
         ${getAccessRightsGridHtml(modules, (key) => (template && template[key]) || defaults[key])}
 
         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px; flex:0 0 auto;">
-          <div style="background:#1e293b; color:#fbbf24; padding:8px 16px; border-radius:8px; font-weight:700; font-size:0.82rem;">
+          <div style="background:#1e293b; color:#b45309; padding:8px 16px; border-radius:8px; font-weight:700; font-size:0.82rem;">
             <i class="fa-solid fa-triangle-exclamation"></i> Saving overwrites per-user rights for all ${memberCount} ${escapeHtml(role)} account(s).
           </div>
           <div style="display:flex; gap:10px;">
@@ -4883,7 +7462,7 @@ function openRolePermissionsModal(roleName) {
   document.body.insertAdjacentHTML('beforeend', modalHtml);
 }
 
-function saveRolePermissionsModal(role) {
+async function saveRolePermissionsModal(role) {
   if (!isErpAdminUser(getCurrentActiveUser())) {
     showNotification('Only Super Admin / Principal can change role permissions.', 'warning');
     return;
@@ -4893,13 +7472,17 @@ function saveRolePermissionsModal(role) {
   saveRolePermissionTemplate(role, rights);
   const applied = applyRoleTemplateToUsers(role);
 
-  saveSchoolDataToStorage();
+  const affectedUsers = (SchoolData.staffUsers || []).filter(u => String(u.role || '').trim() === String(role || '').trim());
+  await persistDirectoryDelta({
+    scope: 'rolePermissions',
+    staffUpserts: affectedUsers,
+    roleTemplateUpserts: { [role]: rights }
+  }, `Role permissions saved for ${role} and applied to ${applied} staff account(s).`);
   document.getElementById('rolePermissionsModal')?.remove();
-  showNotification(`Role permissions saved for ${role} — applied to ${applied} staff account(s).`, 'success');
   if (document.getElementById('contentBody')) renderUsersPage(document.getElementById('contentBody'));
 }
 
-function resetRolePermissionTemplate(role) {
+async function resetRolePermissionTemplate(role) {
   if (!window.confirm(`Reset ${role} back to built-in default permissions?`)) return;
   const templates = getRolePermissionTemplates();
   delete templates[String(role || '').trim()];
@@ -4907,8 +7490,12 @@ function resetRolePermissionTemplate(role) {
     if (String(u.role || '').trim() !== String(role || '').trim()) return;
     u.accessRights = getDefaultAccessRightsForRole(u.role);
   });
-  saveSchoolDataToStorage();
-  showNotification(`${role} reset to default permissions.`, 'info');
+  const affectedUsers = (SchoolData.staffUsers || []).filter(u => String(u.role || '').trim() === String(role || '').trim());
+  await persistDirectoryDelta({
+    scope: 'rolePermissions',
+    staffUpserts: affectedUsers,
+    roleTemplateDeleted: [role]
+  }, `${role} reset to default permissions.`);
   openRolePermissionsModal(role);
 }
 
@@ -4932,14 +7519,14 @@ function openUserAccessRightsModal(userId) {
 
         <!-- TOP TOOLBAR & USER SELECTOR -->
         <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; padding-bottom:14px; margin-bottom:14px; flex:0 0 auto;">
-          <h3 style="margin:0; color:#38bdf8; font-size:1.25rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+          <h3 style="margin:0; color:#0284c7; font-size:1.25rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
             <i class="fa-solid fa-user-shield"></i> User Access Rights Configurator
           </h3>
           <button onclick="document.getElementById('userAccessRightsModal').remove()" style="background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer; font-size:1rem;">X</button>
         </div>
 
-        <div style="display:flex; align-items:center; gap:14px; margin-bottom:8px; background:#1e293b; padding:12px 16px; border-radius:10px; border:1px solid #334155; flex-wrap:wrap; flex:0 0 auto;">
-          <label style="font-size:0.9rem; font-weight:700; color:#38bdf8;">Select User:</label>
+        <div style="display:flex; align-items:center; gap:14px; margin-bottom:8px; background:var(--bg-primary); padding:12px 16px; border-radius:10px; border:1px solid var(--border-color); flex-wrap:wrap; flex:0 0 auto;">
+          <label style="font-size:0.9rem; font-weight:700; color:#0284c7;">Select User:</label>
           <select id="accessRightsUserSelect" class="session-dropdown" style="width:280px; font-weight:700;" onchange="openUserAccessRightsModal(this.value)">
             ${SchoolData.staffUsers.map(u => `
               <option value="${u.id}" ${u.id === user.id ? 'selected' : ''}>${escapeHtml(u.name)} (${escapeHtml(u.role)})</option>
@@ -4950,10 +7537,10 @@ function openUserAccessRightsModal(userId) {
             <i class="fa-solid fa-rotate-left"></i> Follow role again
           </button>
         </div>
-        <p style="font-size:0.78rem; color:#94a3b8; margin:0 0 12px 0; flex:0 0 auto;">
+        <p style="font-size:0.78rem; color:var(--text-muted); margin:0 0 12px 0; flex:0 0 auto;">
           This screen is a <strong>per-person override</strong>. Anything ticked or unticked here beats the
           <strong>${escapeHtml(user.role)}</strong> role template for ${escapeHtml(user.name)} only.
-          Rows marked <span style="color:#fbbf24; font-weight:700;">differs from role</span> are already overridden.
+          Rows marked <span style="color:#b45309; font-weight:700;">differs from role</span> are already overridden.
         </p>
 
         <div style="flex:0 0 auto;">
@@ -4984,7 +7571,7 @@ function openUserAccessRightsModal(userId) {
   document.body.insertAdjacentHTML('beforeend', modalHtml);
 }
 
-function saveUserAccessRightsModal(userId) {
+async function saveUserAccessRightsModal(userId) {
   const user = SchoolData.staffUsers.find(u => u.id === userId);
   if (!user) return;
 
@@ -5005,10 +7592,8 @@ function saveUserAccessRightsModal(userId) {
     user.canManageFees = !!(user.accessRights.fee_collection.view || user.accessRights.fee_collection.add || user.accessRights.fee_collection.modify);
   }
 
-  saveSchoolDataToStorage();
+  await persistDirectoryDelta({ scope: 'staff', staffUpserts: [user] }, `Access rights saved for ${user.name} (${user.role}).`);
   document.getElementById('userAccessRightsModal').remove();
-
-  showNotification(`Access Rights saved for ${user.name} (${user.role}). Totals visibility updated.`, 'success');
   if (document.getElementById('contentBody')) {
     renderUsersPage(document.getElementById('contentBody'));
   }
@@ -5103,6 +7688,83 @@ function repairStaffFinancialVisibilityRights() {
     SchoolData._finRightsV2 = true;
     changed = true;
   }
+
+  if (!SchoolData._finRightsV3) {
+    (SchoolData.staffUsers || []).forEach((u) => {
+      if (!isTeacherRoleUser(u)) return;
+      if (u.viewDueBalance || u.viewTotalRevenue || u.canManageFees) changed = true;
+      u.viewDueBalance = false;
+      u.viewTotalRevenue = false;
+      u.canManageFees = false;
+      u.hideFees = true;
+      ensureStaffAccessRight(u, 'total_dues_view', 'view', false);
+      ensureStaffAccessRight(u, 'total_revenue_view', 'view', false);
+      ensureStaffAccessRight(u, 'fee_collection', 'view', false);
+      ensureStaffAccessRight(u, 'fee_collection', 'add', false);
+      ensureStaffAccessRight(u, 'fee_collection', 'modify', false);
+      ensureStaffAccessRight(u, 'student_dues_view', 'view', false);
+      ensureStaffAccessRight(u, 'fee_receipt_print', 'view', false);
+      ensureStaffAccessRight(u, 'fee_receipt_deletion', 'view', false);
+      ensureStaffAccessRight(u, 'fee_receipt_deletion', 'delete', false);
+      ensureStaffAccessRight(u, 'telegram_fee_notice', 'view', false);
+      changed = true;
+    });
+    SchoolData._finRightsV3 = true;
+  }
+
+  if (!SchoolData._finRightsV4) {
+    const feeKeys = (ERP_MODULES_LIST.fees || []).map((m) => m.key);
+    const teacherExamConfigKeys = ['class_weightage_config', 'class_subject_setup'];
+    const denyAllActions = (rightsObj, key) => {
+      if (!rightsObj[key]) rightsObj[key] = {};
+      ['view', 'add', 'modify', 'delete'].forEach((action) => {
+        rightsObj[key][action] = false;
+      });
+    };
+
+    (SchoolData.staffUsers || []).forEach((u) => {
+      const role = String(u.role || '').trim();
+      if (isErpAdminUser(u) || role === 'Accountant') return;
+
+      if (role === 'Receptionist') {
+        ['view', 'add', 'modify', 'delete'].forEach((action) => {
+          ensureStaffAccessRight(u, 'fee_receipt_deletion', action, false);
+        });
+        changed = true;
+        return;
+      }
+
+      if (isTeacherRoleUser(u) || role === 'Exam Incharge' || role === 'Subject Teacher') {
+        feeKeys.forEach((key) => {
+          ['view', 'add', 'modify', 'delete'].forEach((action) => {
+            ensureStaffAccessRight(u, key, action, false);
+          });
+        });
+        teacherExamConfigKeys.forEach((key) => {
+          ['view', 'add', 'modify', 'delete'].forEach((action) => {
+            ensureStaffAccessRight(u, key, action, false);
+          });
+        });
+        u.viewDueBalance = false;
+        u.viewTotalRevenue = false;
+        u.canManageFees = false;
+        u.hideFees = true;
+        changed = true;
+      }
+    });
+
+    ['Class Teacher & Subject Teacher', 'Subject Teacher', 'Class Teacher', 'Exam Incharge'].forEach((roleName) => {
+      const template = getRolePermissionTemplate(roleName);
+      if (!template) return;
+      feeKeys.forEach((key) => denyAllActions(template, key));
+      if (roleName !== 'Exam Incharge') {
+        teacherExamConfigKeys.forEach((key) => denyAllActions(template, key));
+      }
+      changed = true;
+    });
+
+    SchoolData._finRightsV4 = true;
+  }
   return changed;
 }
 
@@ -5139,6 +7801,54 @@ function canCurrentUserExportExamSheets() {
   return hasUserAccessPermission(user, 'exam_exports', 'view') === true;
 }
 
+function canUserViewExamWeightage(user = getCurrentActiveUser()) {
+  return hasUserAccessPermission(user, 'exam_weightage_view', 'view') === true;
+}
+
+function canUserConfigureExamWeightage(user = getCurrentActiveUser()) {
+  return hasUserAccessPermission(user, 'class_weightage_config', 'view') === true;
+}
+
+function formatExamComponentHeaderLabel(subjectCode, componentLabel, maxMarks, weightageMarks, showWeightage) {
+  const code = subjectCode || '';
+  if (showWeightage) {
+    return `${code} ${componentLabel} (${maxMarks} -> ${weightageMarks})`;
+  }
+  return `${code} ${componentLabel} (${maxMarks})`;
+}
+
+function getStudentClassSectionLabel(student) {
+  if (!student) return '';
+  const cls = student.currentClass || student.class || '';
+  const sec = student.currentSection || student.section || '';
+  return sec ? `${cls} - ${sec}` : cls;
+}
+
+function getStudentFeeDueSnapshot(admissionNo) {
+  const student = findStudentByAdmissionNo(admissionNo);
+  if (!student) {
+    return {
+      classSection: '',
+      tuitionDue: '',
+      annualDue: '',
+      examDue: '',
+      prevDue: '',
+      totalDue: ''
+    };
+  }
+  const status = getStudentFeeCategoryStatus(student);
+  const prevDue = Number(student.currentFeeInfo?.previousSessionDue || 0);
+  const tuitionDueOnly = Math.max(0, Number(status.tuitionDue || 0) - prevDue);
+  return {
+    classSection: getStudentClassSectionLabel(student),
+    tuitionDue: tuitionDueOnly,
+    annualDue: status.annualDue,
+    examDue: status.examDue,
+    prevDue,
+    totalDue: status.totalDue
+  };
+}
+
 function canCurrentUserExportStudents() {
   const user = getCurrentActiveUser();
   return hasUserAccessPermission(user, 'student_exports', 'view') === true;
@@ -5153,6 +7863,12 @@ function canCurrentUserBulkDeleteStudents() {
 function canCurrentUserDeleteSubjects() {
   const role = String(getCurrentActiveUser()?.role || '').toLowerCase().trim();
   return role.includes('super admin') || role.includes('principal');
+}
+
+function canCurrentUserDeleteFeeReceipts(user = getCurrentActiveUser()) {
+  if (!user) return false;
+  if (isErpAdminUser(user)) return true;
+  return hasUserAccessPermission(user, 'fee_receipt_deletion', 'delete') === true;
 }
 
 function canCurrentUserAddSubjects() {
@@ -5240,10 +7956,18 @@ function getDefaultAccessRightsForRole(role) {
         base[mod.key] = { view: false, add: false, modify: false, delete: false };
       }
     } else if (isTeacher) {
-      if (['exam_marks_entry', 'report_cards_print', 'exam_exports', 'attendance_register', 'student_directory'].includes(mod.key)) {
+      if (mod.key.includes('fee') || mod.key.includes('revenue') || mod.key.includes('dues') || mod.key === 'telegram_fee_notice') {
+        base[mod.key] = { view: false, add: false, modify: false, delete: false };
+      } else if (['exam_marks_entry', 'report_cards_print', 'exam_exports', 'attendance_register', 'student_directory'].includes(mod.key)) {
         base[mod.key] = { view: true, add: true, modify: true, delete: false };
       } else if (['teacher_subject_mappings', 'timetable_management', 'exam_schedule_manage', 'admit_card_print'].includes(mod.key)) {
         base[mod.key] = { view: true, add: false, modify: false, delete: false };
+      } else {
+        base[mod.key] = { view: false, add: false, modify: false, delete: false };
+      }
+    } else if (role === 'Exam Incharge') {
+      if (['exam_marks_entry', 'report_cards_print', 'exam_exports', 'exam_weightage_view', 'class_weightage_config', 'class_subject_setup', 'exam_schedule_manage', 'admit_card_print', 'student_directory', 'attendance_register'].includes(mod.key)) {
+        base[mod.key] = { view: true, add: true, modify: true, delete: false };
       } else {
         base[mod.key] = { view: false, add: false, modify: false, delete: false };
       }
@@ -5607,7 +8331,9 @@ function readSubjectClassScopeFromForm() {
  * (English school-wide ≠ one teacher for every class).
  */
 function applyTeacherMappingsToSubjectsDirectory(teacher, mappings) {
-  if (!teacher || !Array.isArray(SchoolData.subjects)) return false;
+  if (!teacher) return false;
+  ensureSchoolDataSubjectsArray();
+  if (!SchoolData.subjects.length) return false;
   const linked = findStaffUserForTeacher(teacher);
   if (!linked || !isTeacherRoleUser(linked)) return false;
   const teacherName = String(teacher.name || linked.name || '').trim();
@@ -5676,7 +8402,8 @@ function syncSubjectTeachersFromLinkedMappings() {
  * Clears leftover demo names (Varsha, Lakshya, …) that are not logins.
  */
 function sanitizeSubjectsTeachersMustBeUsers() {
-  if (!Array.isArray(SchoolData.subjects)) return false;
+  ensureSchoolDataSubjectsArray();
+  if (!SchoolData.subjects.length) return false;
   let changed = false;
   SchoolData.subjects.forEach((sub) => {
     const raw = String(sub.teacher || '').trim();
@@ -5729,7 +8456,7 @@ function repairMissingTeacherStaffAccounts() {
   return false;
 }
 
-function saveStaffTelegramChatIdFromInput(userId) {
+async function saveStaffTelegramChatIdFromInput(userId) {
   const u = (SchoolData.staffUsers || []).find((x) => x.id === userId);
   if (!u) return;
   const input = document.getElementById(`staffTgChat_${userId}`);
@@ -5738,6 +8465,7 @@ function saveStaffTelegramChatIdFromInput(userId) {
     showNotification('Chat ID must be a numeric Telegram ID (7–15 digits).', 'error');
     return;
   }
+  const changedUsers = new Set([u.id]);
   if (clean) {
     (SchoolData.staffUsers || []).forEach((other) => {
       if (other.id !== u.id && String(other.telegramChatId || '').trim() === clean) {
@@ -5745,6 +8473,7 @@ function saveStaffTelegramChatIdFromInput(userId) {
         other.telegramUserName = '';
         other.telegramLinkSource = '';
         other.telegramLinkedAt = '';
+        changedUsers.add(other.id);
       }
     });
   }
@@ -5757,11 +8486,10 @@ function saveStaffTelegramChatIdFromInput(userId) {
     u.telegramLinkSource = 'ERP User Management';
     u.telegramLinkedAt = new Date().toISOString();
   }
-  saveSchoolDataToStorage();
-  showNotification(
-    clean ? `Telegram Chat ID saved for ${u.name} in ERP.` : `Telegram Chat ID cleared for ${u.name}.`,
-    'success'
-  );
+  await persistDirectoryDelta({
+    scope: 'staff',
+    staffUpserts: (SchoolData.staffUsers || []).filter(user => changedUsers.has(user.id))
+  }, clean ? `Telegram Chat ID saved for ${u.name} in ERP.` : `Telegram Chat ID cleared for ${u.name}.`);
   renderUsersPage(document.getElementById('contentBody'));
 }
 
@@ -5770,7 +8498,7 @@ function editStaffTelegramChatId(userId) {
   saveStaffTelegramChatIdFromInput(userId);
 }
 
-function clearStaffTelegramChatId(userId) {
+async function clearStaffTelegramChatId(userId) {
   const u = (SchoolData.staffUsers || []).find((x) => x.id === userId);
   if (!u) return;
   if (!window.confirm(`Clear Telegram Chat ID for ${u.name}?`)) return;
@@ -5780,8 +8508,18 @@ function clearStaffTelegramChatId(userId) {
   u.telegramLinkedAt = '';
   const input = document.getElementById(`staffTgChat_${userId}`);
   if (input) input.value = '';
-  saveSchoolDataToStorage();
-  showNotification(`Telegram unlinked for ${u.name}.`, 'info');
+  await persistDirectoryDelta({ scope: 'staff', staffUpserts: [u] }, `Telegram unlinked for ${u.name}.`);
+  renderUsersPage(document.getElementById('contentBody'));
+}
+
+async function saveStaffBiometricId(userId) {
+  const u = (SchoolData.staffUsers || []).find((x) => x.id === userId);
+  if (!u) return;
+  const input = document.getElementById(`staffBiometric_${userId}`);
+  const clean = String(input?.value || '').trim();
+  if (u.biometricId === clean) return;
+  u.biometricId = clean;
+  await persistDirectoryDelta({ scope: 'staff', staffUpserts: [u] }, `Biometric Z900 ID saved for ${u.name}.`);
   renderUsersPage(document.getElementById('contentBody'));
 }
 
@@ -5969,15 +8707,15 @@ function showStaffPasswordRevealModal(user, password, title) {
   modal.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(2,6,23,0.78);display:flex;align-items:center;justify-content:center;padding:16px;';
   modal.innerHTML = `
     <div style="background:#0f172a;border:2px solid #38bdf8;border-radius:14px;max-width:440px;width:100%;padding:22px;box-shadow:0 20px 50px rgba(0,0,0,0.45);">
-      <h3 style="margin:0 0 8px;color:#38bdf8;font-family:var(--font-heading);">${escapeHtml(title || 'Staff password ready')}</h3>
+      <h3 style="margin:0 0 8px;color:#0284c7;font-family:var(--font-heading);">${escapeHtml(title || 'Staff password ready')}</h3>
       <p style="margin:0 0 14px;color:#94a3b8;font-size:0.88rem;">Cloud login is hashed. This plaintext is kept only on this office PC for Show/Copy.</p>
       <div style="background:#020617;border:1px solid #334155;border-radius:10px;padding:12px;margin-bottom:14px;">
         <div style="color:#94a3b8;font-size:0.78rem;margin-bottom:4px;">Staff</div>
         <div style="color:#e2e8f0;font-weight:700;margin-bottom:10px;">${escapeHtml(user.name || '')}</div>
         <div style="color:#94a3b8;font-size:0.78rem;margin-bottom:4px;">Username</div>
-        <code style="color:#38bdf8;font-size:1rem;font-weight:800;">${escapeHtml(user.username || '')}</code>
+        <code style="color:#0284c7;font-size:1rem;font-weight:800;">${escapeHtml(user.username || '')}</code>
         <div style="color:#94a3b8;font-size:0.78rem;margin:12px 0 4px;">Password</div>
-        <code id="staffPassRevealModalPass" style="color:#fbbf24;font-size:1.05rem;font-weight:800;word-break:break-all;">${escapeHtml(pass)}</code>
+        <code id="staffPassRevealModalPass" style="color:#b45309;font-size:1.05rem;font-weight:800;word-break:break-all;">${escapeHtml(pass)}</code>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
         <button type="button" class="btn btn-primary" id="staffPassRevealCopyBtn"><i class="fa-solid fa-copy"></i> Copy login</button>
@@ -6087,18 +8825,18 @@ function resetStaffPassword(userId) {
     (async () => {
       try {
         // Real login uses erp_staff_credentials — must update that, not only the snapshot field.
-        await callErpSecurityApi('authAdminResetPassword', {
+        const resetResult = await callErpSecurityApi('authAdminResetPassword', {
           body: {
             userId: u.id,
             username: u.username,
             newPassword: password
           }
         });
+        if (resetResult?.savedAt && typeof window.recordCloudMutationRevision === 'function') {
+          window.recordCloudMutationRevision(resetResult.savedAt);
+        }
         rememberStaffPasswordForAdmin(u, password);
         saveSchoolDataToStorage({ skipCloudPush: true });
-        if (typeof pushSchoolDataToCloud === 'function') {
-          pushSchoolDataToCloud({ skipMergePull: true }).catch((err) => console.warn('Password snapshot mirror:', err));
-        }
         renderUsersPage(document.getElementById('contentBody'));
         // Always show a modal with the new password (do not rely only on table DOM).
         showStaffPasswordRevealModal(u, password, 'Password reset — copy now');
@@ -6117,13 +8855,20 @@ function resetStaffPassword(userId) {
   }
 }
 
-function saveUserPermissionsMatrix() {
+async function saveUserPermissionsMatrix() {
   const checkboxes = document.querySelectorAll('input[data-uid]');
+  const changedUserIds = new Set();
   checkboxes.forEach(box => {
     const uid = box.getAttribute('data-uid');
     const field = box.getAttribute('data-field');
     const uObj = SchoolData.staffUsers.find(x => x.id === uid);
     if (uObj) {
+      const before = JSON.stringify(uObj);
+      if (isTeacherRoleUser(uObj) && ['canManageFees', 'viewTotalRevenue', 'viewDueBalance'].includes(field)) {
+        uObj[field] = false;
+        if (JSON.stringify(uObj) !== before) changedUserIds.add(uObj.id);
+        return;
+      }
       uObj[field] = box.checked;
       // Sync Access Rights modules so dashboard/fees enforcement matches the matrix
       if (field === 'viewTotalRevenue') {
@@ -6148,12 +8893,14 @@ function saveUserPermissionsMatrix() {
       if (field === 'reportCards') {
         ensureStaffAccessRight(uObj, 'report_cards_print', 'view', box.checked);
       }
+      if (JSON.stringify(uObj) !== before) changedUserIds.add(uObj.id);
     }
   });
 
-  showNotification('User rights saved. Total Dues / Revenue visibility now applies on Dashboard & Fees.', 'success');
-
-  saveSchoolDataToStorage();
+  const changedUsers = (SchoolData.staffUsers || []).filter(user => changedUserIds.has(user.id));
+  if (changedUsers.length) {
+    await persistDirectoryDelta({ scope: 'staff', staffUpserts: changedUsers }, 'User rights saved. Total Dues and Revenue visibility now applies on Dashboard and Fees.');
+  }
   renderUsersPage(document.getElementById('contentBody'));
 }
 
@@ -6162,7 +8909,7 @@ function openAddNewUserModal() {
     <div id="addUserModal" class="modal-overlay active" style="position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.75); display:flex; align-items:center; justify-content:center; z-index:99999; backdrop-filter:blur(6px);">
       <div class="glass-card" style="width:480px; padding:24px; border:2px solid #38bdf8; background:#0f172a; border-radius:18px; box-shadow:0 25px 50px -12px rgba(56,189,248,0.3);">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:18px; border-bottom:1px solid #334155; padding-bottom:12px;">
-          <h3 style="margin:0; color:#38bdf8; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+          <h3 style="margin:0; color:#0284c7; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
             <i class="fa-solid fa-user-plus"></i> Add New Staff User Account
           </h3>
           <button style="background:#334155; border:none; color:#ffffff; width:30px; height:30px; border-radius:50%; font-size:1rem; cursor:pointer;" onclick="document.getElementById('addUserModal').remove()">X</button>
@@ -6170,23 +8917,23 @@ function openAddNewUserModal() {
 
         <div style="display:flex; flex-direction:column; gap:14px;">
           <div>
-            <label style="font-size:0.85rem; font-weight:700; color:#cbd5e1;">Staff User Full Name *</label>
+            <label style="font-size:0.85rem; font-weight:700; color:#374151;">Staff User Full Name *</label>
             <input type="text" id="newStaffName" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" placeholder="e.g. Mrs. Anjali Sharma">
           </div>
 
           <div style="display:flex; gap:12px;">
             <div style="flex:1;">
-              <label style="font-size:0.85rem; font-weight:700; color:#38bdf8;">Login Username *</label>
+              <label style="font-size:0.85rem; font-weight:700; color:#0284c7;">Login Username *</label>
               <input type="text" id="newStaffUsername" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" placeholder="e.g. anjali_eng">
             </div>
             <div style="flex:1;">
-              <label style="font-size:0.85rem; font-weight:700; color:#38bdf8;">Login Password *</label>
+              <label style="font-size:0.85rem; font-weight:700; color:#0284c7;">Login Password *</label>
               <input type="text" id="newStaffPassword" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" placeholder="e.g. pass1234">
             </div>
           </div>
 
           <div>
-            <label style="font-size:0.85rem; font-weight:700; color:#cbd5e1;">Assigned Role / Designation *</label>
+            <label style="font-size:0.85rem; font-weight:700; color:#374151;">Assigned Role / Designation *</label>
             <select id="newStaffRole" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px; font-weight:700;">
               <option value="Receptionist">Receptionist (Admission & collect fees — no school totals)</option>
               <option value="Subject Teacher">Subject Teacher</option>
@@ -6198,7 +8945,7 @@ function openAddNewUserModal() {
           </div>
 
           <div>
-            <label style="font-size:0.85rem; font-weight:700; color:#cbd5e1;">Mobile Phone Number (Optional):</label>
+            <label style="font-size:0.85rem; font-weight:700; color:#374151;">Mobile Phone Number (Optional):</label>
             <input type="text" id="newStaffPhone" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" placeholder="+91 98765 43210">
           </div>
 
@@ -6217,7 +8964,7 @@ function openAddNewUserModal() {
   document.body.insertAdjacentHTML('beforeend', modalHtml);
 }
 
-function saveNewStaffUser() {
+async function saveNewStaffUser() {
   const name = document.getElementById('newStaffName').value.trim();
   const username = document.getElementById('newStaffUsername').value.trim().toLowerCase();
   const password = document.getElementById('newStaffPassword').value.trim() || 'pass1234';
@@ -6235,6 +8982,8 @@ function saveNewStaffUser() {
 
   if (!SchoolData.staffUsers) SchoolData.staffUsers = [];
   if (!SchoolData.teachers) SchoolData.teachers = [];
+  const previousStaffUsers = SchoolData.staffUsers.slice();
+  const previousTeachers = JSON.parse(JSON.stringify(SchoolData.teachers));
 
   const existingUser = SchoolData.staffUsers.find(u => String(u.username || '').trim().toLowerCase() === username);
   if (existingUser) {
@@ -6247,6 +8996,7 @@ function saveNewStaffUser() {
   const isAccountantRole = role === 'Accountant';
   const isReceptionistRole = role === 'Receptionist';
   let linkedTeacherId = '';
+  let linkedTeacher = null;
   let linkedTeacherMappings = [];
   let linkedTeacherClasses = [];
 
@@ -6267,6 +9017,7 @@ function saveNewStaffUser() {
       SchoolData.teachers.push(tchObj);
     }
     linkedTeacherId = tchObj.id;
+    linkedTeacher = tchObj;
     linkedTeacherMappings = Array.isArray(tchObj.subjectMappings) ? tchObj.subjectMappings : [];
     linkedTeacherClasses = Array.isArray(tchObj.classesTaught) ? tchObj.classesTaught : [];
   }
@@ -6276,7 +9027,6 @@ function saveNewStaffUser() {
     uniqueId: `USR-${String((SchoolData.staffUsers || []).length + 1).padStart(4, '0')}`,
     name,
     username,
-    password,
     role,
     phone,
     email: `${username}@mmm.edu.in`,
@@ -6296,44 +9046,121 @@ function saveNewStaffUser() {
   };
 
   SchoolData.staffUsers.push(newUser);
-  rememberStaffPasswordForAdmin(newUser, password);
+  if (linkedTeacher) linkedTeacher.linkedStaffUserId = newUser.id;
 
   document.getElementById('addUserModal')?.remove();
   // Skip debounced merge-push — staff list must upload exactly as in memory
   saveSchoolDataToStorage({ skipCloudPush: true });
   renderUsersPage(document.getElementById('contentBody'));
 
-  const pushStaff = typeof pushStaffAuthorityToCloud === 'function'
-    ? pushStaffAuthorityToCloud
-    : (typeof pushSchoolDataToCloud === 'function'
-      ? () => pushSchoolDataToCloud({ skipMergePull: true })
-      : null);
-
-  if (pushStaff) {
-    pushStaff()
-      .then(async () => {
-        try {
-          await callErpSecurityApi('authAdminResetPassword', {
-            body: { userId: newUser.id, username: newUser.username, newPassword: password }
-          });
-          rememberStaffPasswordForAdmin(newUser, password);
-          showStaffPasswordRevealModal(newUser, password, 'New staff account — copy password');
-          showNotification(`Created ${name} [${username}] — password is viewable via Show on this PC.`, 'success');
-        } catch (err) {
-          showNotification(`User saved, but secure password setup failed: ${err.message}. Use Reset Pass.`, 'warning');
-        }
-      })
-      .catch((err) => {
-        showNotification(`User created on screen, but cloud save failed: ${err.message}. They may disappear after refresh.`, 'error');
-      });
-  } else {
-    showNotification(`Created staff account for ${name} [${username}] (${role}). Cloud sync missing — may not persist.`, 'warning');
+  try {
+    await persistDirectoryDelta({
+      scope: 'staff',
+      staffUpserts: [newUser],
+      teacherUpserts: linkedTeacher ? [linkedTeacher] : []
+    }, `Created ${name} [${username}]`, { allowQueue: false });
+  } catch (err) {
+    SchoolData.staffUsers = previousStaffUsers;
+    SchoolData.teachers = previousTeachers;
+    saveSchoolDataToStorage({ skipCloudPush: true });
+    renderUsersPage(document.getElementById('contentBody'));
+    showNotification(`User creation was not completed: ${err.message}. No local-only user was kept.`, 'error');
+    return;
+  }
+  try {
+    const passwordResult = await callErpSecurityApi('authAdminResetPassword', {
+      body: { userId: newUser.id, username: newUser.username, newPassword: password }
+    });
+    if (passwordResult?.savedAt && typeof window.recordCloudMutationRevision === 'function') {
+      window.recordCloudMutationRevision(passwordResult.savedAt);
+    }
+    rememberStaffPasswordForAdmin(newUser, password);
+    showStaffPasswordRevealModal(newUser, password, 'New staff account — copy password');
+    showNotification(`✅ ${name} can now log in. Password is stored securely and viewable via Show on this PC.`, 'success');
+  } catch (err) {
+    showNotification(`User roster is safely in cloud, but login password setup failed: ${err.message}. Use Reset Pass.`, 'warning');
   }
 }
 
-function deleteStaffUser(uid) {
+function openChangeRoleModal(userId) {
+  const activeUser = typeof getCurrentActiveUser === 'function' ? getCurrentActiveUser() : null;
+  if (!activeUser || !(activeUser.role === 'Super Admin' || activeUser.role === 'Principal')) {
+    showNotification('Only Super Admin or Principal can change staff roles.', 'error');
+    return;
+  }
+  const target = (SchoolData.staffUsers || []).find(u => u.id === userId);
+  if (!target) { showNotification('User not found.', 'error'); return; }
+  const roles = ['Super Admin', 'Principal', 'Vice Principal', 'Accountant', 'Receptionist', 'Teacher', 'Class Teacher'];
+  const existing = document.getElementById('changeRoleModal');
+  if (existing) existing.remove();
+  const modal = document.createElement('div');
+  modal.id = 'changeRoleModal';
+  modal.className = 'modal-overlay active';
+  modal.style.cssText = 'z-index:999999;';
+  modal.innerHTML = `
+    <div class="modal-box" style="max-width:400px; padding:28px; background:#1e293b; border:2px solid #6366f1; border-radius:16px;">
+      <h3 style="margin:0 0 16px 0; color:#a5b4fc; font-size:1.1rem;">✏️ Change Role — ${escapeHtml(target.name)}</h3>
+      <label style="font-size:0.85rem; color:#cbd5e1; display:block; margin-bottom:6px;">New Role</label>
+      <select id="newRoleSelect" class="session-dropdown" style="width:100%; margin-bottom:14px; font-weight:700;">
+        ${roles.map(r => `<option value="${r}" ${r === target.role ? 'selected' : ''}>${r}</option>`).join('')}
+      </select>
+      <label style="font-size:0.85rem; color:#cbd5e1; display:block; margin-bottom:6px;">Your Admin Password (to confirm)</label>
+      <input type="password" id="changeRoleAdminPass" class="session-dropdown" style="width:100%; margin-bottom:18px;" placeholder="Enter your password">
+      <div style="display:flex; gap:10px; justify-content:flex-end;">
+        <button onclick="document.getElementById('changeRoleModal').remove()" class="btn btn-secondary" style="padding:8px 18px;">Cancel</button>
+        <button onclick="confirmChangeRole('${userId}')" class="btn btn-primary" style="padding:8px 18px; background:#6366f1;">Save Role</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+}
+
+async function confirmChangeRole(userId) {
+  const adminPass = (document.getElementById('changeRoleAdminPass')?.value || '').trim();
+  const newRole = document.getElementById('newRoleSelect')?.value;
+  if (!adminPass) { showNotification('Enter your admin password to confirm.', 'error'); return; }
+  if (!newRole) { showNotification('Select a role.', 'error'); return; }
+  // Verify admin password via cloud
+  const activeUser = typeof getCurrentActiveUser === 'function' ? getCurrentActiveUser() : null;
+  if (!activeUser) { showNotification('Not logged in.', 'error'); return; }
+  try {
+    await callErpSecurityApi('authLogin', {
+      method: 'POST',
+      body: { username: activeUser.username, password: adminPass }
+    });
+  } catch (err) {
+    showNotification('Incorrect admin password. Role not changed.', 'error');
+    return;
+  }
+  const target = (SchoolData.staffUsers || []).find(u => u.id === userId);
+  if (!target) { showNotification('User not found.', 'error'); return; }
+  const oldRole = target.role;
+  const oldAccessRights = target.accessRights ? JSON.parse(JSON.stringify(target.accessRights)) : target.accessRights;
+  target.role = newRole;
+  // Update access rights for new role
+  target.accessRights = getDefaultAccessRightsForRole ? getDefaultAccessRightsForRole(newRole) : target.accessRights;
+  document.getElementById('changeRoleModal')?.remove();
+  saveSchoolDataToStorage({ skipCloudPush: true });
+  renderUsersPage(document.getElementById('contentBody'));
+  // Push to cloud
+  try {
+    await persistDirectoryDelta({ scope: 'staff', staffUpserts: [target] }, `${target.name}'s role changed from ${oldRole} → ${newRole}`);
+  } catch(err) {
+    target.role = oldRole;
+    target.accessRights = oldAccessRights;
+    saveSchoolDataToStorage({ skipCloudPush: true });
+    renderUsersPage(document.getElementById('contentBody'));
+  }
+}
+
+async function deleteStaffUser(uid) {
   if (!confirm('Remove this staff login? Their teacher profile and subject mappings will also be removed.')) return;
   const user = (SchoolData.staffUsers || []).find(x => x.id === uid);
+  const previousStaffUsers = (SchoolData.staffUsers || []).slice();
+  const previousTeachers = (SchoolData.teachers || []).slice();
+  const deletedTeacherIds = (SchoolData.teachers || []).filter(t =>
+    t.linkedStaffUserId === uid || t.id === user?.assignedTeacherId ||
+    String(t.name || '').trim().toLowerCase() === String(user?.name || '').trim().toLowerCase()
+  ).map(t => t.id);
   SchoolData.staffUsers = (SchoolData.staffUsers || []).filter(x => x.id !== uid);
   if (user && Array.isArray(SchoolData.teachers)) {
     SchoolData.teachers = SchoolData.teachers.filter(t =>
@@ -6345,22 +9172,17 @@ function deleteStaffUser(uid) {
   saveSchoolDataToStorage({ skipCloudPush: true });
   renderUsersPage(document.getElementById('contentBody'));
 
-  const pushStaff = typeof pushStaffAuthorityToCloud === 'function'
-    ? pushStaffAuthorityToCloud
-    : (typeof pushSchoolDataToCloud === 'function'
-      ? () => pushSchoolDataToCloud({ skipMergePull: true })
-      : null);
-
-  if (pushStaff) {
-    pushStaff()
-      .then((data) => {
-        showNotification(`Staff removed and saved to cloud (${(SchoolData.staffUsers || []).length} logins left).`, 'success');
-      })
-      .catch((err) => {
-        showNotification(`Staff removed on screen, but cloud save failed: ${err.message}. They will come back on refresh until cloud sync works.`, 'error');
-      });
-  } else {
-    showNotification('Staff removed on screen only. js/cloudSync.js is missing or wrong — upload the real cloudSync file or they will return after refresh.', 'error');
+  try {
+    await persistDirectoryDelta({
+      scope: 'staff',
+      staffDeletedIds: [uid],
+      teacherDeletedIds: deletedTeacherIds
+    }, `Staff removed (${(SchoolData.staffUsers || []).length} logins left)`, { allowQueue: false });
+  } catch (error) {
+    SchoolData.staffUsers = previousStaffUsers;
+    SchoolData.teachers = previousTeachers;
+    saveSchoolDataToStorage({ skipCloudPush: true });
+    renderUsersPage(document.getElementById('contentBody'));
   }
 }
 
@@ -6453,10 +9275,16 @@ function getSubjectExamComponentWeightage(className, subjectCode, component) {
 
 function clampExamMarkInput(inputElem) {
   const max = parseFloat(inputElem.getAttribute('max')) || 100;
-  let value = parseFloat(inputElem.value);
+  const raw = String(inputElem.value || '').trim().toUpperCase();
+  if (!raw) return '';
+  if (['AB', 'ML', 'NA'].includes(raw)) {
+    inputElem.value = raw;
+    return raw;
+  }
+  let value = parseFloat(raw);
   if (Number.isNaN(value)) {
-    inputElem.value = '';
-    return 0;
+    inputElem.classList.add('exam-focus-invalid');
+    return '';
   }
   if (value < 0) value = 0;
   if (value > max) {
@@ -6464,13 +9292,27 @@ function clampExamMarkInput(inputElem) {
     showNotification(`Marks cannot be more than ${max}. Value adjusted.`, 'warning');
   }
   inputElem.value = value;
+  inputElem.classList.remove('exam-focus-invalid');
   return value;
+}
+
+function bindBroadsheetInputToSharedMarks(inputElem) {
+  const row = inputElem?.closest('tr.marks-entry-row');
+  const student = (SchoolData.students || []).find(item => String(item.admissionNo) === String(row?.dataset.admission));
+  const subject = inputElem?.dataset.subject;
+  const exam = inputElem?.dataset.exam;
+  if (!student || !subject || !exam) return;
+  if (!student.examMarks) student.examMarks = {};
+  if (!student.examMarks[subject]) student.examMarks[subject] = {};
+  const value = clampExamMarkInput(inputElem);
+  if (value === '') delete student.examMarks[subject][exam];
+  else student.examMarks[subject][exam] = value;
 }
 
 function recalcMasterBroadsheetRow(inputElem) {
   const tr = inputElem.closest('tr');
   if (!tr) return;
-  clampExamMarkInput(inputElem);
+  bindBroadsheetInputToSharedMarks(inputElem);
 
   const activeClass = document.getElementById('examClassSelector') ? document.getElementById('examClassSelector').value : 'Class 5';
   const examTerm = document.getElementById('examTermSelector') ? document.getElementById('examTermSelector').value : 'half_yearly';
@@ -6555,6 +9397,8 @@ function switchActiveSubjectView(subCode) {
 function setupTableTrackpadAndMouseDragScroll() {
   const el = document.getElementById('subjectTableContainer');
   if (!el) return;
+  if (el._matrixScrollBound) return;
+  el._matrixScrollBound = true;
 
   function syncSlider() {
     const slider = document.getElementById('subjectRangeSlider');
@@ -6564,10 +9408,8 @@ function setupTableTrackpadAndMouseDragScroll() {
     }
   }
 
-  // 1. Sync slider bar on native browser scroll
   el.addEventListener('scroll', syncSlider, { passive: true });
 
-  // 1b. Smooth Horizontal Trackpad & Shift+Wheel Handling (Eliminates Chrome Rubber-Band Physics)
   el.addEventListener('wheel', (e) => {
     if (Math.abs(e.deltaX) > Math.abs(e.deltaY) || e.shiftKey) {
       el.scrollLeft += (e.deltaX || e.deltaY);
@@ -6575,7 +9417,24 @@ function setupTableTrackpadAndMouseDragScroll() {
     }
   }, { passive: false });
 
-  // 2. Keyboard Focus: keep active cell visible
+  // Mobile + touch laptops: drag horizontally to slide subjects
+  let touchStartX = 0;
+  let touchScrollLeft = 0;
+  let touchDragging = false;
+  el.addEventListener('touchstart', (e) => {
+    if (!e.touches || e.touches.length !== 1) return;
+    touchDragging = true;
+    touchStartX = e.touches[0].clientX;
+    touchScrollLeft = el.scrollLeft;
+  }, { passive: true });
+  el.addEventListener('touchmove', (e) => {
+    if (!touchDragging || !e.touches || e.touches.length !== 1) return;
+    const dx = touchStartX - e.touches[0].clientX;
+    el.scrollLeft = touchScrollLeft + dx;
+    syncSlider();
+  }, { passive: true });
+  el.addEventListener('touchend', () => { touchDragging = false; }, { passive: true });
+
   el.addEventListener('focusin', (e) => {
     if (e.target.tagName.toLowerCase() !== 'input') return;
     const cRect = e.target.getBoundingClientRect(), wRect = el.getBoundingClientRect();
@@ -6608,7 +9467,14 @@ function calculateClassRanks(className, examTerm) {
     (s.currentClass || s.class) === className
   );
   const configuredSubs = getSubjectsForClassAndExam(className, examTerm);
-  const isPrimary = (className.includes('Nursery') || className.includes('LKG') || className.includes('UKG') || className.includes('Class 1') || className.includes('Class 2') || className.includes('Class 3') || className.includes('Class 4') || className.includes('Class 5'));
+
+  const parseScore = (val) => {
+    if (val === undefined || val === null) return 0;
+    const str = String(val).trim().toUpperCase();
+    if (str === 'AB' || str === 'ML' || str === 'NA' || str === '' || str === '-') return 0;
+    const num = parseFloat(str);
+    return isNaN(num) ? 0 : num;
+  };
 
   const studentScores = classStudents.map(student => {
     let grandTotalObtained = 0;
@@ -6618,42 +9484,35 @@ function calculateClassRanks(className, examTerm) {
       const code = (s.code || s.name).toLowerCase();
       const markObj = (student.examMarks && student.examMarks[code]) ? student.examMarks[code] : {};
       
-      let ut1 = markObj.ut1 !== undefined ? markObj.ut1 : 0;
-      let ut2 = markObj.ut2 !== undefined ? markObj.ut2 : 0;
-      let hy = markObj.hy !== undefined ? markObj.hy : 0;
-      let ut3 = markObj.ut3 !== undefined ? markObj.ut3 : 0;
-      let ut4 = markObj.ut4 !== undefined ? markObj.ut4 : 0;
-      let fin = markObj.fin !== undefined ? markObj.fin : 0;
+      let ut1 = parseScore(markObj.ut1);
+      let ut2 = parseScore(markObj.ut2);
+      let hy = parseScore(markObj.hy);
+      let ut3 = parseScore(markObj.ut3);
+      let ut4 = parseScore(markObj.ut4);
+      let fin = parseScore(markObj.fin);
 
       let subTotal = 0;
       if (examTerm === 'half_yearly') {
-        const ut1Max = getSubjectExamComponentMax(className, code, 'ut1');
-        const ut2Max = getSubjectExamComponentMax(className, code, 'ut2');
-        const hyMax = getSubjectExamComponentMax(className, code, 'hy');
-        const ut1Weight = getSubjectExamComponentWeightage(className, code, 'ut1');
-        const ut2Weight = getSubjectExamComponentWeightage(className, code, 'ut2');
-        const hyWeight = getSubjectExamComponentWeightage(className, code, 'hy');
+        const ut1Max = getSubjectExamComponentMax(className, code, 'ut1') || 25;
+        const ut2Max = getSubjectExamComponentMax(className, code, 'ut2') || 25;
+        const hyMax = getSubjectExamComponentMax(className, code, 'hy') || 100;
+        const ut1Weight = getSubjectExamComponentWeightage(className, code, 'ut1') || 20;
+        const ut2Weight = getSubjectExamComponentWeightage(className, code, 'ut2') || 20;
+        const hyWeight = getSubjectExamComponentWeightage(className, code, 'hy') || 60;
         subTotal = Math.round((ut1Max ? (ut1 / ut1Max) * ut1Weight : 0) + (ut2Max ? (ut2 / ut2Max) * ut2Weight : 0) + (hyMax ? (hy / hyMax) * hyWeight : 0));
         grandTotalMax += ut1Weight + ut2Weight + hyWeight;
       } else if (examTerm === 'final_annual') {
-        const ut3Max = getSubjectExamComponentMax(className, code, 'ut3');
-        const ut4Max = getSubjectExamComponentMax(className, code, 'ut4');
-        const finMax = getSubjectExamComponentMax(className, code, 'fin');
-        const ut3Weight = getSubjectExamComponentWeightage(className, code, 'ut3');
-        const ut4Weight = getSubjectExamComponentWeightage(className, code, 'ut4');
-        const finWeight = getSubjectExamComponentWeightage(className, code, 'fin');
+        const ut3Max = getSubjectExamComponentMax(className, code, 'ut3') || 25;
+        const ut4Max = getSubjectExamComponentMax(className, code, 'ut4') || 25;
+        const finMax = getSubjectExamComponentMax(className, code, 'fin') || 100;
+        const ut3Weight = getSubjectExamComponentWeightage(className, code, 'ut3') || 20;
+        const ut4Weight = getSubjectExamComponentWeightage(className, code, 'ut4') || 20;
+        const finWeight = getSubjectExamComponentWeightage(className, code, 'fin') || 60;
         subTotal = Math.round((ut3Max ? (ut3 / ut3Max) * ut3Weight : 0) + (ut4Max ? (ut4 / ut4Max) * ut4Weight : 0) + (finMax ? (fin / finMax) * finWeight : 0));
         grandTotalMax += ut3Weight + ut4Weight + finWeight;
       } else {
-        const keys = ['ut1', 'ut2', 'hy', 'ut3', 'ut4', 'fin'];
-        subTotal = keys.reduce((sum, key) => {
-          const raw = { ut1, ut2, hy, ut3, ut4, fin }[key];
-          const rawMax = getSubjectExamComponentMax(className, code, key);
-          const weight = getSubjectExamComponentWeightage(className, code, key);
-          return sum + (rawMax ? (raw / rawMax) * weight : 0);
-        }, 0);
-        subTotal = Math.round(subTotal);
-        grandTotalMax += keys.reduce((sum, key) => sum + getSubjectExamComponentWeightage(className, code, key), 0);
+        subTotal = ut1 + ut2 + hy + ut3 + ut4 + fin;
+        grandTotalMax += (s.maxMarks || 100);
       }
 
       grandTotalObtained += subTotal;
@@ -6661,23 +9520,21 @@ function calculateClassRanks(className, examTerm) {
 
     return {
       admissionNo: student.admissionNo,
-      grandTotalObtained,
-      grandTotalMax,
-      percentage: grandTotalMax > 0 ? (grandTotalObtained / grandTotalMax) * 100 : 0
+      score: grandTotalObtained,
+      max: grandTotalMax
     };
   });
 
-  // Sort descending by total marks obtained
-  studentScores.sort((a, b) => b.grandTotalObtained - a.grandTotalObtained);
+  studentScores.sort((a, b) => b.score - a.score);
 
-  // Map to rank (1, 2, 3...)
   const rankMap = {};
-  studentScores.forEach((st, idx) => {
-    rankMap[st.admissionNo] = idx + 1;
+  studentScores.forEach((item, index) => {
+    rankMap[item.admissionNo] = index + 1;
   });
 
   return rankMap;
 }
+
 
 function exportClassHalfYearlyExcel(className) {
   if (blockExamSheetExportIfDenied()) return;
@@ -6879,6 +9736,68 @@ function exportMasterConsolidatedClassExcel(className) {
 
 }
 
+function parseScore(value) {
+  if (value === undefined || value === null) return 0;
+  const normalized = String(value).trim().toUpperCase();
+  if (normalized === '' || normalized === '-' || normalized === 'AB' || normalized === 'ML' || normalized === 'NA') return 0;
+  const numericValue = Number.parseFloat(normalized);
+  return Number.isFinite(numericValue) ? numericValue : 0;
+}
+
+function formatReportCardMark(value) {
+  if (value === undefined || value === null || String(value).trim() === '') return '—';
+  return escapeHtml(String(value).trim().toUpperCase());
+}
+
+function formatReportCardAttendanceCompact(summary) {
+  const present = Number(summary?.daysPresent) || 0;
+  const workingDays = Number(summary?.workingDays) || 0;
+  const percentage = Number.isFinite(summary?.percentage) ? summary.percentage : 0;
+  return `${percentage}% (${present}/${workingDays} Days)`;
+}
+
+function getReportCardPrintWindowCss(orientation, isLetterhead) {
+  const landscape = orientation === 'landscape';
+  const pageWidth = landscape ? '297mm' : '210mm';
+  const pageHeight = landscape ? '210mm' : '297mm';
+  const colourPadding = landscape ? '8mm 13mm' : '7mm 10mm';
+
+  return `
+    @page { size: A4 ${landscape ? 'landscape' : 'portrait'}; margin: 0; }
+    #reportCardDirectPrintArea { position:fixed; left:-200vw; top:0; background:#ffffff; }
+    @media print {
+      * { box-sizing: border-box; }
+      html, body {
+        width: ${pageWidth}; min-height: ${pageHeight}; margin:0; padding:0;
+        background:#ffffff !important; color:#0f172a !important; font-family:'Inter', sans-serif;
+        -webkit-print-color-adjust:exact !important; print-color-adjust:exact !important;
+      }
+      body.report-card-direct-print > * { visibility:hidden !important; }
+      body.report-card-direct-print #reportCardDirectPrintArea,
+      body.report-card-direct-print #reportCardDirectPrintArea * { visibility:visible !important; }
+      body.report-card-direct-print #reportCardDirectPrintArea {
+        position:absolute !important; left:0 !important; top:0 !important;
+        width:${pageWidth} !important; height:${pageHeight} !important; margin:0 !important;
+        border-radius:0 !important; box-shadow:none !important; overflow:hidden !important;
+        page-break-inside:avoid !important; break-inside:avoid !important;
+      }
+      body.report-card-direct-print #reportCardDirectPrintArea .rc-content-wrapper {
+        width:100% !important; height:100% !important; padding:${colourPadding} !important;
+      }
+      body.report-card-direct-print .no-print { display:none !important; }
+      body.report-card-direct-print .rc-editable-field {
+        outline:none !important; box-shadow:none !important; cursor:default !important;
+      }
+      ${isLetterhead ? `
+        body.report-card-direct-print #reportCardDirectPrintArea .rc-vector-border,
+        body.report-card-direct-print #reportCardDirectPrintArea .rc-watermark-logo { display:none !important; }
+        body.report-card-direct-print #reportCardDirectPrintArea .rc-school-logo,
+        body.report-card-direct-print #reportCardDirectPrintArea .rc-school-name { visibility:hidden !important; }
+      ` : ''}
+    }
+  `;
+}
+
 function printReportCard(containerId) {
   const printArea = document.getElementById(containerId || 'printableSingleSheetArea');
   if (!printArea) {
@@ -6886,54 +9805,22 @@ function printReportCard(containerId) {
     return;
   }
 
-  const printWindow = window.open('', '_blank', 'width=900,height=1200');
-  if (!printWindow) {
-    window.print();
-    return;
-  }
-
-  printWindow.document.write(`
-    <!DOCTYPE html>
-    <html>
-      <head>
-        <title>Official Report Card - Madan Mohan Malviya School</title>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Playfair+Display:wght@700&family=Caveat:wght@700&display=swap" rel="stylesheet">
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-        <style>
-          @page {
-            size: A4 portrait;
-            margin: 6mm 8mm;
-          }
-          * { box-sizing: border-box; }
-          body {
-            font-family: 'Inter', sans-serif;
-            margin: 0;
-            padding: 0;
-            background: #ffffff !important;
-            color: #0f172a !important;
-            -webkit-print-color-adjust: exact !important;
-            print-color-adjust: exact !important;
-          }
-          img { max-width: 100%; }
-          .no-print { display: none !important; }
-        </style>
-      </head>
-      <body>
-        <div style="padding: 10px;">
-          ${printArea.innerHTML}
-        </div>
-        <script>
-          window.onload = function() {
-            setTimeout(function() {
-              window.print();
-              setTimeout(function() { window.close(); }, 500);
-            }, 300);
-          };
-        </script>
-      </body>
-    </html>
-  `);
-  printWindow.document.close();
+  const orientationSelect = document.getElementById('reportCardOrientationSelect');
+  const orientation = orientationSelect?.value || window.reportCardPrintOrientation || 'portrait';
+  const isLetterhead = window._reportCardMode === 'letterhead' || printArea.classList.contains('letterhead-active');
+  window.reportCardPrintOrientation = orientation;
+  document.getElementById('reportCardDirectPrintArea')?.remove();
+  const printClone = printArea.cloneNode(true);
+  printClone.id = 'reportCardDirectPrintArea';
+  printClone.classList.toggle('letterhead-active', isLetterhead);
+  document.body.appendChild(printClone);
+  return printSectionInCurrentWindow(printClone, {
+    bodyClass: 'report-card-direct-print',
+    styleId: 'reportCardDirectPrintStyles',
+    styleText: getReportCardPrintWindowCss(orientation, isLetterhead),
+    removeSectionAfterPrint: true,
+    printImmediately: true
+  });
 }
 
 function handleReportCardPrintClick(admissionNo) {
@@ -6953,15 +9840,22 @@ function handleReportCardPrintClick(admissionNo) {
    ============================================================================ */
 function openUploadSignaturesModal() {
   const sigs = SchoolData.signatures || {};
+  const school = getSchoolProfile();
+  if (!window._officialSignatureEditBaseline) {
+    window._officialSignatureEditBaseline = {
+      signatures: JSON.parse(JSON.stringify(sigs)),
+      principalSignatureDataUrl: String(getSchoolProfile().principalSignatureDataUrl || '')
+    };
+  }
   const modalHtml = `
     <div class="modal-overlay active" id="uploadSigModal" style="z-index:100000;">
       <div class="modal-box" style="max-width:550px; background:#1e293b; color:#ffffff; padding:24px; border-radius:16px; border:2px solid #6366f1; box-shadow:0 25px 50px -12px rgba(0, 0, 0, 0.7); position:relative;">
-        <button onclick="document.getElementById('uploadSigModal').remove()" style="position:absolute; top:16px; right:20px; background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; font-size:1.1rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">X</button>
+        <button onclick="cancelOfficialSignatureEdits()" style="position:absolute; top:16px; right:20px; background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; font-size:1.1rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">X</button>
         
-        <h3 style="margin:0 0 6px 0; color:#38bdf8; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+        <h3 style="margin:0 0 6px 0; color:#0284c7; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
           <i class="fa-solid fa-file-signature"></i> Upload Official Signatures & Seal
         </h3>
-        <p style="margin:0 0 20px 0; font-size:0.85rem; color:#cbd5e1;">Uploaded signatures & stamp will automatically appear on all printed report cards and PDFs.</p>
+        <p style="margin:0 0 20px 0; font-size:0.85rem; color:#374151;">Uploaded signatures & stamp will automatically appear on all printed report cards and PDFs.</p>
 
         <!-- TEACHER SIGNATURE UPLOAD -->
         <div style="background:#0f172a; border:1px solid #334155; border-radius:10px; padding:14px; margin-bottom:14px;">
@@ -6972,7 +9866,10 @@ function openUploadSignaturesModal() {
             <div id="prev_teacherSig" style="width:120px; height:45px; border:1px dashed #6366f1; border-radius:6px; display:flex; align-items:center; justify-content:center; background:#1e293b; overflow:hidden;">
               ${sigs.teacherSig ? `<img src="${sigs.teacherSig}" style="max-width:100%; max-height:100%; object-fit:contain;">` : `<span style="font-size:0.75rem; color:#94a3b8;">No Image</span>`}
             </div>
-            <input type="file" accept="image/*" style="font-size:0.82rem; color:#cbd5e1;" onchange="uploadSignatureImage('teacherSig', this)">
+            <div style="display:flex; flex-direction:column; gap:6px;">
+              <input type="file" accept="image/*" style="font-size:0.82rem; color:#374151;" onchange="uploadSignatureImage('teacherSig', this)">
+              ${sigs.teacherSig ? `<button onclick="clearUploadedSignature('teacherSig')" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem; color:#ef4444; border-color:#ef4444; background:none; cursor:pointer; width:fit-content;">❌ Clear</button>` : ''}
+            </div>
           </div>
         </div>
 
@@ -6983,22 +9880,28 @@ function openUploadSignaturesModal() {
           </label>
           <div style="display:flex; align-items:center; gap:14px;">
             <div id="prev_principalSig" style="width:120px; height:45px; border:1px dashed #10b981; border-radius:6px; display:flex; align-items:center; justify-content:center; background:#1e293b; overflow:hidden;">
-              ${sigs.principalSig ? `<img src="${sigs.principalSig}" style="max-width:100%; max-height:100%; object-fit:contain;">` : `<span style="font-size:0.75rem; color:#94a3b8;">No Image</span>`}
+              ${(sigs.principalSig || school.principalSignatureDataUrl) ? `<img src="${sigs.principalSig || school.principalSignatureDataUrl}" style="max-width:100%; max-height:100%; object-fit:contain;">` : `<span style="font-size:0.75rem; color:#94a3b8;">No Image</span>`}
             </div>
-            <input type="file" accept="image/*" style="font-size:0.82rem; color:#cbd5e1;" onchange="uploadSignatureImage('principalSig', this)">
+            <div style="display:flex; flex-direction:column; gap:6px;">
+              <input type="file" accept="image/*" style="font-size:0.82rem; color:#374151;" onchange="uploadSignatureImage('principalSig', this)">
+              ${(sigs.principalSig || school.principalSignatureDataUrl) ? `<button onclick="clearUploadedSignature('principalSig')" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem; color:#ef4444; border-color:#ef4444; background:none; cursor:pointer; width:fit-content;">❌ Clear</button>` : ''}
+            </div>
           </div>
         </div>
 
         <!-- EXAM CONTROLLER SIGNATURE UPLOAD -->
         <div style="background:#0f172a; border:1px solid #334155; border-radius:10px; padding:14px; margin-bottom:14px;">
           <label style="font-weight:700; color:#cbd5e1; font-size:0.9rem; display:block; margin-bottom:8px;">
-            <i class="fa-solid fa-clipboard-check" style="color:#38bdf8;"></i> Exam Controller Signature (Image):
+            <i class="fa-solid fa-clipboard-check" style="color:#0284c7;"></i> Exam Controller Signature (Image):
           </label>
           <div style="display:flex; align-items:center; gap:14px;">
             <div id="prev_examControllerSig" style="width:120px; height:45px; border:1px dashed #38bdf8; border-radius:6px; display:flex; align-items:center; justify-content:center; background:#1e293b; overflow:hidden;">
               ${sigs.examControllerSig ? `<img src="${sigs.examControllerSig}" style="max-width:100%; max-height:100%; object-fit:contain;">` : `<span style="font-size:0.75rem; color:#94a3b8;">No Image</span>`}
             </div>
-            <input type="file" accept="image/*" style="font-size:0.82rem; color:#cbd5e1;" onchange="uploadSignatureImage('examControllerSig', this)">
+            <div style="display:flex; flex-direction:column; gap:6px;">
+              <input type="file" accept="image/*" style="font-size:0.82rem; color:#374151;" onchange="uploadSignatureImage('examControllerSig', this)">
+              ${sigs.examControllerSig ? `<button onclick="clearUploadedSignature('examControllerSig')" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem; color:#ef4444; border-color:#ef4444; background:none; cursor:pointer; width:fit-content;">❌ Clear</button>` : ''}
+            </div>
           </div>
         </div>
 
@@ -7011,7 +9914,10 @@ function openUploadSignaturesModal() {
             <div id="prev_schoolStamp" style="width:65px; height:65px; border:1px dashed #f59e0b; border-radius:50%; display:flex; align-items:center; justify-content:center; background:#1e293b; overflow:hidden;">
               ${sigs.schoolStamp ? `<img src="${sigs.schoolStamp}" style="max-width:100%; max-height:100%; object-fit:contain;">` : `<span style="font-size:0.75rem; color:#94a3b8;">No Seal</span>`}
             </div>
-            <input type="file" accept="image/*" style="font-size:0.82rem; color:#cbd5e1;" onchange="uploadSignatureImage('schoolStamp', this)">
+            <div style="display:flex; flex-direction:column; gap:6px;">
+              <input type="file" accept="image/*" style="font-size:0.82rem; color:#374151;" onchange="uploadSignatureImage('schoolStamp', this)">
+              ${sigs.schoolStamp ? `<button onclick="clearUploadedSignature('schoolStamp')" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem; color:#ef4444; border-color:#ef4444; background:none; cursor:pointer; width:fit-content;">❌ Clear</button>` : ''}
+            </div>
           </div>
         </div>
 
@@ -7026,28 +9932,59 @@ function openUploadSignaturesModal() {
   document.body.insertAdjacentHTML('beforeend', modalHtml);
 }
 
-function uploadSignatureImage(key, inputEl) {
+function cancelOfficialSignatureEdits() {
+  const baseline = window._officialSignatureEditBaseline;
+  if (baseline) {
+    SchoolData.signatures = baseline.signatures || {};
+    SchoolData.schoolProfile = { ...getSchoolProfile(), principalSignatureDataUrl: baseline.principalSignatureDataUrl || '' };
+    try { localStorage.setItem('school_signatures', JSON.stringify(SchoolData.signatures)); } catch (e) {}
+  }
+  delete window._officialSignatureEditBaseline;
+  document.getElementById('uploadSigModal')?.remove();
+}
+
+async function uploadSignatureImage(key, inputEl) {
   if (!inputEl.files || !inputEl.files[0]) return;
   const file = inputEl.files[0];
-  const reader = new FileReader();
-  reader.onload = function(e) {
-    const base64Img = e.target.result;
+  try {
+    const base64Img = await compressImageToDataUrl(file, 250, 100);
     if (!SchoolData.signatures) SchoolData.signatures = {};
     SchoolData.signatures[key] = base64Img;
-    localStorage.setItem('school_signatures', JSON.stringify(SchoolData.signatures));
 
     const prevBox = document.getElementById(`prev_${key}`);
     if (prevBox) {
       prevBox.innerHTML = `<img src="${base64Img}" style="max-width:100%; max-height:100%; object-fit:contain;">`;
     }
-    showNotification(`Done: Uploaded ${key} image successfully!`, 'success');
-  };
-  reader.readAsDataURL(file);
+    showNotification(`Image prepared for ${key}. Press Save & Apply to save it to cloud.`, 'info');
+  } catch (err) {
+    showNotification(`Image upload failed: ${err.message}`, 'error');
+  }
 }
 
-function saveAndApplySignatures() {
+async function saveAndApplySignatures() {
+  const sigs = { ...(SchoolData.signatures || {}) };
+  const profile = { ...getSchoolProfile() };
+  if (sigs.principalSig) profile.principalSignatureDataUrl = sigs.principalSig;
+  try {
+    await persistConfigurationDelta('schoolAssets', 'school', {
+      profileAssets: {
+        logoDataUrl: profile.logoDataUrl || '',
+        paymentQrDataUrl: profile.paymentQrDataUrl || '',
+        principalSignatureDataUrl: profile.principalSignatureDataUrl || ''
+      },
+      signatures: sigs
+    }, 'Signatures and official stamp saved.');
+  } catch (error) {
+    cancelOfficialSignatureEdits();
+    showNotification(`Signatures were not saved: ${error?.message || 'cloud rejected the change.'}`, 'error');
+    return;
+  }
+  SchoolData.signatures = sigs;
+  SchoolData.schoolProfile = profile;
+  try { localStorage.setItem('school_signatures', JSON.stringify(sigs)); } catch (e) {}
+  saveSchoolDataToStorage({ skipCloudPush: true });
+  delete window._officialSignatureEditBaseline;
   document.getElementById('uploadSigModal')?.remove();
-  showNotification(`Saved: Signatures & Official Stamp saved!`, 'success');
   const modal = document.getElementById('reportPreviewModal');
   if (modal) {
     const admNoEl = modal.querySelector('code');
@@ -7057,261 +9994,55 @@ function saveAndApplySignatures() {
       handleReportCardPrintClick(admNo);
     }
   }
-
-  saveSchoolDataToStorage();
 }
 
 /* ============================================================================
    1-SHEET PRINTABLE COMBINED CONSOLIDATED REPORT CARD MODAL
    ============================================================================ */
 function viewCombinedConsolidatedReportCard(admissionNo) {
-  const student = SchoolData.students.find(s => s.admissionNo === admissionNo);
-  if (!student) return;
-
-  const currentSession = SchoolData.activeSession;
-  const cls = student.currentClass || student.class || 'Class 5';
-  const sec = student.currentSection || student.section || 'A';
-  const roll = student.currentRollNo || student.rollNo || '1';
-  const sigs = SchoolData.signatures || {};
-  const school = getSchoolProfile();
-
-  const subjects = [
-    { name: "English Language & Literature", ut1: 15, ut2: 15, hy: 70, ut3: 15, ut4: 14, fin: 68 },
-    { name: "Mathematics & Reasoning", ut1: 15, ut2: 14, hy: 68, ut3: 15, ut4: 15, fin: 69 },
-    { name: "Science & Environmental Studies", ut1: 14, ut2: 15, hy: 65, ut3: 14, ut4: 14, fin: 66 },
-    { name: "Hindi & Recitation", ut1: 15, ut2: 14, hy: 67, ut3: 15, ut4: 15, fin: 67 },
-    { name: "Social Studies & History", ut1: 14, ut2: 13, hy: 64, ut3: 14, ut4: 14, fin: 65 },
-    { name: "Computer Science & Coding", ut1: 15, ut2: 15, hy: 69, ut3: 15, ut4: 15, fin: 70 }
-  ];
-
-  const modalHtml = `
-    <div class="modal-overlay active" id="reportPreviewModal" style="z-index:99999;">
-      <div class="modal-box" style="max-width:880px; max-height:95vh; overflow-y:auto; background:#ffffff; color:#0f172a; padding:0; border-radius:12px; box-shadow:0 25px 50px -12px rgba(0, 0, 0, 0.5); position:relative;">
-        
-        <!-- PROMINENT TOP-RIGHT CLOSE BUTTON -->
-        <button class="no-print" onclick="document.getElementById('reportPreviewModal').remove()" style="position:absolute; top:16px; right:20px; background:#e2e8f0; color:#0f172a; border:none; width:36px; height:36px; border-radius:50%; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center; font-weight:bold; z-index:1000;" title="Close Preview">
-          <i class="fa-solid fa-xmark"></i>
-        </button>
-
-        <style>
-          @media print {
-            @page {
-              size: A4 portrait;
-              margin: 5mm 6mm;
-            }
-            html, body {
-              background: #ffffff !important;
-              color: #000000 !important;
-              margin: 0 !important;
-              padding: 0 !important;
-            }
-            body * { visibility: hidden !important; }
-            #printableSingleSheetArea, #printableSingleSheetArea * { visibility: visible !important; }
-            #printableSingleSheetArea {
-              position: absolute !important;
-              left: 0 !important;
-              top: 0 !important;
-              width: 100% !important;
-              padding: 0 !important;
-              margin: 0 !important;
-              page-break-inside: avoid !important;
-            }
-            .no-print { display: none !important; }
-            .modal-overlay { position: static !important; background: none !important; padding: 0 !important; }
-            .modal-box { max-width: 100% !important; max-height: none !important; overflow: visible !important; box-shadow: none !important; border: none !important; padding: 0 !important; margin: 0 !important; }
-          }
-        </style>
-
-        <div id="printableSingleSheetArea" style="padding:20px 24px; font-family:'Inter', sans-serif;">
-          <!-- 1-PAGE COMBINED HEADER WITH EMBLEM -->
-          <div style="display:flex; align-items:center; justify-content:space-between; border-bottom:3px double #0f172a; padding-bottom:10px; margin-bottom:12px;">
-            <div style="display:flex; align-items:center; gap:14px;">
-              ${getSchoolLogoHtml(60)}
-              <div>
-                <h2 style="font-family:'Playfair Display', serif; font-size:1.3rem; margin:0; color:#0f172a; text-transform:uppercase;">${school.name}</h2>
-                <p style="margin:2px 0 0 0; font-size:0.75rem; color:#475569; font-weight:600;">${school.address} - Session ${currentSession}</p>
-                <div style="margin-top:3px; font-size:0.72rem; color:#059669; font-weight:700;">OFFICIAL CONSOLIDATED 1-SHEET COMBINED REPORT CARD</div>
-              </div>
-            </div>
-            <div style="text-align:right; margin-right:45px;">
-              <img src="https://api.qrserver.com/v1/create-qr-code/?size=50x50&data=COMBINED-${student.admissionNo}" style="width:50px; height:50px; border-radius:4px; border:1px solid #cbd5e1;">
-            </div>
-          </div>
-
-          <!-- STUDENT BIO COMPACT BANNER -->
-          <div style="background:#f8fafc; border:1px solid #cbd5e1; border-radius:8px; padding:8px 14px; margin-bottom:12px; display:flex; justify-content:space-between; font-size:0.78rem; flex-wrap:wrap; gap:8px;">
-            <div><strong>Student Name:</strong> <span style="color:#4f46e5; font-weight:700;">${student.name}</span></div>
-            <div><strong>Admission No:</strong> <code>${student.admissionNo}</code></div>
-            <div><strong>Class:</strong> ${cls} - ${sec} (Roll: ${roll})</div>
-            <div><strong>Father:</strong> ${student.parentName} | <strong>Mother:</strong> ${student.motherName || 'N/A'} | <strong>DOB:</strong> <span style="color:#0284c7; font-weight:700;">${formatDobToDDMMYYYY(student.dob)}</span></div>
-          </div>
-
-          <!-- SIDE-BY-SIDE DUAL TERM COMBINED MARKS TABLE -->
-          <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.74rem; margin-bottom:12px; border:1px solid #0f172a;">
-            <thead>
-              <tr style="background:#0f172a; color:#ffffff;">
-                <th rowspan="2" style="padding:5px; text-align:left;">Subject Name</th>
-                <th colspan="4" style="padding:3px; background:#1e293b;">TERM 1 (HALF YEARLY)</th>
-                <th colspan="4" style="padding:3px; background:#065f46;">TERM 2 (ANNUAL FINAL)</th>
-                <th rowspan="2" style="padding:5px;">Grand Total (200)</th>
-                <th rowspan="2" style="padding:5px;">Result</th>
-              </tr>
-              <tr style="color:#ffffff;">
-                <th style="padding:3px; background:#334155;">UT1 (15)</th>
-                <th style="padding:3px; background:#334155;">UT2 (15)</th>
-                <th style="padding:3px; background:#334155;">HY (70)</th>
-                <th style="padding:3px; background:#475569;">Term 1 (100)</th>
-
-                <th style="padding:3px; background:#047857;">UT3 (15)</th>
-                <th style="padding:3px; background:#047857;">UT4 (15)</th>
-                <th style="padding:3px; background:#047857;">Annual (70)</th>
-                <th style="padding:3px; background:#065f46;">Term 2 (100)</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${subjects.map((s, idx) => {
-                const t1 = s.ut1 + s.ut2 + s.hy;
-                const t2 = s.ut3 + s.ut4 + s.fin;
-                const grand = t1 + t2;
-                const bg = idx % 2 === 0 ? '#ffffff' : '#f8fafc';
-
-                return `
-                  <tr style="background:${bg}; border-bottom:1px solid #cbd5e1;">
-                    <td style="padding:5px 8px; text-align:left; font-weight:600;">${s.name}</td>
-                    <td style="padding:5px;">${s.ut1}</td>
-                    <td style="padding:5px;">${s.ut2}</td>
-                    <td style="padding:5px;">${s.hy}</td>
-                    <td style="padding:5px; font-weight:700; color:#4f46e5; background:#f4f8ff;">${t1}</td>
-
-                    <td style="padding:5px;">${s.ut3}</td>
-                    <td style="padding:5px;">${s.ut4}</td>
-                    <td style="padding:5px;">${s.fin}</td>
-                    <td style="padding:5px; font-weight:700; color:#059669; background:#ecfdf5;">${t2}</td>
-
-                    <td style="padding:5px; font-weight:800;">${grand}</td>
-                    <td style="padding:5px;"><span style="color:#059669; font-weight:700;">PASSED</span></td>
-                  </tr>
-                `;
-              }).join('')}
-            </tbody>
-          </table>
-
-          <!-- COMPACT COMBINED PERFORMANCE SUMMARY -->
-          ${(() => {
-            let totalObtained = 0;
-            subjects.forEach(s => { totalObtained += (s.ut1 + s.ut2 + s.hy + s.ut3 + s.ut4 + s.fin); });
-            const maxPossible = subjects.length * 200;
-            const overallPerc = ((totalObtained / maxPossible) * 100).toFixed(1);
-            return `
-              <div style="background:#f0fdf4; border:1.5px solid #86efac; border-radius:6px; padding:8px 14px; display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; font-size:0.78rem;">
-                <div>
-                  <strong>Academic Promotion Status:</strong> <span style="color:#15803d; font-weight:800;">PROMOTED TO NEXT CLASS</span>
-                </div>
-                <div>
-                  <strong>Grand Total:</strong> <span style="color:#14532d; font-weight:800;">${totalObtained} / ${maxPossible}</span> | <strong>Overall %:</strong> <span style="color:#16a34a; font-weight:800;">${overallPerc}%</span> | <strong>Class Rank:</strong> 1st Position
-                </div>
-              </div>
-            `;
-          })()}
-
-          <!-- DYNAMIC SIGNATURE FOOTER -->
-          <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-top:16px; border-top:1px solid #cbd5e1; padding-top:8px; font-size:0.72rem;">
-            <!-- TEACHER SIG -->
-            <div style="text-align:center;">
-              <div style="height:38px; display:flex; align-items:flex-end; justify-content:center;">
-                ${sigs.teacherSig ? `
-                  <img src="${sigs.teacherSig}" style="max-height:38px; max-width:110px; object-fit:contain;">
-                ` : `
-                  <span style="font-family:'Caveat', cursive; font-size:1.15rem; color:#4f46e5; font-weight:bold;">${sigs.teacherName || 'Varsha Chauhan'}</span>
-                `}
-              </div>
-              <div style="border-top:1px solid #94a3b8; padding-top:2px; font-weight:600; color:#475569;">Class Teacher Signature</div>
-            </div>
-
-            <!-- EXAM CONTROLLER SIGNATURE / SCHOOL STAMP FALLBACK -->
-            <div style="text-align:center;">
-              <div style="height:50px; display:flex; align-items:center; justify-content:center;">
-                ${(sigs.examControllerSig || sigs.schoolStamp) ? `
-                  <img src="${sigs.examControllerSig || sigs.schoolStamp}" style="max-height:50px; max-width:90px; object-fit:contain;">
-                ` : `
-                  <div style="width:50px; height:50px; border-radius:50%; border:2px dashed #f59e0b; display:flex; align-items:center; justify-content:center; color:#d97706; font-size:0.55rem; font-weight:bold; text-align:center; background:rgba(245,158,11,0.05);">
-                    MMM SCHOOL<br>SEAL
-                  </div>
-                `}
-              </div>
-              <div style="border-top:1px solid #94a3b8; padding-top:2px; font-weight:600; color:#475569;">Exam Controller Signature</div>
-            </div>
-
-            <!-- PRINCIPAL SIG -->
-            <div style="text-align:center;">
-              <div style="height:38px; display:flex; align-items:flex-end; justify-content:center;">
-                ${sigs.principalSig ? `
-                  <img src="${sigs.principalSig}" style="max-height:38px; max-width:110px; object-fit:contain;">
-                ` : `
-                  <span style="font-family:'Caveat', cursive; font-size:1.15rem; color:#059669; font-weight:bold;">${sigs.principalName || 'Principal Office'}</span>
-                `}
-              </div>
-              <div style="border-top:1px solid #94a3b8; padding-top:2px; font-weight:600; color:#475569;">Principal Signature & Stamp</div>
-            </div>
-          </div>
-        </div>
-
-        <!-- ACTION FOOTER BAR -->
-        <div style="display:flex; justify-content:space-between; align-items:center; padding:14px 24px; background:#f8fafc; border-top:1px solid #e2e8f0;" class="no-print">
-          <div style="display:flex; gap:10px;">
-            <button class="btn btn-secondary" onclick="document.getElementById('reportPreviewModal').remove()" style="padding:10px 18px; font-weight:800; background:#475569; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-xmark"></i> Close Preview</button>
-            <button class="btn btn-secondary" onclick="openUploadSignaturesModal()" style="padding:10px 18px; font-weight:800; background:#0284c7; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-signature"></i> Upload Signatures / Stamp</button>
-          </div>
-          <button class="btn btn-primary" onclick="printReportCard('printableSingleSheetArea')" style="padding:10px 24px; font-weight:800; background:linear-gradient(135deg, #6366f1 0%, #4f46e5 100%); color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-print"></i> Print 1-Page A4 Report Card</button>
-        </div>
-
-      </div>
-    </div>
-  `;
-  document.body.insertAdjacentHTML('beforeend', modalHtml);
+  viewFinalAnnualReportCard(admissionNo); // Consolidated matches Final Annual exactly
 }
 
-/* ============================================================================
-   ULTRA-MODERN INDIVIDUAL REPORT CARDS (HALF YEARLY & FINAL ANNUAL)
-   ============================================================================ */
 function viewHalfYearlyReportCard(admissionNo) {
   const student = SchoolData.students.find(s => s.admissionNo === admissionNo);
   if (!student) return;
 
   const cls = student.currentClass || student.class || 'Class 5';
   const sec = student.currentSection || student.section || 'A';
-  const roll = student.currentRollNo || student.rollNo || '1';
+  const roll = student.currentRollNo || student.rollNo || '01';
   const sigs = SchoolData.signatures || {};
   const school = getSchoolProfile();
-  const classTeacherName = getClassTeacherForStudent(student) || sigs.teacherName || 'Class Teacher';
+  const currentSession = SchoolData.activeSession || '2026-27';
+  const classTeacherName = getClassTeacherForStudent(student) || sigs.teacherName || 'Varsha Chauhan';
   const classTeacherSignature = getTeacherSignatureByName(classTeacherName) || sigs.teacherSig || '';
   const principalSignature = school.principalSignatureDataUrl || sigs.principalSig || '';
-  const isPrimary = (cls.includes('Nursery') || cls.includes('LKG') || cls.includes('UKG') || cls.includes('Class 1') || cls.includes('Class 2') || cls.includes('Class 3') || cls.includes('Class 4') || cls.includes('Class 5'));
-  
-  const utMax = isPrimary ? 15 : 10;
-  const hyMax = isPrimary ? 70 : 80;
-  const currentSession = SchoolData.activeSession;
+  const attendanceSummary = getStudentAttendanceSummaryForReport(student, currentSession);
+  const attendanceText = String(student.customAttendance || formatReportCardAttendanceCompact(attendanceSummary)).trim();
+  const teacherRemarks = String(student.reportCardRemarks || '').trim();
 
   const configuredSubs = getSubjectsForClassAndExam(cls, 'half_yearly');
+
   const subjects = configuredSubs.map(s => {
     const code = (s.code || s.name).toLowerCase();
     const studentMarks = (student.examMarks && student.examMarks[code]) ? student.examMarks[code] : {};
     return {
       name: s.name,
       code: s.code,
-      maxMarks: s.maxMarks || 100,
-      ut1: studentMarks.ut1 !== undefined ? parseFloat(studentMarks.ut1) || 0 : 0,
-      ut2: studentMarks.ut2 !== undefined ? parseFloat(studentMarks.ut2) || 0 : 0,
-      hy: studentMarks.hy !== undefined ? parseFloat(studentMarks.hy) || 0 : 0,
-      ut1Max: getSubjectExamComponentMax(cls, s.code || s.name, 'ut1'),
-      ut2Max: getSubjectExamComponentMax(cls, s.code || s.name, 'ut2'),
-      hyMax: getSubjectExamComponentMax(cls, s.code || s.name, 'hy'),
-      ut1Weight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'ut1'),
-      ut2Weight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'ut2'),
-      hyWeight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'hy')
+      ut1: parseScore(studentMarks.ut1),
+      ut2: parseScore(studentMarks.ut2),
+      hy: parseScore(studentMarks.hy),
+      ut1Display: formatReportCardMark(studentMarks.ut1),
+      ut2Display: formatReportCardMark(studentMarks.ut2),
+      hyDisplay: formatReportCardMark(studentMarks.hy),
+      ut1Max: getSubjectExamComponentMax(cls, s.code || s.name, 'ut1') || 25,
+      ut2Max: getSubjectExamComponentMax(cls, s.code || s.name, 'ut2') || 25,
+      hyMax: getSubjectExamComponentMax(cls, s.code || s.name, 'hy') || 100,
+      ut1Weight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'ut1') || 20,
+      ut2Weight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'ut2') || 20,
+      hyWeight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'hy') || 60
     };
   });
-  
+
   const rankMap = calculateClassRanks(cls, 'half_yearly');
   const studentRank = rankMap[student.admissionNo] || 1;
   const subjectSummaries = subjects.map(s => {
@@ -7321,188 +10052,160 @@ function viewHalfYearlyReportCard(admissionNo) {
     const total = Math.round(scaledUt1 + scaledUt2 + scaledHy);
     return { ...s, total };
   });
+
   const grandTotal = subjectSummaries.reduce((sum, s) => sum + s.total, 0);
   const maxPossible = subjectSummaries.length * 100;
   const percentage = maxPossible ? ((grandTotal / maxPossible) * 100).toFixed(1) : '0.0';
 
+  const getGradeFromScore = (score) => {
+    if (score >= 90) return 'A+';
+    if (score >= 80) return 'A';
+    if (score >= 70) return 'B+';
+    if (score >= 60) return 'B';
+    if (score >= 50) return 'C+';
+    if (score >= 40) return 'C';
+    return 'D';
+  };
+
+  const formattedDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+  window.reportCardPrintOrientation = 'portrait';
+  window._reportCardMode = 'colour';
+
   const modalHtml = `
     <div class="modal-overlay active" id="reportPreviewModal" style="z-index:99999;">
-      <div class="modal-box" style="max-width:880px; max-height:92vh; overflow-y:auto; background:#ffffff; color:#0f172a; padding:0; border-radius:16px; box-shadow:0 25px 50px -12px rgba(0, 0, 0, 0.5); position:relative;">
-        
+      <div class="modal-box" style="max-width:840px; max-height:94vh; overflow-y:auto; background:#f1f5f9; padding:20px; border-radius:16px; box-shadow:0 25px 50px -12px rgba(0,0,0,0.5); position:relative;">
+        <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@600;700&family=Inter:wght@400;500;600;700;800&family=Montserrat:wght@800;900&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet">
+
         <style>
-          @media print {
-            @page {
-              size: A4 portrait;
-              margin: 5mm 6mm;
-            }
-            html, body {
-              background: #ffffff !important;
-              color: #000000 !important;
-              margin: 0 !important;
-              padding: 0 !important;
-            }
-            body * { visibility: hidden !important; }
-            #printableSingleSheetArea, #printableSingleSheetArea * { visibility: visible !important; }
-            #printableSingleSheetArea {
-              position: absolute !important;
-              left: 0 !important;
-              top: 0 !important;
-              width: 100% !important;
-              padding: 0 !important;
-              margin: 0 !important;
-              page-break-inside: avoid !important;
-            }
-            .no-print { display: none !important; }
-            .modal-overlay { position: static !important; background: none !important; padding: 0 !important; }
-            .modal-box { max-width: 100% !important; max-height: none !important; overflow: visible !important; box-shadow: none !important; border: none !important; padding: 0 !important; margin: 0 !important; }
-          }
+          .letterhead-active .rc-vector-border { display: none !important; }
+          .letterhead-active .rc-watermark-logo { display: none !important; }
+          .letterhead-active .rc-school-logo,
+          .letterhead-active .rc-school-name { visibility: hidden !important; }
         </style>
 
-        <!-- LUXURY GRADIENT HEADER WITH OFFICIAL LOGO EMBLEM -->
-        <div style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #1e1b4b 100%); color:#ffffff; padding:20px 24px; border-top-left-radius:16px; border-top-right-radius:16px; display:flex; align-items:center; justify-content:space-between; position:relative; border-bottom:4px solid #f59e0b;">
-          <div style="display:flex; align-items:center; gap:16px;">
-            ${getSchoolLogoHtml(65)}
-            <div>
-              <h1 style="font-family:'Playfair Display', serif; font-size:1.4rem; letter-spacing:1px; margin:0; color:#ffffff;">${school.name.toUpperCase()}</h1>
-              <p style="margin:2px 0 0 0; font-size:0.8rem; color:#cbd5e1; font-weight:500;">${school.address}</p>
-              <div style="margin-top:4px; display:inline-block; padding:2px 10px; background:rgba(245, 158, 11, 0.2); border:1px solid #f59e0b; border-radius:20px; font-size:0.72rem; color:#fbbf24; font-weight:700;">
-                HALF-YEARLY EXAMINATION REPORT CARD (TERM 1) - SESSION ${currentSession}
-              </div>
-            </div>
-          </div>
-          <button class="close-modal-btn no-print" onclick="document.getElementById('reportPreviewModal').remove()" style="color:#ffffff; font-size:1.6rem; opacity:0.8; cursor:pointer;" title="Close Preview"><i class="fa-solid fa-xmark"></i></button>
-        </div>
+        <button class="close-modal-btn no-print" onclick="document.getElementById('reportPreviewModal').remove()" style="position:absolute; top:28px; right:32px; background:#e2e8f0; color:#334155; border:none; width:36px; height:36px; border-radius:50%; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center; z-index:10;">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
 
-        <div id="printableSingleSheetArea" style="padding:20px 24px;">
-          <!-- STUDENT GRAPHIC INFO CARD -->
-          <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:12px 18px; margin-bottom:16px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
-            <div style="display:flex; align-items:center; gap:14px;">
-              <img src="${student.photo}" style="width:55px; height:55px; border-radius:50%; border:2.5px solid #6366f1; object-fit:cover;">
-              <div>
-                <h3 style="font-size:1.15rem; margin:0 0 2px 0; color:#0f172a; font-weight:700;">${student.name}</h3>
-                <div style="display:flex; gap:8px; font-size:0.78rem; color:#475569;">
-                  <span><strong>Adm No:</strong> <code style="color:#4f46e5; font-weight:700;">${student.admissionNo}</code></span> |
-                  <span><strong>Class:</strong> <strong style="color:#6366f1;">${cls} - ${sec}</strong></span> |
-                  <span><strong>Roll No:</strong> ${roll}</span>
+        <div id="printableSingleSheetArea" style="width:720px; height:1018px; padding:0; font-family:'Inter', sans-serif; font-size:0.88rem; background:#ffffff; color:#0f172a; border-radius:4px; position:relative; margin:10px auto; page-break-inside:avoid; box-shadow:0 8px 32px rgba(0,0,0,0.15); overflow:hidden;">
+          
+          <!-- VECTOR DECORATIVE CERTIFICATE BORDER -->
+          <div class="rc-vector-border" style="position:absolute; top:12px; left:12px; right:12px; bottom:12px; border:3pt solid #0f766e; border-radius:8px; pointer-events:none; z-index:1;">
+            <div style="position:absolute; top:5px; left:5px; right:5px; bottom:5px; border:4pt solid #ca8a04; border-radius:6px;"></div>
+          </div>
+
+          <!-- WATERMARK LOGO -->
+          <div class="rc-watermark-logo" style="position:absolute; top:53%; left:50%; transform:translate(-50%, -50%); width:320px; height:320px; opacity:0.08; pointer-events:none; z-index:1; display:flex; align-items:center; justify-content:center;">
+            ${getReportCardLogoHtml(320)}
+          </div>
+
+          <!-- PADDED INNER CONTENT CONTAINER -->
+          <div class="rc-content-wrapper" style="position:relative; z-index:2; width:100%; height:100%; padding:24px 36px; display:flex; flex-direction:column; justify-content:space-between; box-sizing:border-box;">
+            <div>
+              <!-- SCHOOL HEADER -->
+              <div class="report-card-print-header" style="text-align:center; padding-bottom:6px; margin-bottom:10px; border-bottom:1.5px solid #0f766e;">
+                <div class="rc-school-logo" style="margin-bottom:4px; transform:translateY(4px);">
+                  ${getReportCardLogoHtml(82)}
+                </div>
+                <h1 class="rc-school-name" style="font-family:'Montserrat', sans-serif; font-weight:900; font-size:1.35rem; margin:0; color:#0f766e; letter-spacing:0.8px; line-height:1.2; text-transform:uppercase;">MADAN MOHAN MALVIYA<br>JUNIOR HIGH SCHOOL</h1>
+                <h2 style="font-family:'Outfit', sans-serif; font-weight:700; font-size:0.92rem; margin:3px 0 2px 0; color:#0f172a; letter-spacing:1px; text-transform:uppercase;">HALF-YEARLY ACADEMIC PROGRESS REPORT</h2>
+                <div style="font-family:'Outfit', sans-serif; font-size:0.78rem; color:#475569; font-weight:700;">
+                  SESSION: ${currentSession} &nbsp;•&nbsp; DATE: <span style="color:#0f766e; font-weight:800;">${formattedDate}</span>
                 </div>
               </div>
-            </div>
 
-            <div style="font-size:0.78rem; color:#334155; line-height:1.5;">
-              <div><strong>Father Name:</strong> ${student.parentName}</div>
-              <div><strong>Mother Name:</strong> ${student.motherName || 'N/A'}</div>
-              <div><strong>Date of Birth:</strong> <strong style="color:#0284c7;">${formatDobToDDMMYYYY(student.dob)}</strong></div>
-            </div>
-
-            <div style="display:flex; align-items:center; gap:12px;">
-              <div style="background:linear-gradient(135deg, #4f46e5 0%, #3730a3 100%); color:#ffffff; padding:6px 12px; border-radius:10px; font-weight:800; font-size:0.78rem; text-align:center; box-shadow:0 4px 6px -1px rgba(79, 70, 229, 0.3);">
-                Rank CLASS RANK<br>
-                <span style="font-size:1.15rem; color:#fef08a;">#${studentRank}</span>
+              <!-- STUDENT DETAILS CARD -->
+              <div class="rc-student-details" style="min-height:96px; box-sizing:border-box; border:1.5px solid #cbd5e1; border-radius:10px; padding:12px 14px; margin-bottom:12px; display:flex; align-items:center; gap:16px; background:#f8fafc;">
+                <div style="width:68px; height:68px; border-radius:8px; overflow:hidden; background:#1e293b; color:#ffffff; display:flex; align-items:center; justify-content:center; font-weight:800; font-size:1.4rem; flex-shrink:0;">
+                  ${student.photo || student.photoDataUrl ? `<img loading="lazy" src="${student.photo || student.photoDataUrl}" style="width:100%; height:100%; object-fit:cover;">` : (student.name ? student.name.split(' ').map(n=>n[0]).join('').substring(0,2).toUpperCase() : 'ST')}
+                </div>
+                <div style="flex-grow:1; display:grid; grid-template-columns:1.4fr 1fr; gap:3px 16px; font-size:0.88rem; color:#1e293b;">
+                  <div><strong style="color:#0f766e; font-size:1rem; text-transform:uppercase;">${escapeHtml(student.name)}</strong></div>
+                  <div><strong>Roll No:</strong> ${escapeHtml(String(roll).padStart(2, '0'))}</div>
+                  <div><strong>Class:</strong> ${escapeHtml(cls)}</div>
+                  <div><strong>Admission No:</strong> ${escapeHtml(student.admissionNo)}</div>
+                  <div><strong>Section:</strong> ${escapeHtml(sec)}</div>
+                  <div><strong>Attendance:</strong> <span class="rc-editable-field" contenteditable="true" spellcheck="false" title="Click to edit attendance; it saves to cloud when you leave the field" onblur="saveStudentCustomAttendance('${student.admissionNo}', this.innerText).catch(()=>{})" onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}" style="display:inline-block; min-width:118px; color:#0f766e; font-weight:800; border-bottom:1px dashed #0f766e; padding:0 3px; outline:none;">${escapeHtml(attendanceText)}</span></div>
+                </div>
               </div>
-              <img src="https://api.qrserver.com/v1/create-qr-code/?size=55x55&data=STUDENT-HY-${student.admissionNo}" style="width:55px; height:55px; border-radius:6px; border:1px solid #cbd5e1;">
-            </div>
-          </div>
 
-          <!-- MARKS TABLE WITH MODERN GRADE BADGES -->
-          <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.8rem; margin-bottom:16px; border-radius:8px; overflow:hidden; border:1px solid #cbd5e1;">
-            <thead>
-              <tr style="background:#1e293b; color:#ffffff;">
-                <th style="padding:8px 10px; text-align:left; font-weight:600;">Subject Name</th>
-                <th style="padding:8px; font-weight:600;">UT-1</th>
-                <th style="padding:8px; font-weight:600;">UT-2</th>
-                <th style="padding:8px; font-weight:600;">Half-Yearly Written</th>
-                <th style="padding:8px; font-weight:600; background:#334155;">Term 1 Total (100)</th>
-                <th style="padding:8px; font-weight:600;">Grade</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${subjectSummaries.map((s, idx) => {
-                const tot = s.total;
-                const grade = tot >= 90 ? 'A+' : tot >= 80 ? 'A' : 'B';
-                const bg = idx % 2 === 0 ? '#ffffff' : '#f8fafc';
-
-                return `
-                  <tr style="background:${bg}; border-bottom:1px solid #e2e8f0;">
-                    <td style="padding:7px 10px; text-align:left; font-weight:600; color:#0f172a;">${s.name}</td>
-                    <td style="padding:7px;">${s.ut1} / ${s.ut1Max}</td>
-                    <td style="padding:7px;">${s.ut2} / ${s.ut2Max}</td>
-                    <td style="padding:7px;">${s.hy} / ${s.hyMax}</td>
-                    <td style="padding:7px; font-weight:700; color:#4f46e5; background:rgba(99, 102, 241, 0.08);">${tot} / 100</td>
-                    <td style="padding:7px;"><span style="padding:2px 8px; border-radius:10px; background:#10b981; color:#ffffff; font-size:0.7rem; font-weight:700;">${grade}</span></td>
+              <!-- ACADEMIC MARKS TABLE -->
+              <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.86rem; margin-bottom:10px; border:1.5px solid #0f766e; border-radius:6px; overflow:hidden;">
+                <thead>
+                  <tr style="background:#1d4ed8; color:#ffffff; font-weight:700;">
+                    <th style="padding:6px; text-align:left; border:1px solid #60a5fa;">Subject Name</th>
+                    <th style="padding:6px; border:1px solid #60a5fa;">UT-1</th>
+                    <th style="padding:6px; border:1px solid #60a5fa;">UT-2</th>
+                    <th style="padding:6px; border:1px solid #60a5fa;">HY (100)</th>
+                    <th style="padding:6px; border:1px solid #60a5fa;">Total (100)</th>
+                    <th style="padding:6px; border:1px solid #60a5fa;">Grade</th>
                   </tr>
-                `;
-              }).join('')}
-            </tbody>
-          </table>
+                </thead>
+                <tbody>
+                  ${subjectSummaries.map((s, idx) => {
+                    const tot = s.total;
+                    const grade = getGradeFromScore(tot);
+                    const badgeColor = grade.includes('A') ? '#10b981' : grade.includes('B') ? '#3b82f6' : grade.includes('C') ? '#eab308' : '#ef4444';
+                    const bg = idx % 2 === 0 ? 'rgba(255,255,255,0.80)' : 'rgba(248,250,252,0.80)';
 
-          <!-- GRAND TOTAL SUMMARY CARD -->
-          <div style="background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%); border:1.5px solid #86efac; border-radius:10px; padding:12px 18px; display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-            <div>
-              <div style="font-size:0.78rem; color:#166534; font-weight:600; text-transform:uppercase; letter-spacing:0.5px;">Term 1 Performance Summary</div>
-              <div style="font-size:1.2rem; font-weight:800; color:#14532d; margin-top:2px;">GRAND TOTAL: ${grandTotal} / ${maxPossible} MARKS</div>
-            </div>
-            <div style="text-align:right;">
-              <span style="padding:4px 14px; background:#16a34a; color:#ffffff; border-radius:20px; font-weight:700; font-size:0.82rem;">PERCENTAGE: ${percentage}%</span>
-              <div style="margin-top:4px; font-size:0.78rem; font-weight:700; color:#15803d;">RANK: ${studentRank}</div>
-            </div>
-          </div>
-
-          <!-- DYNAMIC SIGNATURE FOOTER -->
-          <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-top:16px; border-top:1px solid #cbd5e1; padding-top:8px; font-size:0.72rem;">
-            <!-- TEACHER SIG -->
-            <div style="text-align:center;">
-              <div style="height:38px; display:flex; align-items:flex-end; justify-content:center;">
-                ${classTeacherSignature ? `
-                  <img src="${classTeacherSignature}" style="max-height:38px; max-width:110px; object-fit:contain;">
-                ` : `
-                  <span style="font-family:'Caveat', cursive; font-size:1.15rem; color:#4f46e5; font-weight:bold;">${classTeacherName}</span>
-                `}
+                    return `
+                      <tr style="background:${bg}; border-bottom:1px solid #cbd5e1;">
+                        <td style="padding:5px 8px; text-align:left; font-weight:700; color:#0f172a; border:1px solid #cbd5e1;">${escapeHtml(String(s.name || '').toUpperCase())}</td>
+                        <td style="padding:5px; font-weight:700; border:1px solid #cbd5e1;">${s.ut1Display}</td>
+                        <td style="padding:5px; font-weight:700; border:1px solid #cbd5e1;">${s.ut2Display}</td>
+                        <td style="padding:5px; font-weight:700; border:1px solid #cbd5e1;">${s.hyDisplay}</td>
+                        <td style="padding:5px; font-weight:800; color:#0f766e; border:1px solid #cbd5e1;">${tot}</td>
+                        <td style="padding:5px; border:1px solid #cbd5e1;"><span style="display:inline-flex; min-width:38px; height:22px; padding:0 9px; align-items:center; justify-content:center; border-radius:999px; background:${badgeColor}; color:#ffffff; font-size:0.75rem; font-weight:800; box-sizing:border-box;">${grade}</span></td>
+                      </tr>
+                    `;
+                  }).join('')}
+                  <!-- Summary row -->
+                  <tr style="background:#f0fdfa; font-weight:800; color:#0f766e; font-size:0.86rem; border-top:2px solid #0f766e;">
+                    <td style="padding:7px; text-align:left; border:1px solid #cbd5e1;" colspan="4">Grand Total: ${grandTotal} / ${maxPossible} (${percentage}%)</td>
+                    <td style="padding:7px; text-align:right; border:1px solid #cbd5e1;" colspan="2">Rank: ${studentRank}th / ${Object.keys(rankMap).length || 56}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <div class="rc-teacher-remarks" style="display:flex; align-items:flex-end; gap:8px; margin:8px 4px 0; color:#1e293b; font-size:1rem; font-weight:700;">
+                <strong style="white-space:nowrap; color:#065f46; font-weight:800;">Teacher's Remarks:</strong>
+                <span class="rc-editable-field" contenteditable="true" spellcheck="true" title="Click to enter teacher remarks; it saves to cloud when you leave the field" onblur="saveStudentReportCardRemarks('${student.admissionNo}', this.innerText).catch(()=>{})" onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}" style="flex:1; min-height:22px; border-bottom:1.5px solid #0f766e; padding:1px 5px; outline:none; font-weight:700;">${teacherRemarks ? escapeHtml(teacherRemarks) : '&nbsp;'}</span>
               </div>
-              <div style="border-top:1px solid #94a3b8; padding-top:2px; font-weight:600; color:#475569;">Class Teacher Signature</div>
             </div>
 
-            <!-- EXAM CONTROLLER SIGNATURE / SCHOOL STAMP FALLBACK -->
-            <div style="text-align:center;">
-              <div style="height:50px; display:flex; align-items:center; justify-content:center;">
-                ${(sigs.examControllerSig || sigs.schoolStamp) ? `
-                  <img src="${sigs.examControllerSig || sigs.schoolStamp}" style="max-height:50px; max-width:90px; object-fit:contain;">
-                ` : `
-                  <div style="width:50px; height:50px; border-radius:50%; border:2px dashed #f59e0b; display:flex; align-items:center; justify-content:center; color:#d97706; font-size:0.55rem; font-weight:bold; text-align:center; background:rgba(245,158,11,0.05);">
-                    MMM SCHOOL<br>SEAL
+            <!-- FOOTER SIGNATURES & CAMPUS -->
+            <div style="margin-top:auto;">
+              <div style="display:flex; justify-content:space-between; align-items:flex-end; padding:8px 12px 0 12px; margin-bottom:8px;">
+                <div style="text-align:center; width:220px;">
+                  <div style="height:32px; display:flex; align-items:flex-end; justify-content:center;">
+                    ${classTeacherSignature ? `<img src="${classTeacherSignature}" style="max-height:32px; max-width:140px; object-fit:contain;">` : `<span style="font-family:'Caveat', cursive; font-size:1.35rem; color:#4f46e5; font-weight:bold;">${classTeacherName}</span>`}
                   </div>
-                `}
+                  <div style="border-top:1.5px dotted #0f766e; padding-top:4px; font-weight:800; font-size:0.84rem; color:#065f46;">Class Teacher's Signature</div>
+                </div>
+
+                <div style="text-align:center; width:220px;">
+                  <div style="height:32px; display:flex; align-items:flex-end; justify-content:center;">
+                    ${principalSignature ? `<img src="${principalSignature}" style="max-height:32px; max-width:140px; object-fit:contain;">` : `<span style="font-family:'Caveat', cursive; font-size:1.4rem; color:#0f172a; font-weight:bold;">MPhauhan.</span>`}
+                  </div>
+                  <div style="border-top:1.5px dotted #0f766e; padding-top:4px; font-weight:800; font-size:0.84rem; color:#065f46;">Principal's Signature</div>
+                </div>
               </div>
-              <div style="border-top:1px solid #94a3b8; padding-top:2px; font-weight:600; color:#475569;">Exam Controller Signature</div>
+
+              <div style="text-align:center; font-size:0.75rem; color:#475569; font-weight:800; border-top:1px solid #e2e8f0; padding-top:6px; letter-spacing:1px;">
+                SECTOR 53, NOIDA
+              </div>
             </div>
 
-            <!-- PRINCIPAL SIG -->
-            <div style="text-align:center;">
-              <div style="height:38px; display:flex; align-items:flex-end; justify-content:center;">
-                ${principalSignature ? `
-                  <img src="${principalSignature}" style="max-height:38px; max-width:110px; object-fit:contain;">
-                ` : `
-                  <span style="font-family:'Caveat', cursive; font-size:1.15rem; color:#059669; font-weight:bold;">${sigs.principalName || 'Principal Office'}</span>
-                `}
-              </div>
-              <div style="border-top:1px solid #94a3b8; padding-top:2px; font-weight:600; color:#475569;">Principal Signature & Stamp</div>
-            </div>
           </div>
         </div>
 
-        <!-- ACTION FOOTER BAR -->
-        <div style="display:flex; justify-content:space-between; align-items:center; padding:14px 24px; background:#f8fafc; border-top:1px solid #e2e8f0;" class="no-print">
-          <div style="display:flex; gap:10px;">
-            <button class="btn btn-secondary" onclick="document.getElementById('reportPreviewModal').remove()" style="padding:10px 18px; font-weight:800; background:#475569; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-xmark"></i> Close Preview</button>
-            <button class="btn btn-secondary" onclick="openUploadSignaturesModal()" style="padding:10px 18px; font-weight:800; background:#0284c7; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-signature"></i> Upload Signatures / Stamp</button>
-          </div>
-          <button class="btn btn-primary" onclick="printReportCard('printableSingleSheetArea')" style="padding:10px 24px; font-weight:800; background:linear-gradient(135deg, #6366f1 0%, #4f46e5 100%); color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-print"></i> Print 1-Page A4 Report Card</button>
-        </div>
+        ${getReportCardPrintFooterHtml('Print Report Card', 'background:linear-gradient(135deg, #0f766e 0%, #065f46 100%); color:#ffffff;')}
 
       </div>
     </div>
   `;
   document.body.insertAdjacentHTML('beforeend', modalHtml);
 }
+
 
 function viewFinalAnnualReportCard(admissionNo) {
   const student = SchoolData.students.find(s => s.admissionNo === admissionNo);
@@ -7510,246 +10213,215 @@ function viewFinalAnnualReportCard(admissionNo) {
 
   const cls = student.currentClass || student.class || 'Class 5';
   const sec = student.currentSection || student.section || 'A';
-  const roll = student.currentRollNo || student.rollNo || '1';
+  const roll = student.currentRollNo || student.rollNo || '01';
   const sigs = SchoolData.signatures || {};
   const school = getSchoolProfile();
-  const classTeacherName = getClassTeacherForStudent(student) || sigs.teacherName || 'Class Teacher';
+  const currentSession = SchoolData.activeSession || '2026-27';
+  const classTeacherName = getClassTeacherForStudent(student) || sigs.teacherName || 'Varsha Chauhan';
   const classTeacherSignature = getTeacherSignatureByName(classTeacherName) || sigs.teacherSig || '';
   const principalSignature = school.principalSignatureDataUrl || sigs.principalSig || '';
-  const isPrimary = (cls.includes('Nursery') || cls.includes('LKG') || cls.includes('UKG') || cls.includes('Class 1') || cls.includes('Class 2') || cls.includes('Class 3') || cls.includes('Class 4') || cls.includes('Class 5'));
-  
-  const utMax = isPrimary ? 15 : 10;
-  const hyMax = isPrimary ? 70 : 80;
-  const currentSession = SchoolData.activeSession;
+  const attendanceSummary = getStudentAttendanceSummaryForReport(student, currentSession);
+  const attendanceText = String(student.customAttendance || formatReportCardAttendanceCompact(attendanceSummary)).trim();
+  const teacherRemarks = String(student.reportCardRemarks || '').trim();
 
   const configuredSubs = getSubjectsForClassAndExam(cls, 'final_annual');
+
   const subjects = configuredSubs.map(s => {
     const code = (s.code || s.name).toLowerCase();
     const studentMarks = (student.examMarks && student.examMarks[code]) ? student.examMarks[code] : {};
     return {
       name: s.name,
       code: s.code,
-      maxMarks: s.maxMarks || 100,
-      ut1: studentMarks.ut1 !== undefined ? parseFloat(studentMarks.ut1) || 0 : 0,
-      ut2: studentMarks.ut2 !== undefined ? parseFloat(studentMarks.ut2) || 0 : 0,
-      hy: studentMarks.hy !== undefined ? parseFloat(studentMarks.hy) || 0 : 0,
-      ut3: studentMarks.ut3 !== undefined ? parseFloat(studentMarks.ut3) || 0 : 0,
-      ut4: studentMarks.ut4 !== undefined ? parseFloat(studentMarks.ut4) || 0 : 0,
-      fin: studentMarks.fin !== undefined ? parseFloat(studentMarks.fin) || 0 : 0,
-      ut1Max: getSubjectExamComponentMax(cls, s.code || s.name, 'ut1'),
-      ut2Max: getSubjectExamComponentMax(cls, s.code || s.name, 'ut2'),
-      hyMax: getSubjectExamComponentMax(cls, s.code || s.name, 'hy'),
-      ut3Max: getSubjectExamComponentMax(cls, s.code || s.name, 'ut3'),
-      ut4Max: getSubjectExamComponentMax(cls, s.code || s.name, 'ut4'),
-      finMax: getSubjectExamComponentMax(cls, s.code || s.name, 'fin'),
-      ut1Weight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'ut1'),
-      ut2Weight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'ut2'),
-      hyWeight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'hy'),
-      ut3Weight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'ut3'),
-      ut4Weight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'ut4'),
-      finWeight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'fin')
+      ut1: parseScore(studentMarks.ut1),
+      ut2: parseScore(studentMarks.ut2),
+      hy: parseScore(studentMarks.hy),
+      ut3: parseScore(studentMarks.ut3),
+      ut4: parseScore(studentMarks.ut4),
+      fin: parseScore(studentMarks.fin),
+      ut1Display: formatReportCardMark(studentMarks.ut1),
+      ut2Display: formatReportCardMark(studentMarks.ut2),
+      hyDisplay: formatReportCardMark(studentMarks.hy),
+      ut3Display: formatReportCardMark(studentMarks.ut3),
+      ut4Display: formatReportCardMark(studentMarks.ut4),
+      finDisplay: formatReportCardMark(studentMarks.fin),
+      ut1Max: getSubjectExamComponentMax(cls, s.code || s.name, 'ut1') || 25,
+      ut2Max: getSubjectExamComponentMax(cls, s.code || s.name, 'ut2') || 25,
+      hyMax: getSubjectExamComponentMax(cls, s.code || s.name, 'hy') || 100,
+      ut3Max: getSubjectExamComponentMax(cls, s.code || s.name, 'ut3') || 25,
+      ut4Max: getSubjectExamComponentMax(cls, s.code || s.name, 'ut4') || 25,
+      finMax: getSubjectExamComponentMax(cls, s.code || s.name, 'fin') || 100,
+      ut1Weight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'ut1') || 20,
+      ut2Weight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'ut2') || 20,
+      hyWeight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'hy') || 60,
+      ut3Weight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'ut3') || 20,
+      ut4Weight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'ut4') || 20,
+      finWeight: getSubjectExamComponentWeightage(cls, s.code || s.name, 'fin') || 60
     };
   });
+
+  const rankMap = calculateClassRanks(cls, 'final_annual');
+  const studentRank = rankMap[student.admissionNo] || 1;
   const subjectSummaries = subjects.map(s => {
     const t1 = Math.round((s.ut1Max ? (s.ut1 / s.ut1Max) * s.ut1Weight : 0) + (s.ut2Max ? (s.ut2 / s.ut2Max) * s.ut2Weight : 0) + (s.hyMax ? (s.hy / s.hyMax) * s.hyWeight : 0));
     const t2 = Math.round((s.ut3Max ? (s.ut3 / s.ut3Max) * s.ut3Weight : 0) + (s.ut4Max ? (s.ut4 / s.ut4Max) * s.ut4Weight : 0) + (s.finMax ? (s.fin / s.finMax) * s.finWeight : 0));
     return { ...s, t1, t2, grand: t1 + t2 };
   });
-  const grandScore = subjectSummaries.reduce((sum, s) => sum + s.grand, 0);
-  const finalMaxPossible = subjectSummaries.length * 200;
-  const finalPercentage = finalMaxPossible ? ((grandScore / finalMaxPossible) * 100).toFixed(1) : '0.0';
-  const rankMap = calculateClassRanks(cls, 'final_annual');
-  const studentRank = rankMap[student.admissionNo] || 1;
+
+  const grandTotal = subjectSummaries.reduce((sum, s) => sum + s.grand, 0);
+  const maxPossible = subjectSummaries.length * 200;
+  const percentage = maxPossible ? ((grandTotal / maxPossible) * 100).toFixed(1) : '0.0';
+
+  const getGradeFromScore = (score) => {
+    if (score >= 90) return 'A+';
+    if (score >= 80) return 'A';
+    if (score >= 70) return 'B+';
+    if (score >= 60) return 'B';
+    if (score >= 50) return 'C+';
+    if (score >= 40) return 'C';
+    return 'D';
+  };
+
+  const formattedDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+  window.reportCardPrintOrientation = 'portrait';
+  window._reportCardMode = 'colour';
 
   const modalHtml = `
     <div class="modal-overlay active" id="reportPreviewModal" style="z-index:99999;">
-      <div class="modal-box" style="max-width:920px; max-height:92vh; overflow-y:auto; background:#ffffff; color:#0f172a; padding:0; border-radius:16px; box-shadow:0 25px 50px -12px rgba(0, 0, 0, 0.5); position:relative;">
-        
+      <div class="modal-box" style="max-width:860px; max-height:94vh; overflow-y:auto; background:#f1f5f9; padding:20px; border-radius:16px; box-shadow:0 25px 50px -12px rgba(0,0,0,0.5); position:relative;">
+        <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@600;700&family=Inter:wght@400;500;600;700;800&family=Montserrat:wght@800;900&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet">
+
         <style>
-          @media print {
-            @page {
-              size: A4 portrait;
-              margin: 5mm 6mm;
-            }
-            html, body {
-              background: #ffffff !important;
-              color: #000000 !important;
-              margin: 0 !important;
-              padding: 0 !important;
-            }
-            body * { visibility: hidden !important; }
-            #printableSingleSheetArea, #printableSingleSheetArea * { visibility: visible !important; }
-            #printableSingleSheetArea {
-              position: absolute !important;
-              left: 0 !important;
-              top: 0 !important;
-              width: 100% !important;
-              padding: 0 !important;
-              margin: 0 !important;
-              page-break-inside: avoid !important;
-            }
-            .no-print { display: none !important; }
-            .modal-overlay { position: static !important; background: none !important; padding: 0 !important; }
-            .modal-box { max-width: 100% !important; max-height: none !important; overflow: visible !important; box-shadow: none !important; border: none !important; padding: 0 !important; margin: 0 !important; }
-          }
+          .letterhead-active .rc-vector-border { display: none !important; }
+          .letterhead-active .rc-watermark-logo { display: none !important; }
+          .letterhead-active .rc-school-logo,
+          .letterhead-active .rc-school-name { visibility: hidden !important; }
         </style>
 
-        <!-- LUXURY GRADIENT HEADER WITH OFFICIAL CREST LOGO -->
-        <div style="background: linear-gradient(135deg, #065f46 0%, #047857 50%, #0f172a 100%); color:#ffffff; padding:20px 24px; border-top-left-radius:16px; border-top-right-radius:16px; display:flex; align-items:center; justify-content:space-between; border-bottom:4px solid #f59e0b; position:relative;">
-          <div style="display:flex; align-items:center; gap:16px;">
-            ${getSchoolLogoHtml(65)}
-            <div>
-              <h1 style="font-family:'Playfair Display', serif; font-size:1.4rem; letter-spacing:1px; margin:0; color:#ffffff;">${school.name.toUpperCase()}</h1>
-              <p style="margin:2px 0 0 0; font-size:0.8rem; color:#a7f3d0; font-weight:500;">${school.address} - Session ${currentSession}</p>
-              <div style="margin-top:4px; display:inline-block; padding:2px 10px; background:rgba(245, 158, 11, 0.2); border:1px solid #f59e0b; border-radius:20px; font-size:0.72rem; color:#fbbf24; font-weight:700;">
-                OFFICIAL CONSOLIDATED FINAL PASSING REPORT CARD (TERM 1 & TERM 2)
-              </div>
-            </div>
-          </div>
-          <button class="close-modal-btn no-print" onclick="document.getElementById('reportPreviewModal').remove()" style="color:#ffffff; font-size:1.6rem; opacity:0.8; cursor:pointer;" title="Close Preview"><i class="fa-solid fa-xmark"></i></button>
-        </div>
+        <button class="close-modal-btn no-print" onclick="document.getElementById('reportPreviewModal').remove()" style="position:absolute; top:28px; right:32px; background:#e2e8f0; color:#334155; border:none; width:36px; height:36px; border-radius:50%; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center; z-index:10;">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
 
-        <div id="printableSingleSheetArea" style="padding:20px 24px;">
-          <!-- STUDENT GRAPHIC INFO CARD -->
-          <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:12px 18px; margin-bottom:16px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
-            <div style="display:flex; align-items:center; gap:14px;">
-              <img src="${student.photo}" style="width:55px; height:55px; border-radius:50%; border:2.5px solid #10b981; object-fit:cover;">
-              <div>
-                <h3 style="font-size:1.15rem; margin:0 0 2px 0; color:#0f172a; font-weight:700;">${student.name}</h3>
-                <div style="display:flex; gap:8px; font-size:0.78rem; color:#475569;">
-                  <span><strong>Adm No:</strong> <code style="color:#059669; font-weight:700;">${student.admissionNo}</code></span> |
-                  <span><strong>Class:</strong> <strong style="color:#047857;">${cls} - ${sec}</strong></span> |
-                  <span><strong>Roll No:</strong> ${roll}</span>
+        <div id="printableSingleSheetArea" style="width:740px; height:1030px; padding:0; font-family:'Inter', sans-serif; font-size:0.86rem; background:#ffffff; color:#0f172a; border-radius:4px; position:relative; margin:10px auto; page-break-inside:avoid; box-shadow:0 8px 32px rgba(0,0,0,0.15); overflow:hidden;">
+          
+          <!-- VECTOR DECORATIVE CERTIFICATE BORDER -->
+          <div class="rc-vector-border" style="position:absolute; top:12px; left:12px; right:12px; bottom:12px; border:3pt solid #0f766e; border-radius:8px; pointer-events:none; z-index:1;">
+            <div style="position:absolute; top:5px; left:5px; right:5px; bottom:5px; border:4pt solid #ca8a04; border-radius:6px;"></div>
+          </div>
+
+          <!-- WATERMARK LOGO -->
+          <div class="rc-watermark-logo" style="position:absolute; top:53%; left:50%; transform:translate(-50%, -50%); width:320px; height:320px; opacity:0.08; pointer-events:none; z-index:1; display:flex; align-items:center; justify-content:center;">
+            ${getReportCardLogoHtml(320)}
+          </div>
+
+          <!-- PADDED INNER CONTENT CONTAINER -->
+          <div class="rc-content-wrapper" style="position:relative; z-index:2; width:100%; height:100%; padding:22px 34px; display:flex; flex-direction:column; justify-content:space-between; box-sizing:border-box;">
+            <div>
+              <!-- SCHOOL HEADER -->
+              <div class="report-card-print-header" style="text-align:center; padding-bottom:6px; margin-bottom:10px; border-bottom:1.5px solid #0f766e;">
+                <div class="rc-school-logo" style="margin-bottom:4px; transform:translateY(4px);">
+                  ${getReportCardLogoHtml(82)}
+                </div>
+                <h1 class="rc-school-name" style="font-family:'Montserrat', sans-serif; font-weight:900; font-size:1.35rem; margin:0; color:#0f766e; letter-spacing:0.8px; line-height:1.2; text-transform:uppercase;">MADAN MOHAN MALVIYA<br>JUNIOR HIGH SCHOOL</h1>
+                <h2 style="font-family:'Outfit', sans-serif; font-weight:700; font-size:0.92rem; margin:3px 0 2px 0; color:#0f172a; letter-spacing:1px; text-transform:uppercase;">FINAL EXAM ACADEMIC PROGRESS REPORT</h2>
+                <div style="font-family:'Outfit', sans-serif; font-size:0.78rem; color:#475569; font-weight:700;">
+                  SESSION: ${currentSession} &nbsp;•&nbsp; DATE: <span style="color:#0f766e; font-weight:800;">${formattedDate}</span>
                 </div>
               </div>
-            </div>
 
-            <div style="font-size:0.78rem; color:#334155; line-height:1.5;">
-              <div><strong>Father Name:</strong> ${student.parentName}</div>
-              <div><strong>Mother Name:</strong> ${student.motherName || 'N/A'}</div>
-              <div><strong>Date of Birth:</strong> <strong style="color:#059669;">${formatDobToDDMMYYYY(student.dob)}</strong></div>
-            </div>
+              <!-- STUDENT DETAILS CARD -->
+              <div class="rc-student-details" style="min-height:96px; box-sizing:border-box; border:1.5px solid #cbd5e1; border-radius:10px; padding:12px 14px; margin-bottom:10px; display:flex; align-items:center; gap:16px; background:#f8fafc;">
+                <div style="width:68px; height:68px; border-radius:8px; overflow:hidden; background:#1e293b; color:#ffffff; display:flex; align-items:center; justify-content:center; font-weight:800; font-size:1.4rem; flex-shrink:0;">
+                  ${student.photo || student.photoDataUrl ? `<img loading="lazy" src="${student.photo || student.photoDataUrl}" style="width:100%; height:100%; object-fit:cover;">` : (student.name ? student.name.split(' ').map(n=>n[0]).join('').substring(0,2).toUpperCase() : 'ST')}
+                </div>
+                <div style="flex-grow:1; display:grid; grid-template-columns:1.4fr 1fr; gap:3px 16px; font-size:0.88rem; color:#1e293b;">
+                  <div><strong style="color:#0f766e; font-size:1rem; text-transform:uppercase;">${escapeHtml(student.name)}</strong></div>
+                  <div><strong>Roll No:</strong> ${escapeHtml(String(roll).padStart(2, '0'))}</div>
+                  <div><strong>Class:</strong> ${escapeHtml(cls)}</div>
+                  <div><strong>Admission No:</strong> ${escapeHtml(student.admissionNo)}</div>
+                  <div><strong>Section:</strong> ${escapeHtml(sec)}</div>
+                  <div><strong>Attendance:</strong> <span class="rc-editable-field" contenteditable="true" spellcheck="false" title="Click to edit attendance; it saves to cloud when you leave the field" onblur="saveStudentCustomAttendance('${student.admissionNo}', this.innerText).catch(()=>{})" onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}" style="display:inline-block; min-width:118px; color:#0f766e; font-weight:800; border-bottom:1px dashed #0f766e; padding:0 3px; outline:none;">${escapeHtml(attendanceText)}</span></div>
+                </div>
+              </div>
 
-            <div>
-              <img src="https://api.qrserver.com/v1/create-qr-code/?size=55x55&data=VERIFIED-PASSING-CARD-${student.admissionNo}" style="width:55px; height:55px; border-radius:6px; border:1px solid #cbd5e1;">
-            </div>
-          </div>
-
-          <!-- SIDE-BY-SIDE DUAL TERM MARKS TABLE -->
-          <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.74rem; margin-bottom:16px; border-radius:8px; overflow:hidden; border:1px solid #cbd5e1;">
-            <thead>
-              <tr style="background:#0f172a; color:#ffffff;">
-                <th rowspan="2" style="padding:6px; text-align:left;">Subject Name</th>
-                <th colspan="4" style="padding:4px; background:#1e293b;">TERM 1 (HALF YEARLY EXAM)</th>
-                <th colspan="4" style="padding:4px; background:#065f46;">TERM 2 (ANNUAL FINAL EXAM)</th>
-                <th rowspan="2" style="padding:6px; background:#0f172a;">Grand Total (200)</th>
-                <th rowspan="2" style="padding:6px; background:#0f172a;">Final %</th>
-                <th rowspan="2" style="padding:6px; background:#0f172a;">Result</th>
-              </tr>
-              <tr style="color:#ffffff;">
-                <th style="padding:4px; background:#334155;">UT1 (${utMax})</th>
-                <th style="padding:4px; background:#334155;">UT2 (${utMax})</th>
-                <th style="padding:4px; background:#334155;">HY (${hyMax})</th>
-                <th style="padding:4px; background:#475569;">Term 1 (100)</th>
-
-                <th style="padding:4px; background:#047857;">UT3 (${utMax})</th>
-                <th style="padding:4px; background:#047857;">UT4 (${utMax})</th>
-                <th style="padding:4px; background:#047857;">Annual (${hyMax})</th>
-                <th style="padding:4px; background:#065f46;">Term 2 (100)</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${subjectSummaries.map((s, idx) => {
-                const t1 = s.t1;
-                const t2 = s.t2;
-                const grand = s.grand;
-                const perc = (grand / 2).toFixed(1);
-                const grade = perc >= 90 ? 'PASSED (A+)' : perc >= 80 ? 'PASSED (A)' : 'PASSED';
-                const bg = idx % 2 === 0 ? '#ffffff' : '#f8fafc';
-
-                return `
-                  <tr style="background:${bg}; border-bottom:1px solid #e2e8f0;">
-                    <td style="padding:5px 8px; text-align:left; font-weight:600; color:#0f172a;">${s.name}</td>
-                    <td style="padding:5px;">${s.ut1} / ${s.ut1Max}</td>
-                    <td style="padding:5px;">${s.ut2} / ${s.ut2Max}</td>
-                    <td style="padding:5px;">${s.hy} / ${s.hyMax}</td>
-                    <td style="padding:5px; font-weight:700; color:#4f46e5; background:rgba(99, 102, 241, 0.08);">${t1} / 100</td>
-
-                    <td style="padding:5px;">${s.ut3} / ${s.ut3Max}</td>
-                    <td style="padding:5px;">${s.ut4} / ${s.ut4Max}</td>
-                    <td style="padding:5px;">${s.fin} / ${s.finMax}</td>
-                    <td style="padding:5px; font-weight:700; color:#059669; background:rgba(16, 185, 129, 0.08);">${t2} / 100</td>
-
-                    <td style="padding:5px; font-weight:800; color:#0f172a;">${grand} / 200</td>
-                    <td style="padding:5px; font-weight:700; color:#047857;">${perc}%</td>
-                    <td style="padding:5px;"><span style="padding:2px 8px; border-radius:10px; background:#10b981; color:#ffffff; font-size:0.7rem; font-weight:700;">${grade}</span></td>
+              <!-- ACADEMIC MARKS TABLE WITH HALF YEARLY & FINAL EXAM -->
+              <table style="width:100%; border-collapse:collapse; text-align:center; font-size:0.84rem; margin-bottom:8px; border:1.5px solid #0f766e; border-radius:6px; overflow:hidden;">
+                <thead>
+                  <tr style="background:#0f766e; color:#ffffff; font-weight:700;">
+                    <th rowspan="2" style="padding:6px 8px; text-align:left; border:1px solid #0d9488; width:28%;">Subject Name</th>
+                    <th colspan="3" style="padding:4px; border:1px solid #60a5fa; background:#1d4ed8;">HALF YEARLY</th>
+                    <th colspan="3" style="padding:4px; border:1px solid #0d9488; background:#115e59;">FINAL EXAM</th>
+                    <th rowspan="2" style="padding:6px 4px; border:1px solid #0d9488; width:15%;">Grand Total<br>(200)</th>
+                    <th rowspan="2" style="padding:6px 4px; border:1px solid #0d9488; width:10%;">Grade</th>
                   </tr>
-                `;
-              }).join('')}
-            </tbody>
-          </table>
+                  <tr style="color:#ffffff; font-size:0.78rem;">
+                    <th style="padding:3px; border:1px solid #60a5fa; background:#1d4ed8;">UT1</th>
+                    <th style="padding:3px; border:1px solid #60a5fa; background:#1d4ed8;">UT2</th>
+                    <th style="padding:3px; border:1px solid #60a5fa; background:#1d4ed8;">HY (100)</th>
+                    <th style="padding:3px; border:1px solid #0d9488; background:#115e59;">UT3</th>
+                    <th style="padding:3px; border:1px solid #0d9488; background:#115e59;">UT4</th>
+                    <th style="padding:3px; border:1px solid #0d9488; background:#115e59;">Final (100)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${subjectSummaries.map((s, idx) => {
+                    const grade = getGradeFromScore(Math.round((s.grand / 200) * 100));
+                    const badgeColor = grade.includes('A') ? '#10b981' : grade.includes('B') ? '#3b82f6' : grade.includes('C') ? '#eab308' : '#ef4444';
+                    const bg = idx % 2 === 0 ? 'rgba(255,255,255,0.80)' : 'rgba(248,250,252,0.80)';
 
-          <!-- FINAL RESULT BANNER -->
-          <div style="background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%); border:1.5px solid #6ee7b7; border-radius:10px; padding:12px 18px; display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-            <div>
-              <div style="font-size:0.78rem; color:#065f46; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;">Official Academic Result: PROMOTED TO NEXT CLASS</div>
-              <div style="font-size:1.2rem; font-weight:800; color:#064e3b; margin-top:2px;">GRAND SCORE: ${grandScore} / ${finalMaxPossible} MARKS (${finalPercentage}%)</div>
-            </div>
-            <div style="text-align:right;">
-              <span style="padding:4px 14px; background:#059669; color:#ffffff; border-radius:20px; font-weight:700; font-size:0.82rem;">RANK: ${studentRank}</span>
-            </div>
-          </div>
-
-          <!-- DYNAMIC SIGNATURE FOOTER -->
-          <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-top:16px; border-top:1px solid #cbd5e1; padding-top:8px; font-size:0.72rem;">
-            <!-- TEACHER SIG -->
-            <div style="text-align:center;">
-              <div style="height:38px; display:flex; align-items:flex-end; justify-content:center;">
-                ${classTeacherSignature ? `
-                  <img src="${classTeacherSignature}" style="max-height:38px; max-width:110px; object-fit:contain;">
-                ` : `
-                  <span style="font-family:'Caveat', cursive; font-size:1.15rem; color:#4f46e5; font-weight:bold;">${classTeacherName}</span>
-                `}
+                    return `
+                      <tr style="background:${bg}; border-bottom:1px solid #cbd5e1;">
+                        <td style="padding:4px 8px; text-align:left; font-weight:700; color:#0f172a; border:1px solid #cbd5e1;">${escapeHtml(String(s.name || '').toUpperCase())}</td>
+                        <td style="padding:4px; font-weight:700; border:1px solid #cbd5e1;">${s.ut1Display}</td>
+                        <td style="padding:4px; font-weight:700; border:1px solid #cbd5e1;">${s.ut2Display}</td>
+                        <td style="padding:4px; font-weight:700; border:1px solid #cbd5e1;">${s.hyDisplay}</td>
+                        <td style="padding:4px; font-weight:700; border:1px solid #cbd5e1;">${s.ut3Display}</td>
+                        <td style="padding:4px; font-weight:700; border:1px solid #cbd5e1;">${s.ut4Display}</td>
+                        <td style="padding:4px; font-weight:700; border:1px solid #cbd5e1;">${s.finDisplay}</td>
+                        <td style="padding:4px; font-weight:800; color:#0f766e; border:1px solid #cbd5e1;">${s.grand}</td>
+                        <td style="padding:4px; border:1px solid #cbd5e1;"><span style="display:inline-flex; min-width:36px; height:20px; padding:0 8px; align-items:center; justify-content:center; border-radius:999px; background:${badgeColor}; color:#ffffff; font-size:0.75rem; font-weight:800; box-sizing:border-box;">${grade}</span></td>
+                      </tr>
+                    `;
+                  }).join('')}
+                  <!-- Summary row -->
+                  <tr style="background:#f0fdfa; font-weight:800; color:#0f766e; font-size:0.86rem; border-top:2px solid #0f766e;">
+                    <td style="padding:6px 8px; text-align:left; border:1px solid #cbd5e1;" colspan="7">Grand Total: ${grandTotal} / ${maxPossible} (${percentage}%)</td>
+                    <td style="padding:6px 8px; text-align:right; border:1px solid #cbd5e1;" colspan="2">Rank: ${studentRank}th / ${Object.keys(rankMap).length || 56}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <div class="rc-teacher-remarks" style="display:flex; align-items:flex-end; gap:8px; margin:8px 4px 0; color:#1e293b; font-size:1rem; font-weight:700;">
+                <strong style="white-space:nowrap; color:#065f46; font-weight:800;">Teacher's Remarks:</strong>
+                <span class="rc-editable-field" contenteditable="true" spellcheck="true" title="Click to enter teacher remarks; it saves to cloud when you leave the field" onblur="saveStudentReportCardRemarks('${student.admissionNo}', this.innerText).catch(()=>{})" onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}" style="flex:1; min-height:22px; border-bottom:1.5px solid #0f766e; padding:1px 5px; outline:none; font-weight:700;">${teacherRemarks ? escapeHtml(teacherRemarks) : '&nbsp;'}</span>
               </div>
-              <div style="border-top:1px solid #94a3b8; padding-top:2px; font-weight:600; color:#475569;">Class Teacher Signature</div>
             </div>
 
-            <!-- EXAM CONTROLLER SIGNATURE / SCHOOL STAMP FALLBACK -->
-            <div style="text-align:center;">
-              <div style="height:50px; display:flex; align-items:center; justify-content:center;">
-                ${(sigs.examControllerSig || sigs.schoolStamp) ? `
-                  <img src="${sigs.examControllerSig || sigs.schoolStamp}" style="max-height:50px; max-width:90px; object-fit:contain;">
-                ` : `
-                  <div style="width:50px; height:50px; border-radius:50%; border:2px dashed #f59e0b; display:flex; align-items:center; justify-content:center; color:#d97706; font-size:0.55rem; font-weight:bold; text-align:center; background:rgba(245,158,11,0.05);">
-                    MMM SCHOOL<br>SEAL
+            <!-- FOOTER SIGNATURES & CAMPUS -->
+            <div style="margin-top:auto;">
+              <div style="display:flex; justify-content:space-between; align-items:flex-end; padding:8px 12px 0 12px; margin-bottom:8px;">
+                <div style="text-align:center; width:220px;">
+                  <div style="height:32px; display:flex; align-items:flex-end; justify-content:center;">
+                    ${classTeacherSignature ? `<img src="${classTeacherSignature}" style="max-height:32px; max-width:140px; object-fit:contain;">` : `<span style="font-family:'Caveat', cursive; font-size:1.35rem; color:#4f46e5; font-weight:bold;">${classTeacherName}</span>`}
                   </div>
-                `}
+                  <div style="border-top:1.5px dotted #0f766e; padding-top:4px; font-weight:800; font-size:0.84rem; color:#065f46;">Class Teacher's Signature</div>
+                </div>
+
+                <div style="text-align:center; width:220px;">
+                  <div style="height:32px; display:flex; align-items:flex-end; justify-content:center;">
+                    ${principalSignature ? `<img src="${principalSignature}" style="max-height:32px; max-width:140px; object-fit:contain;">` : `<span style="font-family:'Caveat', cursive; font-size:1.4rem; color:#0f172a; font-weight:bold;">MPhauhan.</span>`}
+                  </div>
+                  <div style="border-top:1.5px dotted #0f766e; padding-top:4px; font-weight:800; font-size:0.84rem; color:#065f46;">Principal's Signature</div>
+                </div>
               </div>
-              <div style="border-top:1px solid #94a3b8; padding-top:2px; font-weight:600; color:#475569;">Exam Controller Signature</div>
+
+              <div style="text-align:center; font-size:0.75rem; color:#475569; font-weight:800; border-top:1px solid #e2e8f0; padding-top:6px; letter-spacing:1px;">
+                SECTOR 53, NOIDA
+              </div>
             </div>
 
-            <!-- PRINCIPAL SIG -->
-            <div style="text-align:center;">
-              <div style="height:38px; display:flex; align-items:flex-end; justify-content:center;">
-                ${principalSignature ? `
-                  <img src="${principalSignature}" style="max-height:38px; max-width:110px; object-fit:contain;">
-                ` : `
-                  <span style="font-family:'Caveat', cursive; font-size:1.15rem; color:#059669; font-weight:bold;">${sigs.principalName || 'Principal Office'}</span>
-                `}
-              </div>
-              <div style="border-top:1px solid #94a3b8; padding-top:2px; font-weight:600; color:#475569;">Principal Signature & Stamp</div>
-            </div>
           </div>
         </div>
 
-        <!-- ACTION FOOTER BAR -->
-        <div style="display:flex; justify-content:space-between; align-items:center; padding:14px 24px; background:#f8fafc; border-top:1px solid #e2e8f0;" class="no-print">
-          <div style="display:flex; gap:10px;">
-            <button class="btn btn-secondary" onclick="document.getElementById('reportPreviewModal').remove()" style="padding:10px 18px; font-weight:800; background:#475569; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-xmark"></i> Close Preview</button>
-            <button class="btn btn-secondary" onclick="openUploadSignaturesModal()" style="padding:10px 18px; font-weight:800; background:#0284c7; color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-signature"></i> Upload Signatures / Stamp</button>
-          </div>
-          <button class="btn btn-primary" onclick="printReportCard('printableSingleSheetArea')" style="padding:10px 24px; font-weight:800; background:linear-gradient(135deg, #10b981 0%, #059669 100%); color:#ffffff; border:none; border-radius:8px; cursor:pointer;"><i class="fa-solid fa-print"></i> Print Passing Report Card</button>
-        </div>
+        ${getReportCardPrintFooterHtml('Print Report Card', 'background:linear-gradient(135deg, #0f766e 0%, #065f46 100%); color:#ffffff;')}
 
       </div>
     </div>
@@ -7757,10 +10429,11 @@ function viewFinalAnnualReportCard(admissionNo) {
   document.body.insertAdjacentHTML('beforeend', modalHtml);
 }
 
-/* ============================================================================
-   DATA PERSISTENCE & AUTO-SAVE ENGINE
-   ============================================================================ */
+
 function buildSchoolDataStoragePayload() {
+  ensureSchoolDataSubjectsArray();
+  ensureSchoolDataClasses();
+  ensureSchoolDataPeriodSettings();
   const activeSession = SchoolData.activeSession || "2026-27";
   (SchoolData.students || []).forEach(student => {
     removeCancelledPaymentsFromStudent(student);
@@ -7774,6 +10447,16 @@ function buildSchoolDataStoragePayload() {
     students: SchoolData.students,
     classFeeMaster: SchoolData.classFeeMaster,
     feeScheduleRules: SchoolData.feeScheduleRules,
+    feeStructureBySession: SchoolData.feeStructureBySession || {},
+    feeSettingsVersions: SchoolData.feeSettingsVersions || {},
+    feeSettingsMutationIds: SchoolData.feeSettingsMutationIds || {},
+    configurationVersions: SchoolData.configurationVersions || {},
+    configurationMutationIds: SchoolData.configurationMutationIds || {},
+    examConfigurationVersions: SchoolData.examConfigurationVersions || {},
+    examConfigurationMutationIds: SchoolData.examConfigurationMutationIds || {},
+    directoryEntityVersions: SchoolData.directoryEntityVersions || {},
+    directoryMutationIds: SchoolData.directoryMutationIds || {},
+    directoryTombstones: SchoolData.directoryTombstones || {},
     weightageRules: SchoolData.weightageRules,
     userPermissions: SchoolData.userPermissions,
     signatures: SchoolData.signatures,
@@ -7782,12 +10465,83 @@ function buildSchoolDataStoragePayload() {
     subjects: SchoolData.subjects,
     staffUsers: SchoolData.staffUsers,
     examSubjectConfigs: SchoolData.examSubjectConfigs,
+    examSchedules: Array.isArray(SchoolData.examSchedules) ? SchoolData.examSchedules : [],
     schoolProfile: SchoolData.schoolProfile,
     periodSettings: SchoolData.periodSettings,
+    attendance: SchoolData.attendance || {},
+    rolePermissionTemplates: SchoolData.rolePermissionTemplates || {},
+    teacherPeriodMatrices: SchoolData.teacherPeriodMatrices || {},
     telegramLogs: SchoolData.telegramLogs,
     cancelledReceipts: SchoolData.cancelledReceipts,
     printSettings: SchoolData.printSettings
   };
+}
+
+function mergeSubjectsPreferNonEmpty(currentSubjects, incomingSubjects) {
+  const current = normalizeSubjectsPayload(currentSubjects);
+  const incoming = normalizeSubjectsPayload(incomingSubjects);
+  if (!incoming.length) return current;
+  if (!current.length) return incoming;
+  const byKey = new Map();
+  current.forEach((item) => {
+    const key = String(item?.code || item?.id || item?.name || '').trim().toLowerCase();
+    if (key) byKey.set(key, item);
+  });
+  incoming.forEach((item) => {
+    const key = String(item?.code || item?.id || item?.name || '').trim().toLowerCase();
+    if (!key) return;
+    byKey.set(key, { ...(byKey.get(key) || {}), ...item });
+  });
+  return Array.from(byKey.values());
+}
+
+function mergeStaffUsersPreferNonEmpty(currentUsers, incomingUsers) {
+  const current = Array.isArray(currentUsers) ? currentUsers.filter(Boolean) : [];
+  const incoming = Array.isArray(incomingUsers) ? incomingUsers.filter(Boolean) : [];
+  if (!incoming.length) return current;
+  if (!current.length) return incoming;
+  const byKey = new Map();
+  current.forEach((item) => {
+    const key = String(item?.username || item?.id || '').trim().toLowerCase();
+    if (key) byKey.set(key, item);
+  });
+  incoming.forEach((item) => {
+    const key = String(item?.username || item?.id || '').trim().toLowerCase();
+    if (!key) return;
+    const prev = byKey.get(key) || {};
+    byKey.set(key, { ...prev, ...item, password: item.password || prev.password || '' });
+  });
+  return Array.from(byKey.values());
+}
+
+function mergeTeachersPreferNonEmpty(currentTeachers, incomingTeachers) {
+  const current = Array.isArray(currentTeachers) ? currentTeachers.filter(Boolean) : [];
+  const incoming = Array.isArray(incomingTeachers) ? incomingTeachers.filter(Boolean) : [];
+  if (!incoming.length) return current;
+  if (!current.length) return incoming;
+  const byKey = new Map();
+  current.forEach((item) => {
+    const key = String(item?.name || item?.id || '').trim().toLowerCase();
+    if (key) byKey.set(key, item);
+  });
+  incoming.forEach((item) => {
+    const key = String(item?.name || item?.id || '').trim().toLowerCase();
+    if (!key) return;
+    const prev = byKey.get(key) || {};
+    const mappings = (Array.isArray(item.subjectMappings) && item.subjectMappings.length)
+      ? item.subjectMappings
+      : (Array.isArray(prev.subjectMappings) && prev.subjectMappings.length ? prev.subjectMappings : []);
+    const classes = (Array.isArray(item.classesTaught) && item.classesTaught.length)
+      ? item.classesTaught
+      : (prev.classesTaught || item.classes || prev.classes || []);
+    byKey.set(key, {
+      ...prev,
+      ...item,
+      subjectMappings: mappings,
+      classesTaught: classes
+    });
+  });
+  return Array.from(byKey.values());
 }
 
 function applySchoolDataStoragePayload(parsed, options) {
@@ -7795,11 +10549,35 @@ function applySchoolDataStoragePayload(parsed, options) {
   if (!parsed || !Array.isArray(parsed.students)) return false;
   if (parsed.students.length === 0 && !allowEmpty) return false;
   if (parsed.students) SchoolData.students = parsed.students;
-  if (parsed.classes) SchoolData.classes = parsed.classes;
+  dedupeAllSchoolFeeRecords();
+  
+  if (parsed.classes !== undefined) {
+    const incoming = normalizeClassesPayload(parsed.classes);
+    if (incoming.length) {
+      SchoolData.classes = incoming;
+    }
+  }
+  ensureSchoolDataClasses();
   if (parsed.classFeeMaster) SchoolData.classFeeMaster = parsed.classFeeMaster;
   if (parsed.feeScheduleRules) SchoolData.feeScheduleRules = parsed.feeScheduleRules;
+  if (parsed.feeStructureBySession && typeof parsed.feeStructureBySession === 'object') SchoolData.feeStructureBySession = parsed.feeStructureBySession;
+  if (parsed.feeSettingsVersions && typeof parsed.feeSettingsVersions === 'object') SchoolData.feeSettingsVersions = parsed.feeSettingsVersions;
+  if (parsed.feeSettingsMutationIds && typeof parsed.feeSettingsMutationIds === 'object') SchoolData.feeSettingsMutationIds = parsed.feeSettingsMutationIds;
+  if (parsed.configurationVersions && typeof parsed.configurationVersions === 'object') SchoolData.configurationVersions = parsed.configurationVersions;
+  if (parsed.configurationMutationIds && typeof parsed.configurationMutationIds === 'object') SchoolData.configurationMutationIds = parsed.configurationMutationIds;
+  if (parsed.examConfigurationVersions && typeof parsed.examConfigurationVersions === 'object') SchoolData.examConfigurationVersions = parsed.examConfigurationVersions;
+  if (parsed.examConfigurationMutationIds && typeof parsed.examConfigurationMutationIds === 'object') SchoolData.examConfigurationMutationIds = parsed.examConfigurationMutationIds;
+  if (parsed.directoryEntityVersions && typeof parsed.directoryEntityVersions === 'object') SchoolData.directoryEntityVersions = parsed.directoryEntityVersions;
+  if (parsed.directoryMutationIds && typeof parsed.directoryMutationIds === 'object') SchoolData.directoryMutationIds = parsed.directoryMutationIds;
+  if (parsed.directoryTombstones && typeof parsed.directoryTombstones === 'object') SchoolData.directoryTombstones = parsed.directoryTombstones;
+  const activeFeeSettings = SchoolData.feeStructureBySession?.[String(parsed.activeSession || SchoolData.activeSession || '')];
+  if (activeFeeSettings?.classFeeMaster) SchoolData.classFeeMaster = activeFeeSettings.classFeeMaster;
+  if (activeFeeSettings?.feeScheduleRules) SchoolData.feeScheduleRules = activeFeeSettings.feeScheduleRules;
   if (parsed.weightageRules) SchoolData.weightageRules = parsed.weightageRules;
   if (parsed.userPermissions) SchoolData.userPermissions = parsed.userPermissions;
+  if (parsed.attendance && typeof parsed.attendance === 'object') SchoolData.attendance = parsed.attendance;
+  if (parsed.rolePermissionTemplates && typeof parsed.rolePermissionTemplates === 'object') SchoolData.rolePermissionTemplates = parsed.rolePermissionTemplates;
+  if (parsed.teacherPeriodMatrices && typeof parsed.teacherPeriodMatrices === 'object') SchoolData.teacherPeriodMatrices = parsed.teacherPeriodMatrices;
   if (parsed.signatures) {
     const prev = SchoolData.signatures || {};
     SchoolData.signatures = { ...prev, ...parsed.signatures };
@@ -7808,21 +10586,25 @@ function applySchoolDataStoragePayload(parsed, options) {
     });
   }
   if (parsed.sessions) SchoolData.sessions = parsed.sessions;
-  if (Array.isArray(parsed.teachers) || parsed.teachers) SchoolData.teachers = parsed.teachers || [];
-  if (parsed.subjects) SchoolData.subjects = parsed.subjects;
-  if (Array.isArray(parsed.staffUsers)) {
-    const prevByKey = new Map(
-      (SchoolData.staffUsers || []).map((u) => [String(u.username || u.id || '').toLowerCase(), u])
-    );
-    SchoolData.staffUsers = parsed.staffUsers.map((u) => {
-      const key = String(u.username || u.id || '').toLowerCase();
-      const prev = prevByKey.get(key);
-      // Never blank an existing password just because cloud row omitted it
-      if (prev && prev.password && !u.password) return { ...u, password: prev.password };
-      return u;
-    });
+  if (parsed.teachers !== undefined) {
+    SchoolData.teachers = mergeTeachersPreferNonEmpty(SchoolData.teachers, parsed.teachers);
   }
-  if (parsed.examSubjectConfigs) SchoolData.examSubjectConfigs = parsed.examSubjectConfigs;
+  if (parsed.subjects !== undefined) {
+    SchoolData.subjects = mergeSubjectsPreferNonEmpty(SchoolData.subjects, parsed.subjects);
+  }
+  if (parsed.examSchedules !== undefined) {
+    SchoolData.examSchedules = Array.isArray(parsed.examSchedules) ? parsed.examSchedules : [];
+  }
+  if (Array.isArray(parsed.staffUsers)) {
+    SchoolData.staffUsers = mergeStaffUsersPreferNonEmpty(SchoolData.staffUsers, parsed.staffUsers);
+  }
+  if (parsed.examSubjectConfigs !== undefined) {
+    const incoming = parsed.examSubjectConfigs && typeof parsed.examSubjectConfigs === 'object' ? parsed.examSubjectConfigs : {};
+    const current = SchoolData.examSubjectConfigs && typeof SchoolData.examSubjectConfigs === 'object' ? SchoolData.examSubjectConfigs : {};
+    if (Object.keys(incoming).length || !Object.keys(current).length) {
+      SchoolData.examSubjectConfigs = { ...current, ...incoming };
+    }
+  }
   if (parsed.schoolProfile) {
     const prev = SchoolData.schoolProfile || {};
     const next = parsed.schoolProfile;
@@ -7834,7 +10616,11 @@ function applySchoolDataStoragePayload(parsed, options) {
       paymentQrDataUrl: next.paymentQrDataUrl || prev.paymentQrDataUrl || ''
     };
   }
-  if (parsed.periodSettings) SchoolData.periodSettings = parsed.periodSettings;
+  if (parsed.periodSettings !== undefined) {
+    const incoming = normalizePeriodSettingsPayload(parsed.periodSettings);
+    const current = normalizePeriodSettingsPayload(SchoolData.periodSettings);
+    SchoolData.periodSettings = incoming.length ? incoming : (current.length ? current : getDefaultPeriodSettings());
+  }
   if (parsed.printSettings && typeof parsed.printSettings === 'object') {
     SchoolData.printSettings = { ...(SchoolData.printSettings || {}), ...parsed.printSettings };
   }
@@ -7844,10 +10630,8 @@ function applySchoolDataStoragePayload(parsed, options) {
   }
   mergeLocalCancelledReceiptsFromTinyStore();
   if (parsed.activeSession) SchoolData.activeSession = parsed.activeSession;
-  mergeExactDuplicateStudentRows();
-  if (typeof repairCrossDeviceStudentIdentityDrift === 'function') {
-    repairCrossDeviceStudentIdentityDrift();
-  }
+  // Loading cloud data must never merge, rename, move, or delete student rows.
+  // Duplicate identities are reported for administrator review only.
   if (SchoolData.students && Array.isArray(SchoolData.students)) {
     SchoolData.students.forEach(s => {
       const session = SchoolData.activeSession || "2026-27";
@@ -7862,7 +10646,10 @@ const ERP_IDB_NAME = 'MMM_ERP_DB';
 const ERP_IDB_STORE = 'kv';
 const ERP_IDB_SNAPSHOT_KEY = 'snapshot';
 const ERP_IDB_DISPLAY_KEY = 'cloudDisplay';
+const ERP_IDB_DISPLAY_VERSION_KEY = 'MMM_ERP_CLOUD_DISPLAY_CACHE_AT';
+const ERP_IDB_PHOTOS_KEY = 'studentPhotoCache';
 let _storageSaveToastAt = 0;
+window._erpStudentPhotoCache = window._erpStudentPhotoCache || {};
 
 function isHeavyDataUrl(value) {
   return typeof value === 'string' && value.indexOf('data:') === 0 && value.length > 4096;
@@ -7951,7 +10738,12 @@ function saveCloudDisplayCache(payload) {
   return openErpIndexedDb().then(db => new Promise((resolve, reject) => {
     const tx = db.transaction(ERP_IDB_STORE, 'readwrite');
     tx.objectStore(ERP_IDB_STORE).put(record, ERP_IDB_DISPLAY_KEY);
-    tx.oncomplete = () => resolve(true);
+    tx.oncomplete = () => {
+      // Publish this revision only after IndexedDB confirms the display copy
+      // is durable. Startup can then reuse it after a tiny cloudVersion check.
+      try { localStorage.setItem(ERP_IDB_DISPLAY_VERSION_KEY, String(record.savedAt || '')); } catch (e) {}
+      resolve(true);
+    };
     tx.onerror = () => reject(tx.error || new Error('display cache write failed'));
   })).catch(err => {
     console.warn('Display cache save skipped:', err);
@@ -7960,6 +10752,7 @@ function saveCloudDisplayCache(payload) {
 }
 
 function clearCloudDisplayCache() {
+  try { localStorage.removeItem(ERP_IDB_DISPLAY_VERSION_KEY); } catch (e) {}
   return openErpIndexedDb().then(db => new Promise((resolve, reject) => {
     const tx = db.transaction(ERP_IDB_STORE, 'readwrite');
     tx.objectStore(ERP_IDB_STORE).delete(ERP_IDB_DISPLAY_KEY);
@@ -8176,10 +10969,8 @@ function loadSchoolDataFromStorage() {
     
     // Never clear live ERP fee receipts, wallet balances, or card links while loading.
     // Saved receipts are the source of truth after refresh.
-    mergeExactDuplicateStudentRows();
-    if (typeof repairCrossDeviceStudentIdentityDrift === 'function') {
-      repairCrossDeviceStudentIdentityDrift();
-    }
+    // Do not run historical identity-repair routines automatically. They alter
+    // student rows and receipt ownership merely by refreshing the application.
     mergeLocalCancelledReceiptsFromTinyStore();
     if (SchoolData.students && Array.isArray(SchoolData.students)) {
       SchoolData.students.forEach(s => {
@@ -8196,31 +10987,40 @@ function loadSchoolDataFromStorage() {
 
 async function syncAllCardUidsFromGoogleSheets() {
   showNotification('Fetching NFC UIDs and Telegram Chat IDs from Google Sheet...', 'info');
+  const tracker = captureStudentMasterChangeSet();
   try {
     const rows = await fetchGoogleContactRowsForSync();
     if (rows.length > 0) {
       applyRosterIdentityRowsToStudents(rows);
       const result = applyContactUidRowsToStudents(rows, { updateAttendance: false });
-      repairDuplicateNfcUidAssignments();
-      showNotification(`Google Sheet contact sync complete: ${result.updated} student record(s) updated. ${result.skipped} row(s) skipped.`, 'success');
+      const records = buildChangedStudentMasterRecords(tracker, { intent: 'contact_link' });
+      if (records.length) await persistStudentMasterDelta(records, null);
+      showNotification(`Google Sheet contact sync saved to cloud: ${result.updated} student record(s) updated. ${result.skipped} row(s) skipped.`, 'success');
       rerenderContactSyncViews();
       return;
     }
   } catch(e) {
+    applySchoolDataStoragePayload(tracker.payload, { allowEmpty: true });
+    showNotification(`Google Sheet sync was not saved: ${e?.message || 'cloud rejected the changes.'}`, 'error');
+    rerenderContactSyncViews();
+    return;
   }
   showNotification('Google Sheet sync unavailable. No local student data was changed.', 'warning');
   rerenderContactSyncViews();
 }
 
 async function refreshTelegramLinksFromGoogleSheetForSend() {
+  const tracker = captureStudentMasterChangeSet();
   try {
     const rows = await fetchGoogleContactRowsForSync();
     if (!rows.length) return { ok: false, updated: 0, skipped: 0 };
     const rosterResult = applyRosterIdentityRowsToStudents(rows);
     const result = applyContactUidRowsToStudents(rows, { updateAttendance: false });
-    repairDuplicateNfcUidAssignments();
+    const records = buildChangedStudentMasterRecords(tracker, { intent: 'contact_link' });
+    if (records.length) await persistStudentMasterDelta(records, null);
     return { ok: true, ...result, ...rosterResult };
   } catch (e) {
+    applySchoolDataStoragePayload(tracker.payload, { allowEmpty: true });
     return { ok: false, updated: 0, skipped: 0 };
   }
 }
@@ -8265,6 +11065,16 @@ function backupDatabaseToJson() {
     students: SchoolData.students,
     classFeeMaster: SchoolData.classFeeMaster,
     feeScheduleRules: SchoolData.feeScheduleRules,
+    feeStructureBySession: SchoolData.feeStructureBySession || {},
+    feeSettingsVersions: SchoolData.feeSettingsVersions || {},
+    feeSettingsMutationIds: SchoolData.feeSettingsMutationIds || {},
+    configurationVersions: SchoolData.configurationVersions || {},
+    configurationMutationIds: SchoolData.configurationMutationIds || {},
+    examConfigurationVersions: SchoolData.examConfigurationVersions || {},
+    examConfigurationMutationIds: SchoolData.examConfigurationMutationIds || {},
+    directoryEntityVersions: SchoolData.directoryEntityVersions || {},
+    directoryMutationIds: SchoolData.directoryMutationIds || {},
+    directoryTombstones: SchoolData.directoryTombstones || {},
     weightageRules: SchoolData.weightageRules,
     userPermissions: SchoolData.userPermissions,
     signatures: SchoolData.signatures,
@@ -8297,7 +11107,7 @@ function openRestoreDatabaseModal() {
     <div class="modal-overlay active" id="restoreDbModal" style="z-index:99999;">
       <div class="modal-box" style="max-width:520px; background:#0f172a; color:#ffffff; padding:24px; border-radius:18px; border:2px solid #a855f7; box-shadow:0 25px 50px -12px rgba(0,0,0,0.8);">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; border-bottom:1px solid #334155; padding-bottom:12px;">
-          <h3 style="margin:0; color:#c084fc; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+          <h3 style="margin:0; color:#6d28d9; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
             <i class="fa-solid fa-cloud-arrow-up"></i> Restore Database Backup
           </h3>
           <button onclick="document.getElementById('restoreDbModal').remove()" style="background:#334155; color:#ffffff; border:none; width:30px; height:30px; border-radius:50%; cursor:pointer;">X</button>
@@ -8327,35 +11137,17 @@ function confirmRestoreDatabase() {
 
   const file = fileInput.files[0];
   const reader = new FileReader();
-  reader.onload = function(e) {
+  reader.onload = async function(e) {
     try {
       const data = JSON.parse(e.target.result);
-      if (data.students && Array.isArray(data.students)) SchoolData.students = data.students;
-      if (data.classes && Array.isArray(data.classes)) SchoolData.classes = data.classes;
-      if (data.classFeeMaster) SchoolData.classFeeMaster = data.classFeeMaster;
-      if (data.feeScheduleRules) SchoolData.feeScheduleRules = data.feeScheduleRules;
-      if (data.weightageRules) SchoolData.weightageRules = data.weightageRules;
-      if (data.userPermissions) SchoolData.userPermissions = data.userPermissions;
-      if (data.signatures) SchoolData.signatures = data.signatures;
-      if (data.sessions) SchoolData.sessions = data.sessions;
-      if (data.teachers) SchoolData.teachers = data.teachers;
-      if (data.subjects) SchoolData.subjects = data.subjects;
-      if (data.examSubjectConfigs) SchoolData.examSubjectConfigs = data.examSubjectConfigs;
-      if (data.periodSettings) SchoolData.periodSettings = data.periodSettings;
-      if (data.telegramLogs) SchoolData.telegramLogs = data.telegramLogs;
-      if (data.activeSession) SchoolData.activeSession = data.activeSession;
-
-      saveSchoolDataToStorage();
-      
-      const modal = document.getElementById('restoreDbModal');
-      if (modal) modal.remove();
-
-      showNotification(`Saved: Complete Database Restored! Loaded ${SchoolData.students.length} students & all fee records!`, 'success');
+      if (!data || !Array.isArray(data.students)) throw new Error('Backup has no students array.');
+      const applied = applySchoolDataStoragePayload(data, { allowEmpty: true });
+      if (!applied) throw new Error('Backup data could not be applied.');
+      await persistErpCloudSave(`Complete database restored with ${SchoolData.students.length} students and fee records.`);
+      document.getElementById('restoreDbModal')?.remove();
       handleRouting();
     } catch(err) {
-      const modal = document.getElementById('restoreDbModal');
-      if (modal) modal.remove();
-      showNotification('Error: Invalid JSON backup file format!', 'error');
+      showNotification(`Database restore failed: ${err.message || 'Invalid JSON backup file.'}`, 'error');
     }
   };
   reader.readAsText(file);
@@ -8426,7 +11218,7 @@ function exportStudentsToExcel(classFilter) {
       csvEscape(detail.class || s.currentClass || ''),
       csvEscape(detail.section || s.currentSection || ''),
       csvEscape(s.address || ''),
-      csvEscape(formatDobToDDMMYYYY(s.dob) || ''),
+      csvEscape(formatStudentDob(s) || ''),
       csvEscape(s.gender || ''),
       csvEscape(s.parentPhone || ''),
       csvEscape(s.parentEmail || ''),
@@ -8461,12 +11253,24 @@ function exportStudentsToExcel(classFilter) {
    MODULE: STUDENT DIRECTORY
    ============================================================================ */
 function renderStudentsPage(container) {
+  if (window.ERP_V2_READ_FLAGS && window.ERP_V2_READ_FLAGS.students && typeof window.refreshStudentsFromV2 === 'function') {
+    requestErpV2ScreenRefresh('students', 'students', window.refreshStudentsFromV2, function() {
+      if (window.location.hash.replace('#', '') === 'students') renderStudentsPage(container);
+    });
+  }
   const students = getStudentsByActiveSession();
   const currentSession = SchoolData.activeSession;
   const canExportStudents = canCurrentUserExportStudents();
   const canBulkDeleteStudents = canCurrentUserBulkDeleteStudents();
   const canImportStudents = hasUserAccessPermission(getCurrentActiveUser(), 'student_admission', 'add');
   const canAddStudents = hasUserAccessPermission(getCurrentActiveUser(), 'student_admission', 'add');
+  const PAGE_SIZE = 50;
+  window._studentDirPage = Math.max(1, Number(window._studentDirPage || 1));
+  const totalStudents = students.length;
+  const studentPages = Math.max(1, Math.ceil(totalStudents / PAGE_SIZE));
+  if (window._studentDirPage > studentPages) window._studentDirPage = studentPages;
+  const pageStart = (window._studentDirPage - 1) * PAGE_SIZE;
+  const pageStudents = students.slice(pageStart, pageStart + PAGE_SIZE);
 
   container.innerHTML = `
     <div class="page-header">
@@ -8490,6 +11294,9 @@ function renderStudentsPage(container) {
           <button class="btn btn-secondary" onclick="openBulkStudentCsvModal()" style="background:#059669; color:#ffffff; border:none; font-weight:bold;">
             <i class="fa-solid fa-file-csv"></i> Import CSV
           </button>
+          <button class="btn btn-secondary" onclick="openBulkStudentPhotoModal()" style="background:#8b5cf6; color:#ffffff; border:none; font-weight:bold;">
+            <i class="fa-solid fa-images"></i> Bulk Photo Upload
+          </button>
         ` : ''}
         ${canBulkDeleteStudents ? `
           <button class="btn btn-secondary" onclick="deleteAllStudentsForFreshCsvImport()" style="background:#dc2626; color:#ffffff; border:none; font-weight:bold;">
@@ -8503,7 +11310,7 @@ function renderStudentsPage(container) {
 
     <div class="glass-card">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:12px;">
-        <input type="text" id="studentSearchInput" placeholder="Search student name, adm no, or NFC UID..." class="session-dropdown" style="width:300px;" onkeyup="filterStudentsDirectoryTable()">
+        <input type="text" id="studentSearchInput" placeholder="Search student name or admission no..." class="session-dropdown" style="width:300px;" onkeyup="filterStudentsDirectoryTable()">
         <select id="studentClassFilter" class="session-dropdown" onchange="filterStudentsDirectoryTable()">
           ${getClassSelectOptionsHtml('ALL', { includeAll: true })}
         </select>
@@ -8512,37 +11319,30 @@ function renderStudentsPage(container) {
       <div class="data-table-container">
         <table class="data-table" id="studentsDirectoryTable">
           <thead>
-            <tr>
-              <th>Student Name</th>
-              <th>Admission No</th>
-              <th>Class & Sec</th>
-              <th>NFC UID</th>
-              <th>Parent Info</th>
-              <th>Fee Status</th>
+            <tr style="user-select:none;">
+              <th onclick="sortHtmlTable('studentsDirectoryTable', 0, 'string')" style="cursor:pointer;">Student Name <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
+              <th onclick="sortHtmlTable('studentsDirectoryTable', 1, 'number')" style="cursor:pointer;">Admission No <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
+              <th onclick="sortHtmlTable('studentsDirectoryTable', 2, 'string')" style="cursor:pointer;">Class & Sec <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
+              <th onclick="sortHtmlTable('studentsDirectoryTable', 3, 'string')" style="cursor:pointer;">Parent Info <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
+              <th onclick="sortHtmlTable('studentsDirectoryTable', 4, 'string')" style="cursor:pointer;">Fee Status <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
               <th>Actions</th>
             </tr>
           </thead>
           <tbody>
-            ${students.map(s => {
-              const fee = s.currentFeeInfo;
-              const dueAmount = (fee.dueMonths.length * getStudentMonthlyTuitionRate(s)) + (fee.previousSessionDue || 0);
+            ${pageStudents.map(s => {
+              const dueAmount = getStudentTotalDueAmount(s);
 
               return `
-                <tr class="student-dir-row" data-name="${s.name.toLowerCase()}" data-adm="${s.admissionNo}" data-uid="${s.nfcUid.toLowerCase()}" data-class="${s.currentClass}">
+                <tr class="student-dir-row" data-name="${s.name.toLowerCase()}" data-adm="${s.admissionNo}" data-class="${s.currentClass}">
                   <td style="display:flex; align-items:center; gap:10px;">
-                    <img src="${s.photo}" style="width:36px; height:36px; border-radius:50%; object-fit:cover;">
+                    ${getStudentDirectoryPhotoHtml(s, 36)}
                     <div>
                       <strong style="color:var(--text-main);">${s.name}</strong><br>
-                      <small style="color:var(--text-muted);">${s.gender} | <strong style="color:#38bdf8;">DOB: ${formatDobToDDMMYYYY(s.dob)}</strong></small>
+                      <small style="color:var(--text-muted);">${s.gender} | <strong style="color:var(--accent-primary);">DOB: ${formatStudentDob(s)}</strong></small>
                     </div>
                   </td>
-                  <td><code>${s.admissionNo}</code></td>
+                  <td><span class="adm-no-chip">${s.admissionNo}</span></td>
                   <td><span class="badge badge-purple">${s.currentClass} - ${s.currentSection}</span></td>
-                  <td>
-                    ${s.nfcUid && s.nfcUid.trim().length > 0 
-                      ? `<code style="color:#38bdf8; font-weight:800; background:rgba(56,189,248,0.1); padding:3px 7px; border-radius:6px; border:1px solid rgba(56,189,248,0.3);"><i class="fa-solid fa-microchip"></i> ${s.nfcUid}</code>` 
-                      : `<span style="color:#64748b; font-weight:600; font-size:0.85rem;">--</span>`}
-                  </td>
                   <td>
                     <div style="font-size:0.8rem;">
                       <strong>${s.parentName}</strong><br>
@@ -8559,7 +11359,7 @@ function renderStudentsPage(container) {
                       <button class="btn btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="openStudentProfile('${s.admissionNo}')">
                         <i class="fa-solid fa-eye"></i> Profile
                       </button>
-                      <button class="btn btn-secondary" style="padding:4px 10px; font-size:0.75rem; background:rgba(56, 189, 248, 0.15); color:#38bdf8; border:1px solid #38bdf8;" onclick="openEditStudentModal('${s.admissionNo}')">
+                      <button class="btn btn-secondary" style="padding:4px 10px; font-size:0.75rem; background:rgba(56, 189, 248, 0.15); color:#0284c7; border:1px solid #38bdf8;" onclick="openEditStudentModal('${s.admissionNo}')">
                         <i class="fa-solid fa-pen-to-square"></i> Edit
                       </button>
                       <button class="btn btn-primary" style="padding:4px 10px; font-size:0.75rem; background:linear-gradient(135deg, #10b981 0%, #059669 100%); border:none;" onclick="openCollectFeeModal('${s.admissionNo}')">
@@ -8573,6 +11373,13 @@ function renderStudentsPage(container) {
           </tbody>
         </table>
       </div>
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-top:12px; gap:8px; flex-wrap:wrap;">
+        <small style="color:#94a3b8;">Showing ${pageStudents.length ? (pageStart + 1) : 0}–${pageStart + pageStudents.length} of ${totalStudents}</small>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-secondary" ${window._studentDirPage <= 1 ? 'disabled' : ''} onclick="window._studentDirPage=${window._studentDirPage - 1}; renderStudentsPage(document.getElementById('contentBody'))">Prev</button>
+          <button class="btn btn-secondary" ${window._studentDirPage >= studentPages ? 'disabled' : ''} onclick="window._studentDirPage=${window._studentDirPage + 1}; renderStudentsPage(document.getElementById('contentBody'))">Next</button>
+        </div>
+      </div>
     </div>
   `;
 }
@@ -8585,40 +11392,695 @@ function filterStudentsDirectoryTable() {
   rows.forEach(r => {
     const name = r.getAttribute('data-name') || '';
     const adm = r.getAttribute('data-adm') || '';
-    const uid = r.getAttribute('data-uid') || '';
     const cls = r.getAttribute('data-class') || '';
 
-    const matchQuery = !query || name.includes(query) || adm.includes(query) || uid.includes(query);
+    const matchQuery = !query || name.includes(query) || adm.includes(query);
     const matchClass = targetClass === 'ALL' || cls === targetClass;
 
     r.style.display = (matchQuery && matchClass) ? '' : 'none';
   });
 }
 
+/* ============================================================================
+   BULK STUDENT PHOTO UPLOAD (matched by admission number in the file name)
+   ============================================================================ */
+
+const BULK_PHOTO_MAX_WIDTH = 240;
+const BULK_PHOTO_MAX_HEIGHT = 320;
+const BULK_PHOTO_JPEG_QUALITY = 0.72;
+const STUDENT_PHOTO_ASSET_DIR = 'assets/students/';
+
+function studentPhotoAssetPath(admissionNo) {
+  const adm = String(admissionNo || '').replace(/\.0$/, '').trim();
+  return `${STUDENT_PHOTO_ASSET_DIR}${adm}.jpg`;
+}
+
+function isStudentPhotoAssetPath(value) {
+  const photo = String(value || '').trim();
+  return photo.startsWith(STUDENT_PHOTO_ASSET_DIR) && /\.(jpe?g|png|webp)$/i.test(photo);
+}
+
+function resolveStudentPhotoSrc(student) {
+  const adm = String(student?.admissionNo || '').replace(/\.0$/, '').trim();
+  const cached = adm && window._erpStudentPhotoCache ? String(window._erpStudentPhotoCache[adm] || '').trim() : '';
+  const photo = String(cached || student?.photo || student?.photoDataUrl || '').trim();
+  if (!photo) return '';
+  if (photo.startsWith('data:image')) return photo;
+  if (/unsplash|placeholder|dicebear|gravatar/i.test(photo)) return '';
+  if (isStudentPhotoAssetPath(photo)) return photo;
+  if (/supabase\.co\/storage\/v1\/object\/public\//i.test(photo)) return photo;
+  if (/^https?:\/\//i.test(photo)) return photo;
+  return photo;
+}
+
+function loadStudentPhotoCacheFromIdb() {
+  return openErpIndexedDb().then((db) => new Promise((resolve) => {
+    const tx = db.transaction(ERP_IDB_STORE, 'readonly');
+    const req = tx.objectStore(ERP_IDB_STORE).get(ERP_IDB_PHOTOS_KEY);
+    req.onsuccess = () => {
+      const cache = req.result && typeof req.result === 'object' ? req.result : {};
+      window._erpStudentPhotoCache = { ...cache, ...(window._erpStudentPhotoCache || {}) };
+      resolve(window._erpStudentPhotoCache);
+    };
+    req.onerror = () => resolve(window._erpStudentPhotoCache || {});
+  })).catch(() => window._erpStudentPhotoCache || {});
+}
+
+function cacheStudentPhotosLocally(photoRows) {
+  const rows = Array.isArray(photoRows) ? photoRows : [];
+  if (!rows.length) return Promise.resolve(false);
+  rows.forEach((row) => {
+    const adm = String(row.admissionNo || row.student?.admissionNo || '').replace(/\.0$/, '').trim();
+    const dataUrl = String(row.dataUrl || row.photo || '').trim();
+    if (adm && dataUrl.startsWith('data:image')) {
+      window._erpStudentPhotoCache[adm] = dataUrl;
+    }
+  });
+  return openErpIndexedDb().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(ERP_IDB_STORE, 'readwrite');
+    tx.objectStore(ERP_IDB_STORE).put({ ...(window._erpStudentPhotoCache || {}) }, ERP_IDB_PHOTOS_KEY);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error || new Error('photo cache write failed'));
+  })).catch((err) => {
+    console.warn('Photo cache save skipped:', err);
+    return false;
+  });
+}
+
+function getStudentInitials(name) {
+  const parts = String(name || 'Student').trim().split(/\s+/).filter(Boolean);
+  return parts.slice(0, 2).map(part => part[0]).join('').toUpperCase() || '?';
+}
+
+function buildStudentInitialsAvatarStyle(sizePx) {
+  const fontSize = Math.max(10, Math.round(sizePx * 0.32));
+  return `width:${sizePx}px;height:${sizePx}px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#334155;color:#94a3b8;font-size:${fontSize}px;font-weight:800;flex-shrink:0;`;
+}
+
+/** Swap broken/missing photo img for initials circle — never stack both. */
+function replaceStudentPhotoWithInitials(img) {
+  if (!img || img.tagName !== 'IMG') return;
+  img.onerror = null;
+  const sizePx = Number(img.getAttribute('data-photo-size')) || 36;
+  const initials = img.getAttribute('data-photo-initials') || '?';
+  const el = document.createElement('div');
+  el.style.cssText = buildStudentInitialsAvatarStyle(sizePx);
+  el.textContent = initials;
+  img.replaceWith(el);
+}
+
+/** Student list/profile avatar — real photo only; initials when missing or broken. */
+function getStudentDirectoryPhotoHtml(student, sizePx = 36) {
+  const photo = resolveStudentPhotoSrc(student);
+  const initials = getStudentInitials(student?.name);
+  const boxStyle = buildStudentInitialsAvatarStyle(sizePx);
+  if (!photo) {
+    return `<div style="${boxStyle}">${escapeHtml(initials)}</div>`;
+  }
+  return `<img data-strict-lazy-src="${photo}" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=" alt="" data-photo-size="${sizePx}" data-photo-initials="${escapeHtml(initials)}" style="width:${sizePx}px;height:${sizePx}px;border-radius:50%;object-fit:cover;flex-shrink:0;display:block;background:#334155;" onerror="replaceStudentPhotoWithInitials(this)">`;
+}
+
+function loadJsZipLibrary() {
+  if (window.JSZip) return Promise.resolve(window.JSZip);
+  return new Promise((resolve, reject) => {
+    const existing = document.getElementById('erpJsZipScript');
+    if (existing) {
+      existing.addEventListener('load', () => resolve(window.JSZip));
+      existing.addEventListener('error', () => reject(new Error('Could not load ZIP helper.')));
+      return;
+    }
+    const script = document.createElement('script');
+    script.id = 'erpJsZipScript';
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+    script.onload = () => resolve(window.JSZip);
+    script.onerror = () => reject(new Error('Could not load ZIP helper.'));
+    document.head.appendChild(script);
+  });
+}
+
+async function downloadStudentPhotosAssetZip(queue) {
+  const JSZip = await loadJsZipLibrary();
+  const zip = new JSZip();
+  const folder = zip.folder('students');
+  queue.forEach((row) => {
+    const adm = String(row.student?.admissionNo || '').trim();
+    const base64 = String(row.dataUrl || '').split(',')[1] || '';
+    if (!adm || !base64) return;
+    folder.file(`${adm}.jpg`, base64, { base64: true });
+  });
+  const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `student-photos-${new Date().toISOString().slice(0, 10)}.zip`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+/** Photos travel inside the cloud roster payload, so shrink each one to passport size before storing. */
+function resizeImageFileToDataUrl(file, maxWidth = BULK_PHOTO_MAX_WIDTH, maxHeight = BULK_PHOTO_MAX_HEIGHT) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('File could not be read.'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('Not a readable image file.'));
+      img.onload = () => {
+        const scale = Math.min(maxWidth / img.width, maxHeight / img.height, 1);
+        const width = Math.max(1, Math.round(img.width * scale));
+        const height = Math.max(1, Math.round(img.height * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, width, height);
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', BULK_PHOTO_JPEG_QUALITY));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+/** Accepts "1813.jpg", "1813 Abhimanyu.jpg", "adm-1813.png" and "IMG_1813.jpeg". */
+function extractAdmissionNoFromFileName(fileName) {
+  const base = String(fileName || '').replace(/\.[^.]+$/, '').trim();
+  if (/^\d+$/.test(base)) return base;
+  const leading = base.match(/^\D*(\d{2,})/);
+  if (leading) return leading[1];
+  const anywhere = base.match(/\d{2,}/);
+  return anywhere ? anywhere[0] : '';
+}
+
+function estimateDataUrlBytes(dataUrl) {
+  const base64 = String(dataUrl || '').split(',')[1] || '';
+  return Math.round(base64.length * 0.75);
+}
+
+function formatBytesShort(bytes) {
+  if (!bytes) return '0 KB';
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function openBulkStudentPhotoModal() {
+  document.getElementById('bulkPhotoModal')?.remove();
+  window._bulkPhotoQueue = [];
+
+  document.body.insertAdjacentHTML('beforeend', `
+    <div class="modal-overlay active" id="bulkPhotoModal" style="z-index:1000000; backdrop-filter:blur(6px);">
+      <div class="modal-box" style="max-width:820px; width:96%; max-height:90vh; overflow-y:auto; background:var(--card-bg, #0f172a); color:var(--text-main, #fff); border:2px solid #8b5cf6; border-radius:18px; padding:24px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border-color, #334155); padding-bottom:12px; margin-bottom:16px;">
+          <h3 style="margin:0; color:#6d28d9; display:flex; align-items:center; gap:10px;">
+            <i class="fa-solid fa-images"></i> Bulk Student Photo Upload
+          </h3>
+          <button onclick="document.getElementById('bulkPhotoModal').remove()" style="background:#334155; color:#fff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer;">X</button>
+        </div>
+
+        <div style="background:rgba(139,92,246,0.10); border:1px solid rgba(139,92,246,0.45); border-radius:12px; padding:14px 16px; margin-bottom:18px; font-size:0.86rem; line-height:1.7;">
+          <strong style="color:#6d28d9;">Real photos are not stored in cloud anymore — you must upload them again.</strong><br>
+          Name each file after admission number: <code>1813.jpg</code>, <code>1186 Harshita.jpg</code>, etc.<br>
+          Photos save to <strong>Supabase Storage</strong> (best) or cloud directly — both survive refresh on all PCs.<br>
+          You can select <strong>100+ photos at once</strong> — the app uploads them in small automatic batches (about 12 at a time).
+        </div>
+
+        <div style="background:rgba(16,185,129,0.08); border:1px solid rgba(16,185,129,0.35); border-radius:12px; padding:14px 16px; margin-bottom:18px;">
+          <strong style="color:#34d399; display:block; margin-bottom:8px;"><i class="fa-solid fa-cloud-arrow-down"></i> Restore from old ERP (fastest for all students)</strong>
+          <div style="font-size:0.84rem; line-height:1.65; color:#cbd5e1; margin-bottom:10px;">
+            1. Log in to <strong>madanmohanmalviyaschool.com</strong> → student list → F12 Console → run <code>old_erp_browser_photo_manifest.js</code><br>
+            2. Upload the CSV here (columns: AdmissionNo, PhotoUrl). Server downloads each photo into Supabase Storage.
+          </div>
+          <input type="file" id="oldErpPhotoCsvInput" accept=".csv,text/csv" class="session-dropdown" style="width:100%; padding:10px; margin-bottom:8px;" onchange="stageOldErpPhotoCsv(this)">
+          <input type="text" id="oldErpPhotoCookie" placeholder="Optional: old ERP session cookie if downloads fail (F12 → Network → Cookie header)" class="session-dropdown" style="width:100%; padding:10px; font-size:0.8rem;">
+          <div id="oldErpPhotoCsvStatus" style="margin-top:8px; font-size:0.84rem;"></div>
+        </div>
+
+        <label style="font-weight:800; display:block; margin-bottom:8px;">Or choose photo files from your PC</label>
+        <input type="file" id="bulkPhotoInput" accept="image/*" multiple class="session-dropdown" style="width:100%; padding:10px;" onchange="stageBulkStudentPhotos(this)">
+
+        <div id="bulkPhotoStatus" style="margin-top:16px;"></div>
+        <div id="bulkPhotoPreview" style="margin-top:14px;"></div>
+
+        <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:20px; flex-wrap:wrap;">
+          <button class="btn btn-secondary" onclick="document.getElementById('bulkPhotoModal').remove()">Cancel</button>
+          <button class="btn btn-secondary" id="oldErpPhotoImportBtn" style="background:#059669; color:#fff; border:none; display:none;" onclick="applyOldErpPhotoCsvImport()">
+            <i class="fa-solid fa-cloud-arrow-down"></i> Import from Old ERP CSV
+          </button>
+          <button class="btn btn-primary" id="bulkPhotoApplyBtn" style="background:linear-gradient(135deg, #8b5cf6 0%, #6d28d9 100%); border:none;" disabled onclick="applyStagedBulkStudentPhotos()">
+            <i class="fa-solid fa-floppy-disk"></i> Save Matched Photos
+          </button>
+        </div>
+      </div>
+    </div>`);
+}
+
+async function stageBulkStudentPhotos(input) {
+  const files = Array.from(input?.files || []);
+  const status = document.getElementById('bulkPhotoStatus');
+  const preview = document.getElementById('bulkPhotoPreview');
+  const applyBtn = document.getElementById('bulkPhotoApplyBtn');
+  if (!files.length || !status || !preview) return;
+
+  window._bulkPhotoQueue = [];
+  if (applyBtn) applyBtn.disabled = true;
+  status.innerHTML = `<div style="color:var(--text-muted);"><i class="fa-solid fa-spinner fa-spin"></i> Reading and resizing ${files.length} photo${files.length === 1 ? '' : 's'}…</div>`;
+  preview.innerHTML = '';
+
+  const rows = [];
+  for (const file of files) {
+    const admissionNo = extractAdmissionNoFromFileName(file.name);
+    const student = admissionNo ? findStudentByAdmissionNo(admissionNo) : null;
+    let dataUrl = '';
+    let error = '';
+    if (student) {
+      try {
+        dataUrl = await resizeImageFileToDataUrl(file);
+      } catch (e) {
+        error = e.message || 'Could not process image.';
+      }
+    }
+    rows.push({ fileName: file.name, admissionNo, student, dataUrl, error, originalBytes: file.size });
+  }
+
+  window._bulkPhotoQueue = rows.filter(r => r.student && r.dataUrl);
+  const unmatched = rows.filter(r => !r.student);
+  const failed = rows.filter(r => r.student && !r.dataUrl);
+  const totalBytes = window._bulkPhotoQueue.reduce((sum, r) => sum + estimateDataUrlBytes(r.dataUrl), 0);
+  const originalBytes = rows.reduce((sum, r) => sum + (r.originalBytes || 0), 0);
+
+  status.innerHTML = `
+    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+      <span class="badge badge-success">${window._bulkPhotoQueue.length} matched</span>
+      ${unmatched.length ? `<span class="badge badge-warning">${unmatched.length} no matching admission no</span>` : ''}
+      ${failed.length ? `<span class="badge badge-danger">${failed.length} unreadable</span>` : ''}
+      <span class="badge badge-info">${formatBytesShort(originalBytes)} → ${formatBytesShort(totalBytes)} after resize</span>
+    </div>`;
+
+  preview.innerHTML = `
+    <div class="data-table-container" style="max-height:340px; overflow-y:auto;">
+      <table class="data-table" style="font-size:0.82rem;">
+        <thead><tr><th style="width:60px;">Photo</th><th>File</th><th>Adm No</th><th>Matched Student</th><th>Result</th></tr></thead>
+        <tbody>
+          ${rows.map(r => `
+            <tr>
+              <td>${r.dataUrl ? `<img src="${r.dataUrl}" style="width:34px; height:44px; object-fit:cover; border-radius:4px; border:1px solid #334155;">` : '<span style="color:#64748b;">—</span>'}</td>
+              <td><small>${escapeHtml(r.fileName)}</small></td>
+              <td>${r.admissionNo ? `<span class="adm-no-chip">${escapeHtml(r.admissionNo)}</span>` : '<span style="color:#f59e0b;">none found</span>'}</td>
+              <td>${r.student
+                ? `<strong>${escapeHtml(r.student.name || '')}</strong><br><small style="color:var(--text-muted);">${escapeHtml(r.student.currentClass || '')} - ${escapeHtml(r.student.currentSection || '')}</small>`
+                : '<span style="color:var(--text-muted);">no student with this admission no</span>'}</td>
+              <td>${r.dataUrl
+                ? '<span class="badge badge-success">Ready</span>'
+                : `<span class="badge badge-warning">Skipped</span>${r.error ? `<br><small>${escapeHtml(r.error)}</small>` : ''}`}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+
+  if (applyBtn) applyBtn.disabled = window._bulkPhotoQueue.length === 0;
+}
+
+function parseOldErpPhotoCsvText(text) {
+  const lines = String(text || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const items = [];
+  lines.forEach((line, index) => {
+    const parts = line.split(',').map(part => part.trim().replace(/^"|"$/g, ''));
+    if (!parts.length) return;
+    if (index === 0 && /admission|photo|url|filename/i.test(parts[0])) return;
+    const admissionNo = String(parts[0] || '').replace(/\.0$/, '').trim();
+    const url = String(parts[1] || parts[parts.length - 1] || '').trim();
+    if (!admissionNo || !/^https?:\/\//i.test(url)) return;
+    const student = typeof findStudentByAdmissionNo === 'function' ? findStudentByAdmissionNo(admissionNo) : null;
+    items.push({ admissionNo, url, student, studentName: student?.name || '' });
+  });
+  return items;
+}
+
+async function stageOldErpPhotoCsv(input) {
+  const file = input?.files?.[0];
+  const statusEl = document.getElementById('oldErpPhotoCsvStatus');
+  const importBtn = document.getElementById('oldErpPhotoImportBtn');
+  window._oldErpPhotoImportQueue = [];
+  if (!file || !statusEl) return;
+
+  try {
+    const text = await file.text();
+    const items = parseOldErpPhotoCsvText(text);
+    const matched = items.filter(item => item.student);
+    const unmatched = items.length - matched.length;
+    window._oldErpPhotoImportQueue = matched;
+    if (importBtn) importBtn.style.display = matched.length ? 'inline-flex' : 'none';
+    statusEl.innerHTML = matched.length
+      ? `<span style="color:#34d399;">${matched.length} photo URL(s) matched to students${unmatched ? ` (${unmatched} skipped — no admission match)` : ''}.</span>`
+      : `<span style="color:#f87171;">No valid rows found. CSV needs AdmissionNo,PhotoUrl columns.</span>`;
+  } catch (err) {
+    if (importBtn) importBtn.style.display = 'none';
+    statusEl.innerHTML = `<span style="color:#f87171;">Could not read CSV: ${escapeHtml(String(err.message || err))}</span>`;
+  }
+}
+
+async function applyOldErpPhotoCsvImport() {
+  const queue = Array.isArray(window._oldErpPhotoImportQueue) ? window._oldErpPhotoImportQueue : [];
+  if (!queue.length) return showNotification('Upload a CSV from old ERP first.', 'warning');
+  if (!window.confirm(`Import ${queue.length} photo(s) from old ERP into cloud storage?\n\nDo one class CSV at a time. This may take a few minutes.`)) return;
+
+  const importBtn = document.getElementById('oldErpPhotoImportBtn');
+  const statusEl = document.getElementById('oldErpPhotoCsvStatus');
+  const cookie = String(document.getElementById('oldErpPhotoCookie')?.value || '').trim();
+
+  if (importBtn) {
+    importBtn.disabled = true;
+    importBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Importing…';
+  }
+  if (statusEl) {
+    statusEl.innerHTML = `<div style="color:#34d399;"><i class="fa-solid fa-cloud-arrow-down fa-beat"></i> Downloading ${queue.length} photo(s) from old ERP…</div>`;
+  }
+
+  try {
+    if (typeof pushBulkPhotoImportFromUrls !== 'function') {
+      throw new Error('Photo import is not available. Upload latest js/cloudSync.js and redeploy api/erp-cloud.js on Vercel.');
+    }
+    const result = await pushBulkPhotoImportFromUrls(queue, cookie);
+    const failed = Array.isArray(result.failed) ? result.failed.length : 0;
+    document.getElementById('bulkPhotoModal')?.remove();
+    showNotification(
+      `Imported ${result.imported || queue.length} real photo(s) from old ERP.${failed ? ` ${failed} failed — check cookie or URL.` : ''} Refresh to see them.`,
+      failed ? 'warning' : 'success'
+    );
+    if (String(window.location.hash || '').includes('students')) {
+      renderStudentsPage(document.getElementById('contentBody'));
+    }
+  } catch (err) {
+    console.error('Old ERP photo import failed:', err);
+    if (importBtn) {
+      importBtn.disabled = false;
+      importBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Import from Old ERP CSV';
+    }
+    if (statusEl) {
+      statusEl.innerHTML = `<div style="color:#f87171; line-height:1.6;"><strong>Import failed.</strong><br>${escapeHtml(String(err.message || err))}<br>Create Supabase bucket <code>student-photos</code> (public) and redeploy API if needed.</div>`;
+    }
+    showNotification(`Photo import failed: ${err.message || err}`, 'error');
+  }
+}
+
+function applyStagedBulkStudentPhotos() {
+  const queue = Array.isArray(window._bulkPhotoQueue) ? window._bulkPhotoQueue : [];
+  if (!queue.length) return showNotification('No photos matched an admission number.', 'warning');
+
+  const replacing = queue.filter(r => getStudentPhotoForAdmitCard(r.student)).length;
+  const confirmMsg = replacing
+    ? `Save ${queue.length} photo(s)? ${replacing} student(s) already have a photo and it will be replaced.`
+    : `Save ${queue.length} student photo(s)?`;
+  if (!window.confirm(confirmMsg)) return;
+
+  void applyStagedBulkStudentPhotosAsync(queue);
+}
+
+function formatBulkPhotoUploadProgress(progress) {
+  if (!progress) return 'Uploading photos…';
+  const modeLabel = progress.mode === 'storage' ? 'Supabase Storage' : 'cloud';
+  return `Uploading batch ${progress.batch} of ${progress.totalBatches} to ${modeLabel} (${progress.batchSize} photo${progress.batchSize === 1 ? '' : 's'} in this batch, ${progress.totalPhotos} total)…`;
+}
+
+function formatBulkPhotoSaveError(err) {
+  const msg = escapeHtml(String(err?.message || err || 'Unknown error'));
+  const lower = String(err?.message || err || '').toLowerCase();
+  if (/maximum \d+ photos|one class at a time/i.test(lower)) {
+    return `${msg}<br><br><strong>Fix:</strong> Upload the latest <code>js/cloudSync.js</code> from GitHub (it splits large uploads automatically). Hard-refresh the page (Ctrl+F5) and try again.`;
+  }
+  if (/413|payload too large|body.*limit|http 413/i.test(lower)) {
+    return `${msg}<br><br>Photos were too large for one server request. The latest app splits them automatically — update <code>cloudSync.js</code>, hard-refresh, and try again.`;
+  }
+  if (/bucket.*missing|student-photos/i.test(lower)) {
+    return `${msg}<br><br>Create a public Supabase Storage bucket named <code>student-photos</code> (see SUPABASE_PHOTO_STORAGE.md), then redeploy <code>api/erp-cloud.js</code> on Vercel.`;
+  }
+  if (/not deployed|404|cloud api not found/i.test(lower)) {
+    return `${msg}<br><br>Deploy <code>api/erp-cloud.js</code> and <code>api/mmmjhs-bot.js</code> on Vercel (Git push), not only JS files via Vercel Drop.`;
+  }
+  return msg;
+}
+
+async function applyStagedBulkStudentPhotosAsync(queue) {
+  const applyBtn = document.getElementById('bulkPhotoApplyBtn');
+  const statusEl = document.getElementById('bulkPhotoStatus');
+  const knownCloudAt = String(localStorage.getItem('MMM_ERP_CLOUD_LAST_CLOUD_AT') || '');
+  const batchCount = typeof splitPhotoUploadBatches === 'function'
+    ? splitPhotoUploadBatches(queue).length
+    : Math.max(1, Math.ceil(queue.length / 12));
+
+  saveSchoolDataToStorage({ skipCloudPush: true });
+  window._erpCloudMemoryDirty = true;
+
+  if (applyBtn) {
+    applyBtn.disabled = true;
+    applyBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving to cloud…';
+  }
+  if (statusEl) {
+    statusEl.innerHTML = `<div style="color:#6d28d9;"><i class="fa-solid fa-cloud-arrow-up fa-beat"></i> Preparing ${queue.length} photo(s) in ${batchCount} automatic batch${batchCount === 1 ? '' : 'es'}…</div>`;
+  }
+
+  const onProgress = (progress) => {
+    if (!statusEl) return;
+    statusEl.innerHTML = `<div style="color:#6d28d9;"><i class="fa-solid fa-spinner fa-spin"></i> ${escapeHtml(formatBulkPhotoUploadProgress(progress))}</div>`;
+  };
+
+  try {
+    let savedAt = '';
+    let usedStorage = false;
+    let usedCloudPatch = false;
+    let storageErr = null;
+    let patchErr = null;
+
+    if (typeof pushBulkStudentPhotosToSupabaseStorage === 'function') {
+      try {
+        const storageResult = await pushBulkStudentPhotosToSupabaseStorage(queue, { onProgress });
+        savedAt = String(storageResult?.savedAt || window._erpCloudLastPushAt || '').trim();
+        usedStorage = true;
+      } catch (err) {
+        storageErr = err;
+        console.warn('Supabase Storage upload failed:', err);
+        if (!isPhotoApiUnavailableError(err)) {
+          throw err;
+        }
+      }
+    }
+
+    if (!usedStorage && typeof pushBulkStudentPhotosToCloud === 'function') {
+      try {
+        queue.forEach(row => {
+          row.student.photo = row.dataUrl;
+          row.student.photoDataUrl = row.dataUrl;
+        });
+        const patchResult = await pushBulkStudentPhotosToCloud(queue, { onProgress });
+        savedAt = String(patchResult?.savedAt || window._erpCloudLastPushAt || '').trim();
+        usedCloudPatch = true;
+      } catch (err) {
+        patchErr = err;
+        console.warn('Cloud photo patch failed:', err);
+        if (!isPhotoApiUnavailableError(err)) {
+          throw err;
+        }
+      }
+    }
+
+    if (!usedStorage && !usedCloudPatch) {
+      const fallbackReason = storageErr?.message || patchErr?.message || 'Photo API not available on server.';
+      queue.forEach(row => {
+        const assetPath = studentPhotoAssetPath(row.student.admissionNo);
+        row.assetPath = assetPath;
+        row.student.photo = assetPath;
+        row.student.photoDataUrl = assetPath;
+      });
+
+      if (statusEl) {
+        statusEl.innerHTML = `<div style="color:#f59e0b;"><i class="fa-solid fa-triangle-exclamation"></i> Photo API unavailable (${escapeHtml(String(fallbackReason))}). Saving file links only…</div>`;
+      }
+
+      let pushResult = null;
+      if (typeof pushStaffAuthorityToCloud === 'function') {
+        pushResult = await pushStaffAuthorityToCloud();
+      } else if (typeof pushSchoolDataToCloud === 'function') {
+        pushResult = await pushSchoolDataToCloud({ skipMergePull: true });
+      } else {
+        throw new Error('Cloud sync is not available on this page.');
+      }
+
+      savedAt = String(pushResult?.savedAt || window._erpCloudLastPushAt || '').trim();
+      if (!pushResult?.ok || !savedAt) {
+        throw new Error('Cloud did not confirm the save. Deploy api/erp-cloud.js on Vercel for automatic photo storage.');
+      }
+    }
+
+    if (knownCloudAt && savedAt && savedAt === knownCloudAt && !usedStorage && !usedCloudPatch) {
+      throw new Error('Cloud timestamp did not change — photos were not saved. Try again or contact admin.');
+    }
+
+    await cacheStudentPhotosLocally(queue);
+
+    if (usedStorage) {
+      document.getElementById('bulkPhotoModal')?.remove();
+      showNotification(`Saved ${queue.length} real photo(s) to Supabase Storage. Refresh is safe — all PCs will see them.`, 'success');
+    } else if (usedCloudPatch) {
+      document.getElementById('bulkPhotoModal')?.remove();
+      showNotification(`Saved ${queue.length} real photo(s) to cloud. Refresh is safe — all PCs will see them.`, 'success');
+    } else {
+      if (statusEl) {
+        statusEl.innerHTML = `<div style="color:#34d399;"><i class="fa-solid fa-file-zipper"></i> Cloud saved. Preparing ZIP download…</div>`;
+      }
+      await downloadStudentPhotosAssetZip(queue);
+      document.getElementById('bulkPhotoModal')?.remove();
+      showNotification(
+        `Photos saved on this PC and will show here after refresh. Cloud has file links only — upload the downloaded ZIP folder to assets/students/ on Vercel for all PCs, OR deploy api/erp-cloud.js for automatic Supabase Storage.`,
+        'warning'
+      );
+    }
+
+    window._bulkPhotoQueue = [];
+    if (String(window.location.hash || '').includes('students')) {
+      renderStudentsPage(document.getElementById('contentBody'));
+    }
+  } catch (err) {
+    console.error('Bulk photo cloud save failed:', err);
+    if (applyBtn) {
+      applyBtn.disabled = false;
+      applyBtn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> Save Matched Photos';
+    }
+    if (statusEl) {
+      statusEl.innerHTML = `<div style="color:#f87171; line-height:1.6;"><strong>Save failed.</strong><br>${formatBulkPhotoSaveError(err)}</div>`;
+    }
+    showNotification(`Photo save failed: ${err.message || err}`, 'error');
+  }
+}
+
+function canCurrentUserReactivateStudents() {
+  const role = String(getCurrentActiveUser()?.role || '').toLowerCase().trim();
+  return role.includes('super admin') || role.includes('principal');
+}
+
+/** Return a left/inactive student to the active roster for the current session. */
+async function recoverLeftStudentsFromTcRegister() {
+  if (!canCurrentUserReactivateStudents()) {
+    showNotification('Only Super Admin or Principal can recover roster records.', 'warning');
+    return;
+  }
+  if (!window.confirm('Restore left/inactive students from the permanent cloud TC register?\n\nThis re-links issued transfer certificates to student records. It cannot recreate deleted staff logins.')) {
+    return;
+  }
+  try {
+    const result = await callErpSecurityApi('recoverFromTcRegister', { method: 'POST', body: {} });
+    if (typeof pullSchoolDataFromCloud === 'function') {
+      await pullSchoolDataFromCloud({ force: true });
+    } else if (typeof window.pullSchoolDataFromCloud === 'function') {
+      await window.pullSchoolDataFromCloud({ force: true });
+    }
+    showNotification(
+      `TC recovery done: ${result.tcCount || 0} certificate(s), ${result.restored || 0} student(s) re-added, ${result.markedLeft || 0} marked left.`,
+      'success'
+    );
+    if (String(window.location.hash || '').includes('left-students')) {
+      renderLeftStudentsPage(document.getElementById('contentBody'));
+    } else if (String(window.location.hash || '').includes('tc-register')) {
+      renderTcRegisterPage(document.getElementById('contentBody'));
+    }
+  } catch (error) {
+    showNotification(`TC recovery failed: ${error.message || error}`, 'error');
+  }
+}
+
+/** Return a left/inactive student to the active roster for the current session. */
+async function reactivateInactiveStudent(admissionNo) {
+  if (!canCurrentUserReactivateStudents()) {
+    showNotification('Only Super Admin or Principal can bring back inactive students.', 'warning');
+    return;
+  }
+
+  const student = findStudentByAdmissionNo(admissionNo);
+  if (!student) {
+    showNotification('Student record not found in this device roster.', 'error');
+    return;
+  }
+  if (isStudentActiveForRoster(student)) {
+    showNotification(`${student.name} is already active in the roster.`, 'info');
+    return;
+  }
+
+  const session = SchoolData.activeSession || '2026-27';
+  const cls = student.currentClass || student.class || 'Class 5';
+  const sec = student.currentSection || student.section || 'A';
+  const hadTc = !!(student.tcCertificateNo || student.tcNo);
+
+  let confirmMsg = `Bring back ${student.name} (Adm ${student.admissionNo}) to the active roster?\n\nThey will reappear in class lists, attendance, fees, exams and admit cards for Session ${session} (${cls} - ${sec}).`;
+  if (hadTc) {
+    confirmMsg += `\n\nNote: An issued TC (${student.tcCertificateNo || student.tcNo}) stays on the permanent cloud register. Reactivating does not cancel it.`;
+  }
+  if (!window.confirm(confirmMsg)) return;
+
+  const before = JSON.parse(JSON.stringify(student));
+  student.status = 'Active';
+  delete student.leftAt;
+  if (!student.sessionDetails) student.sessionDetails = {};
+  if (!student.sessionDetails[session]) {
+    student.sessionDetails[session] = {
+      class: cls,
+      section: sec,
+      rollNo: student.currentRollNo || student.rollNo || '',
+      status: 'Active'
+    };
+  } else {
+    student.sessionDetails[session].status = 'Active';
+    if (!student.sessionDetails[session].class) student.sessionDetails[session].class = cls;
+    if (!student.sessionDetails[session].section) student.sessionDetails[session].section = sec;
+  }
+
+  try {
+    await persistStudentMasterDelta([buildStudentMasterRecord(student, {
+      action: 'reactivate', originalAdmissionNo: admissionNo,
+      sessionPatches: { [session]: student.sessionDetails[session] }
+    })], `${student.name} is active again in Session ${session}.`);
+  } catch (error) {
+    Object.keys(student).forEach(key => { delete student[key]; });
+    Object.assign(student, before);
+    throw error;
+  }
+  if (String(window.location.hash || '').includes('left-students')) {
+    renderLeftStudentsPage(document.getElementById('contentBody'));
+  } else if (String(window.location.hash || '').includes('tc-register')) {
+    loadTcRegisterIntoPage();
+  }
+}
+
 function renderLeftStudentsPage(container) {
   const students = getLeftStudents();
   const currentSession = SchoolData.activeSession || '2026-27';
+  const canReactivate = canCurrentUserReactivateStudents();
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-user-clock" style="color:#f59e0b"></i> Left / Inactive Students</h2>
         <p class="page-subtitle">Historical records remain in the cloud. Fees, receipts, marks, report cards and issued TCs are preserved.</p>
       </div>
-      <button class="btn btn-primary" onclick="window.location.hash='students'"><i class="fa-solid fa-users"></i> Active Students</button>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" style="background:#0284c7; color:#fff; border:none; font-weight:800;" onclick="window.location.hash='tc-register'"><i class="fa-solid fa-file-shield"></i> TC Register (Cloud)</button>
+        ${canReactivate ? `<button class="btn btn-secondary" style="background:#7c3aed; color:#fff; border:none; font-weight:800;" onclick="recoverLeftStudentsFromTcRegister()"><i class="fa-solid fa-rotate"></i> Recover from TC Register</button>` : ''}
+        <button class="btn btn-primary" onclick="window.location.hash='students'"><i class="fa-solid fa-users"></i> Active Students</button>
+      </div>
     </div>
     <div class="glass-card">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; gap:12px; flex-wrap:wrap;">
         <input type="text" id="leftStudentSearchInput" placeholder="Search name, admission or certificate no…" class="session-dropdown" style="width:340px;" onkeyup="filterLeftStudentsTable()">
         <span class="badge badge-warning">${students.length} left / inactive record${students.length === 1 ? '' : 's'}</span>
       </div>
+      <div id="leftStudentsCloudTcNotice" style="margin-bottom:14px;"></div>
       <div class="data-table-container">
         <table class="data-table" id="leftStudentsTable">
           <thead><tr><th>Student</th><th>Admission</th><th>Last Class</th><th>Left / TC Details</th><th>Fee Record</th><th>Actions</th></tr></thead>
           <tbody>
             ${students.length ? students.map(student => {
-              const fee = student.currentFeeInfo || {};
-              const dueMonths = Array.isArray(fee.dueMonths) ? fee.dueMonths : [];
-              const dueAmount = (dueMonths.length * getStudentMonthlyTuitionRate(student)) + Number(fee.previousSessionDue || 0) + Number(student.partialDue || 0);
+              const dueAmount = getStudentTotalDueAmount(student);
               const tcNo = student.tcCertificateNo || student.tcNo || '';
               const searchable = `${student.name || ''} ${student.admissionNo || ''} ${tcNo}`.toLowerCase();
               return `
@@ -8629,6 +12091,7 @@ function renderLeftStudentsPage(container) {
                   <td>${tcNo ? `<strong>${escapeHtml(tcNo)}</strong><br>` : ''}<small>${student.leftAt ? formatErpDateTime(student.leftAt) : 'Historical record'}</small><br><small>${escapeHtml(student.leftReason || '')}</small></td>
                   <td>${dueAmount > 0 ? `<span class="badge badge-danger">Due: Rs ${dueAmount.toLocaleString('en-IN')}</span>` : '<span class="badge badge-success">No recorded due</span>'}</td>
                   <td><div style="display:flex; gap:6px; flex-wrap:wrap;">
+                    ${canReactivate ? `<button class="btn btn-primary" style="padding:5px 9px; background:linear-gradient(135deg,#10b981,#059669); border:none;" onclick="reactivateInactiveStudent('${student.admissionNo}')" title="Return to active roster"><i class="fa-solid fa-user-check"></i> Bring Back</button>` : ''}
                     <button class="btn btn-secondary" style="padding:5px 9px;" onclick="openStudentProfile('${student.admissionNo}')"><i class="fa-solid fa-eye"></i> Profile</button>
                     <button class="btn btn-secondary" style="padding:5px 9px; color:#34d399;" onclick="openCollectFeeModal('${student.admissionNo}')"><i class="fa-solid fa-receipt"></i> Fees</button>
                     <button class="btn btn-primary" style="padding:5px 9px;" onclick="reprintIssuedTransferCertificate('${student.admissionNo}')"><i class="fa-solid fa-qrcode"></i> Issued TC</button>
@@ -8639,11 +12102,190 @@ function renderLeftStudentsPage(container) {
         </table>
       </div>
     </div>`;
+
+  flagCloudTcHoldersMissingFromRoster();
 }
 
 function filterLeftStudentsTable() {
   const query = String(document.getElementById('leftStudentSearchInput')?.value || '').trim().toLowerCase();
   document.querySelectorAll('#leftStudentsTable .left-student-row').forEach(row => {
+    row.style.display = !query || String(row.getAttribute('data-search') || '').includes(query) ? '' : 'none';
+  });
+}
+
+/* ============================================================================
+   TRANSFER CERTIFICATE REGISTER (permanent cloud record)
+   ============================================================================ */
+
+/** Issued TCs live in their own append-only cloud table, so they outlive roster edits and CSV re-imports. */
+async function fetchIssuedTcRegister() {
+  const result = await callErpSecurityApi('tcList', {
+    method: 'GET',
+    query: { sessionToken: getErpSessionToken() }
+  });
+  return Array.isArray(result.certificates) ? result.certificates : [];
+}
+
+function getTcSnapshotField(certificate, ...keys) {
+  const snapshot = certificate?.student_snapshot || certificate?.studentSnapshot || {};
+  for (const key of keys) {
+    const value = certificate?.[key] ?? snapshot?.[key];
+    if (value !== undefined && value !== null && String(value).trim() !== '') return String(value);
+  }
+  return '';
+}
+
+/**
+ * A TC in the cloud whose student is no longer in the roster means the roster was
+ * replaced (usually a CSV re-import). Say so plainly instead of silently hiding the record.
+ */
+async function flagCloudTcHoldersMissingFromRoster() {
+  const host = document.getElementById('leftStudentsCloudTcNotice');
+  if (!host) return;
+  let certificates = [];
+  try {
+    certificates = await fetchIssuedTcRegister();
+  } catch (error) {
+    host.innerHTML = `<div style="padding:10px 14px; border-radius:10px; background:rgba(148,163,184,0.12); border:1px solid rgba(148,163,184,0.35); font-size:0.82rem; color:var(--text-muted);">
+      Could not read the cloud TC register right now (${escapeHtml(error.message || 'network error')}). Issued certificates are still stored in the cloud.
+    </div>`;
+    return;
+  }
+
+  const rosterAdmissions = new Set((SchoolData.students || []).map(s => normalizeAdmissionLookup(s.admissionNo)));
+  const orphans = certificates.filter(c => !rosterAdmissions.has(normalizeAdmissionLookup(c.admission_no || c.admissionNo)));
+
+  if (!certificates.length) {
+    host.innerHTML = '';
+    return;
+  }
+
+  host.innerHTML = `
+    <div style="padding:12px 14px; border-radius:10px; background:rgba(2,132,199,0.12); border:1px solid rgba(2,132,199,0.45); font-size:0.85rem; color:var(--text-main);">
+      <strong>${certificates.length}</strong> transfer certificate${certificates.length === 1 ? '' : 's'} on permanent cloud record.
+      ${orphans.length ? `<span style="color:#f59e0b; font-weight:700;">${orphans.length} belong${orphans.length === 1 ? 's' : ''} to student${orphans.length === 1 ? '' : 's'} no longer in this session's roster</span> — the certificate is still valid and reprintable.` : 'All of them match a student in the current roster.'}
+      <a href="#tc-register" style="color:#0284c7; font-weight:700; margin-left:6px;">Open TC Register</a>
+    </div>`;
+}
+
+function renderTcRegisterPage(container) {
+  container.innerHTML = `
+    <div class="page-header">
+      <div>
+        <h2 class="page-title"><i class="fa-solid fa-file-shield" style="color:#0284c7"></i> Transfer Certificate Register</h2>
+        <p class="page-subtitle">Every TC ever issued, read straight from the permanent cloud record. Roster edits and CSV re-imports cannot remove these.</p>
+      </div>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="renderTcRegisterPage(document.getElementById('contentBody'))"><i class="fa-solid fa-rotate"></i> Reload</button>
+        ${canCurrentUserReactivateStudents() ? `<button class="btn btn-secondary" style="background:#7c3aed; color:#fff; border:none; font-weight:800;" onclick="recoverLeftStudentsFromTcRegister()"><i class="fa-solid fa-user-clock"></i> Recover Left Students</button>` : ''}
+        <button class="btn btn-primary" onclick="window.location.hash='left-students'"><i class="fa-solid fa-user-clock"></i> Left / Inactive Students</button>
+      </div>
+    </div>
+    <div class="glass-card">
+      <div id="tcRegisterBody" style="padding:24px; text-align:center; color:var(--text-muted);">
+        <i class="fa-solid fa-spinner fa-spin"></i> Reading the cloud TC register…
+      </div>
+    </div>`;
+
+  loadTcRegisterIntoPage();
+}
+
+async function loadTcRegisterIntoPage() {
+  const host = document.getElementById('tcRegisterBody');
+  if (!host) return;
+
+  let certificates = [];
+  try {
+    certificates = await fetchIssuedTcRegister();
+  } catch (error) {
+    host.innerHTML = `<div style="padding:24px; text-align:center;">
+      <p style="color:#f87171; font-weight:700; margin:0 0 8px 0;">Could not load the TC register.</p>
+      <p style="color:var(--text-muted); font-size:0.85rem; margin:0;">${escapeHtml(error.message || 'Network error')}</p>
+      <p style="color:var(--text-muted); font-size:0.8rem; margin:10px 0 0 0;">Sign in again if your session expired. Certificates are never deleted by this screen.</p>
+    </div>`;
+    return;
+  }
+
+  if (!certificates.length) {
+    host.innerHTML = `<div style="padding:30px; text-align:center; color:var(--text-muted);">
+      No transfer certificate has been issued yet. Issue one from a student profile and it will appear here permanently.
+    </div>`;
+    return;
+  }
+
+  const revokedCount = certificates.filter(c => String(c.status || '').toLowerCase() !== 'valid').length;
+  const canReactivate = canCurrentUserReactivateStudents();
+
+  host.innerHTML = `
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; gap:12px; flex-wrap:wrap;">
+      <input type="text" id="tcRegisterSearchInput" placeholder="Search name, admission or certificate no…" class="session-dropdown" style="width:340px;" onkeyup="filterTcRegisterTable()">
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <span class="badge badge-info">${certificates.length} issued</span>
+        ${revokedCount ? `<span class="badge badge-danger">${revokedCount} revoked</span>` : ''}
+      </div>
+    </div>
+    <div class="data-table-container">
+      <table class="data-table" id="tcRegisterTable">
+        <thead>
+          <tr>
+            <th>Certificate No</th>
+            <th>Student</th>
+            <th>Adm No</th>
+            <th>Session</th>
+            <th>Issued On</th>
+            <th>Issued By</th>
+            <th>Status</th>
+            <th style="text-align:center;">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${certificates.map(c => {
+            const adm = getTcSnapshotField(c, 'admission_no', 'admissionNo');
+            const name = getTcSnapshotField(c, 'name', 'student_name', 'studentName') || '(name not recorded)';
+            const cls = getTcSnapshotField(c, 'currentClass', 'class');
+            const sec = getTcSnapshotField(c, 'currentSection', 'section');
+            const certNo = getTcSnapshotField(c, 'certificate_no', 'certificateNo');
+            const session = getTcSnapshotField(c, 'academic_session', 'academicSession');
+            const issuedBy = getTcSnapshotField(c, 'issued_by_name', 'issuedByName') || '—';
+            const isValid = String(c.status || 'valid').toLowerCase() === 'valid';
+            const rosterStudent = findStudentByAdmissionNo(adm);
+            const inRoster = !!rosterStudent;
+            const isLeft = rosterStudent && !isStudentActiveForRoster(rosterStudent);
+            const searchable = `${name} ${adm} ${certNo}`.toLowerCase();
+            return `
+              <tr class="tc-register-row" data-search="${escapeHtml(searchable)}">
+                <td><code style="color:#6d28d9; font-weight:800;">${escapeHtml(certNo)}</code></td>
+                <td>
+                  <strong>${escapeHtml(name)}</strong>
+                  ${cls ? `<br><small style="color:var(--text-muted);">${escapeHtml(cls)}${sec ? ` - ${escapeHtml(sec)}` : ''}</small>` : ''}
+                  ${!inRoster ? '<br><span class="badge badge-warning" style="font-size:0.68rem;">student record missing from roster</span>' : ''}
+                  ${isLeft ? '<br><span class="badge badge-warning" style="font-size:0.68rem;">left / inactive — can be brought back</span>' : ''}
+                </td>
+                <td><span class="adm-no-chip">${escapeHtml(adm)}</span></td>
+                <td>${escapeHtml(session)}</td>
+                <td><small>${escapeHtml(formatErpDateTime(c.issued_at || c.issuedAt))}</small></td>
+                <td><small>${escapeHtml(issuedBy)}</small></td>
+                <td>${isValid
+                  ? '<span class="badge badge-success">Valid</span>'
+                  : `<span class="badge badge-danger">Revoked</span>${c.revoked_at ? `<br><small>${escapeHtml(formatErpDateTime(c.revoked_at))}</small>` : ''}`}</td>
+                <td style="text-align:center;">
+                  <div style="display:flex; gap:6px; justify-content:center; flex-wrap:wrap;">
+                    ${isLeft && canReactivate ? `<button class="btn btn-primary" style="padding:5px 10px; font-size:0.75rem; background:linear-gradient(135deg,#10b981,#059669); border:none;" onclick="reactivateInactiveStudent('${escapeHtml(adm)}')"><i class="fa-solid fa-user-check"></i> Bring Back</button>` : ''}
+                    <button class="btn btn-primary" style="padding:5px 10px; font-size:0.75rem;" onclick="reprintIssuedTransferCertificate('${escapeHtml(adm)}')">
+                      <i class="fa-solid fa-print"></i> Reprint
+                    </button>
+                  </div>
+                </td>
+              </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>`;
+}
+
+function filterTcRegisterTable() {
+  const query = String(document.getElementById('tcRegisterSearchInput')?.value || '').trim().toLowerCase();
+  document.querySelectorAll('#tcRegisterTable .tc-register-row').forEach(row => {
     row.style.display = !query || String(row.getAttribute('data-search') || '').includes(query) ? '' : 'none';
   });
 }
@@ -8731,7 +12373,7 @@ function openEditStudentModal(admissionNo) {
     <div class="modal-overlay active" id="editStudentModal" style="z-index:99999; backdrop-filter:blur(8px);">
       <div class="modal-box" style="max-width:680px; width:95%; background:#0f172a; color:#ffffff; padding:24px; border-radius:20px; border:2px solid #38bdf8; box-shadow:0 25px 50px -12px rgba(0,0,0,0.85);">
         <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; padding-bottom:14px; margin-bottom:16px;">
-          <h3 style="margin:0; color:#38bdf8; font-size:1.2rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+          <h3 style="margin:0; color:#0284c7; font-size:1.2rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
             <i class="fa-solid fa-user-pen"></i> Edit Student Profile: ${student.name} (Adm: ${student.admissionNo})
           </h3>
           <button onclick="document.getElementById('editStudentModal').remove()" style="background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer; font-size:1rem;">X</button>
@@ -8740,62 +12382,67 @@ function openEditStudentModal(admissionNo) {
         <div style="display:flex; flex-direction:column; gap:14px; max-height:480px; overflow-y:auto; padding-right:6px;">
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
             <div>
-              <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Admission Number *</label>
-              <input type="text" id="editStudAdmissionNo" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px; font-weight:800; color:#38bdf8;" value="${student.admissionNo || ''}" placeholder="Real school register no.">
+              <label style="font-size:0.82rem; font-weight:700; color:#374151;">Admission Number *</label>
+              <input type="text" id="editStudAdmissionNo" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px; font-weight:800; color:#0284c7;" value="${student.admissionNo || ''}" placeholder="Real school register no.">
             </div>
             <div>
-              <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Student Full Name *</label>
+              <label style="font-size:0.82rem; font-weight:700; color:#374151;">Student Full Name *</label>
               <input type="text" id="editStudName" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" value="${student.name || ''}">
             </div>
             <div>
-              <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Father Name *</label>
+              <label style="font-size:0.82rem; font-weight:700; color:#374151;">Father Name *</label>
               <input type="text" id="editStudFather" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" value="${student.parentName || ''}">
             </div>
             <div>
-              <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Mother Name</label>
+              <label style="font-size:0.82rem; font-weight:700; color:#374151;">Mother Name</label>
               <input type="text" id="editStudMother" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" value="${student.motherName || ''}">
             </div>
             <div>
-              <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Date of Birth (DOB)</label>
-              <input type="date" id="editStudDob" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" value="${formatDobForDateInput(student.dob)}">
+              <label style="font-size:0.82rem; font-weight:700; color:#374151;">Date of Birth (DOB)</label>
+              <input type="date" id="editStudDob" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" value="${formatDobForDateInput(studentDobRaw(student))}">
             </div>
             <div>
-              <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Parent Mobile Phone *</label>
+              <label style="font-size:0.82rem; font-weight:700; color:#374151;">Parent Mobile Phone *</label>
               <input type="text" id="editStudPhone" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" value="${student.parentPhone || ''}">
             </div>
             <div>
-              <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">School Bot Chat ID</label>
+              <label style="font-size:0.82rem; font-weight:700; color:#374151;">School Bot Chat ID</label>
               <input type="text" id="editStudTelegram" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" value="${getStudentSchoolChatId(student)}">
             </div>
             <div>
-              <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">NFC Card UID</label>
+              <label style="font-size:0.82rem; font-weight:700; color:#374151;">PEN (Permanent Education No.)</label>
+              <input type="text" id="editStudPen" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" value="${student.pen || student.PEN || ''}" placeholder="Enter Permanent Education No.">
+            </div>
+            <div>
+              <label style="font-size:0.82rem; font-weight:700; color:#374151;">NFC Card UID</label>
               <input type="text" id="editStudNfcUid" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" value="${student.nfcUid || ''}" placeholder="Leave blank if no card assigned">
             </div>
             <div>
-              <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Class</label>
+              <label style="font-size:0.82rem; font-weight:700; color:#374151;">Class</label>
               <input type="text" id="editStudClass" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" value="${student.currentClass || student.class || 'Class 5'}">
             </div>
             <div>
-              <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Section</label>
+              <label style="font-size:0.82rem; font-weight:700; color:#374151;">Section</label>
               <input type="text" id="editStudSection" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" value="${student.currentSection || student.section || 'A'}">
             </div>
           </div>
 
           <div>
-            <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Residential Address</label>
+            <label style="font-size:0.82rem; font-weight:700; color:#374151;">Residential Address</label>
             <input type="text" id="editStudAddress" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" value="${student.address || ''}">
           </div>
 
           <div>
-            <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Photo Image URL</label>
+            <label style="font-size:0.82rem; font-weight:700; color:#374151;">Photo Image URL</label>
             <input type="text" id="editStudPhoto" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" value="${student.photo || ''}">
           </div>
 
           <div style="display:flex; gap:12px; align-items:center; background:#111827; padding:12px; border-radius:10px; border:1px solid #334155;">
-            <img id="editStudPhotoPreview" src="${student.photo || 'https://images.unsplash.com/photo-1544717305-2782549b5136?w=150'}" style="width:58px; height:58px; border-radius:50%; object-fit:cover; border:2px solid #38bdf8;">
-            <div style="flex:1;">
-              <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Upload Student Profile Picture</label>
+            <div id="editStudPhotoPreview">${getStudentDirectoryPhotoHtml(student, 58)}</div>
+            <div style="flex:1; display:flex; flex-direction:column; gap:6px;">
+              <label style="font-size:0.82rem; font-weight:700; color:#374151;">Upload Student Profile Picture</label>
               <input type="file" id="editStudPhotoFile" accept="image/*" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" onchange="previewSelectedImage(this, 'editStudPhotoPreview')">
+              ${(student.photo || student.photoDataUrl) ? `<button onclick="clearStudentPhoto('${student.admissionNo}')" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem; color:#ef4444; border-color:#ef4444; background:none; cursor:pointer; width:fit-content;">❌ Clear Photo</button>` : ''}
             </div>
           </div>
         </div>
@@ -8828,6 +12475,7 @@ async function saveEditedStudentDetails(admissionNo) {
   const dob = document.getElementById('editStudDob')?.value.trim();
   const phone = document.getElementById('editStudPhone')?.value.trim();
   const telegram = document.getElementById('editStudTelegram')?.value.trim();
+  const pen = document.getElementById('editStudPen')?.value.trim();
   const nfcUid = document.getElementById('editStudNfcUid')?.value.trim();
   const cls = document.getElementById('editStudClass')?.value.trim();
   const sec = document.getElementById('editStudSection')?.value.trim();
@@ -8846,20 +12494,19 @@ async function saveEditedStudentDetails(admissionNo) {
     return;
   }
 
+  const before = JSON.parse(JSON.stringify(student));
+  ensureStudentMasterId(student, admissionNo);
   student.admissionNo = newAdmissionNo;
   student.name = name;
   student.parentName = father;
   student.motherName = mother;
-  student.dob = dob ? formatDobToDDMMYYYY(dob) : student.dob;
+  student.dob = dob ? formatDobToDDMMYYYY(dob) : formatStudentDob(student);
+  if (!student.dob || student.dob === 'N/A') student.dob = studentDobRaw(student);
+  student.dateOfBirth = student.dob;
   student.parentPhone = phone || student.parentPhone;
   setStudentSchoolChatId(student, telegram || '');
-  if (nfcUid) {
-    SchoolData.students.forEach(other => {
-      if (other !== student && normalizeUid(other.nfcUid) === normalizeUid(nfcUid)) {
-        other.nfcUid = '';
-      }
-    });
-  }
+  student.pen = pen || '';
+  student.PEN = pen || '';
   student.nfcUid = nfcUid || '';
   student.currentClass = cls || student.currentClass;
   student.class = cls || student.class;
@@ -8867,43 +12514,67 @@ async function saveEditedStudentDetails(admissionNo) {
   student.section = sec || student.section;
   student.address = addr || student.address;
   const photoFile = document.getElementById('editStudPhotoFile')?.files?.[0];
+  let compressedPhoto = '';
   if (photoFile) {
-    student.photo = await fileToDataUrl(photoFile);
+    compressedPhoto = await compressImageToDataUrl(photoFile, 200, 200);
   } else {
     student.photo = photo || '';
   }
 
-  saveSchoolDataToStorage();
-  const modal = document.getElementById('editStudentModal');
-  if (modal) modal.remove();
-
-  showNotification(`Done: Student details for "${name}" updated successfully!`, 'success');
+  try {
+    await persistStudentMasterDelta([buildStudentMasterRecord(student, { originalAdmissionNo: admissionNo })], `Student details for "${name}" updated.`);
+  } catch (error) {
+    Object.keys(student).forEach(key => { delete student[key]; });
+    Object.assign(student, before);
+    throw error;
+  }
+  if (compressedPhoto) {
+    try {
+      if (typeof pushBulkStudentPhotosToSupabaseStorage !== 'function') throw new Error('Protected student photo upload is unavailable.');
+      await pushBulkStudentPhotosToSupabaseStorage([{ student, dataUrl: compressedPhoto }]);
+      showNotification('Student photo saved to protected cloud storage.', 'success');
+    } catch (error) {
+      showNotification(`Student details are safe, but the photo was not uploaded: ${error?.message || 'retry the photo later.'}`, 'warning');
+    }
+  }
+  document.getElementById('editStudentModal')?.remove();
 
   if (document.getElementById('contentBody')) {
     renderStudentsPage(document.getElementById('contentBody'));
   }
 }
 
-function deleteStudentRecord(admissionNo) {
+async function deleteStudentRecord(admissionNo) {
   const student = SchoolData.students.find(s => s.admissionNo === admissionNo);
   if (!student) return;
 
   if (!confirm(`Are you sure you want to delete student record "${student.name}" (Adm: ${admissionNo})?`)) return;
 
-  SchoolData.students = SchoolData.students.filter(s => s.admissionNo !== admissionNo);
-  saveSchoolDataToStorage();
-
-  const modal = document.getElementById('editStudentModal');
-  if (modal) modal.remove();
-
-  showNotification(` Deleted student record "${student.name}"!`, 'warning');
+  const before = JSON.parse(JSON.stringify(student));
+  student.status = 'Deleted';
+  student.leftAt = new Date().toISOString();
+  student.leftReason = 'Soft-deleted from Student Directory';
+  try {
+    await persistStudentMasterDelta([buildStudentMasterRecord(student, {
+      action: 'delete', originalAdmissionNo: admissionNo
+    })], `Student record "${student.name}" moved to inactive history.`);
+  } catch (error) {
+    Object.keys(student).forEach(key => { delete student[key]; });
+    Object.assign(student, before);
+    throw error;
+  }
+  document.getElementById('editStudentModal')?.remove();
 
   if (document.getElementById('contentBody')) {
     renderStudentsPage(document.getElementById('contentBody'));
   }
 }
 
-function wipeFakeMockEntriesAndReset() {
+async function wipeFakeMockEntriesAndReset() {
+  if (typeof isErpCloudOnly === 'function' && isErpCloudOnly()) {
+    showNotification('Mock-data reset is disabled in the live Cloud ERP to protect real students and fee records.', 'warning');
+    return;
+  }
   if (!confirm("Are you sure you want to wipe fake mock entries and reset to a clean database for Madan Mohan Malviya School?")) return;
 
   // Clean, realistic initial dataset
@@ -8962,9 +12633,7 @@ function wipeFakeMockEntriesAndReset() {
   ];
 
   SchoolData.telegramLogs = [];
-  saveSchoolDataToStorage();
-
-  showNotification("Cleaned: Database Wiped & Reset to Clean Fresh State!", "success");
+  await persistErpCloudSave('Database reset saved.');
   if (document.getElementById('contentBody')) {
     renderStudentsPage(document.getElementById('contentBody'));
   }
@@ -8990,10 +12659,10 @@ function openBulkStudentCsvModal() {
       <div class="modal-box keyboard-scroll-panel" tabindex="0" style="max-width:700px; width:calc(100vw - 28px); max-height:calc(100vh - 28px); overflow-y:auto; background:#0f172a; color:#ffffff; padding:24px; border-radius:18px; border:2px solid #10b981; box-shadow:0 25px 50px -12px rgba(0,0,0,0.8); position:relative;">
         <button onclick="document.getElementById('bulkStudentCsvModal').remove()" style="position:absolute; top:14px; right:16px; background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; font-size:1.1rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">X</button>
 
-        <h3 style="margin:0 0 4px 0; color:#34d399; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+        <h3 style="margin:0 0 4px 0; color:#047857; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
           <i class="fa-solid fa-file-csv"></i> Bulk Import Students via CSV File
         </h3>
-        <p style="margin:0 0 16px 0; font-size:0.82rem; color:#cbd5e1;">Import your school register CSV with columns: <strong>Date Of Admission, PEN, Caste, AdmissionNo, Name, Father Name, Mother Name, Class, Section, Address</strong> into Session ${currentSession}.</p>
+        <p style="margin:0 0 16px 0; font-size:0.82rem; color:#374151;">Import your school register CSV with columns: <strong>Date Of Admission, PEN, Caste, AdmissionNo, Name, Father Name, Mother Name, Class, Section, Address</strong> into Session ${currentSession}.</p>
 
         <!-- DOWNLOAD SAMPLE TEMPLATE BAR -->
         <div style="background:#1e293b; padding:12px 16px; border-radius:10px; border:1px solid #334155; margin-bottom:16px; display:flex; justify-content:space-between; align-items:center;">
@@ -9021,7 +12690,7 @@ function openBulkStudentCsvModal() {
         <!-- LIVE PREVIEW CONTAINER -->
         <div id="csvPreviewContainer" style="display:none; margin-bottom:16px;">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-            <h4 style="margin:0; font-size:0.85rem; color:#38bdf8;" id="csvPreviewTitle">Ready to Import</h4>
+            <h4 style="margin:0; font-size:0.85rem; color:#0284c7;" id="csvPreviewTitle">Ready to Import</h4>
             <span class="badge badge-success" id="csvCountBadge">0 Students</span>
           </div>
           <div class="keyboard-scroll-panel csv-preview-scroll" tabindex="0" style="max-height:220px; overflow:auto; background:#0f172a; border:1px solid #334155; border-radius:8px; padding:8px;">
@@ -9048,8 +12717,8 @@ function openBulkStudentCsvModal() {
         <!-- ACTION FOOTER -->
         <div style="background:rgba(14,165,233,0.12); border:1px solid rgba(14,165,233,0.45); border-radius:10px; padding:12px; margin-bottom:14px; color:#bae6fd; font-size:0.78rem; font-weight:700;">
           <div style="display:flex; gap:10px; align-items:flex-start; margin-bottom:10px;">
-            <i class="fa-solid fa-shield-halved" style="margin-top:2px; color:#38bdf8;"></i>
-            <span>Safe import: existing students are matched by Admission No. Blank CSV cells never erase saved ERP details.</span>
+            <i class="fa-solid fa-shield-halved" style="margin-top:2px; color:#0284c7;"></i>
+            <span>Safe import: existing students are matched by <strong>Admission No</strong>. Class, Section, Gender and Date of Admission from CSV always replace ERP values when the CSV cell is filled.</span>
           </div>
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
             <label style="display:flex; gap:8px; align-items:flex-start; background:#0f172a; border:1px solid #334155; border-radius:8px; padding:9px;">
@@ -9062,8 +12731,8 @@ function openBulkStudentCsvModal() {
             </label>
           </div>
           <label style="display:flex; gap:8px; align-items:center; margin-top:10px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.45); border-radius:8px; padding:9px; color:#fde68a;">
-            <input type="checkbox" id="addMissingStudentsOnCsvImport" onchange="updateCsvImportPreviewStats()">
-            <span>Add CSV admission numbers that are not already in ERP as new students</span>
+            <input type="checkbox" id="addMissingStudentsOnCsvImport" onchange="updateCsvImportPreviewStats()" ${!(SchoolData.students || []).length ? 'checked' : ''}>
+            <span>Add CSV admission numbers that are not already in ERP as new students${!(SchoolData.students || []).length ? ' <strong>(required — student list is empty)</strong>' : ''}</span>
           </label>
         </div>
 
@@ -9134,16 +12803,8 @@ function downloadSampleStudentCsvTemplate() {
 
 function formatAdmissionDateDisplay(raw) {
   if (!raw || raw === 'N/A') return '';
-  const str = String(raw).trim();
-  if (str.includes('/')) return str;
-  if (str.includes('-')) {
-    const parts = str.split('-');
-    if (parts.length === 3) {
-      if (parts[0].length === 4) return `${parts[2]}/${parts[1]}/${parts[0]}`;
-      return `${parts[0]}/${parts[1]}/${parts[2]}`;
-    }
-  }
-  return str;
+  const formatted = formatDobToDDMMYYYY(raw);
+  return formatted === 'N/A' ? '' : formatted;
 }
 
 function hasCsvValue(value) {
@@ -9159,6 +12820,38 @@ function shouldApplyCsvValue(existingValue, csvValue, mode) {
 
 function applyCsvValue(student, field, csvValue, mode) {
   if (shouldApplyCsvValue(student[field], csvValue, mode)) student[field] = csvValue;
+}
+
+function normalizeCsvGender(raw) {
+  const g = String(raw || '').trim().toLowerCase();
+  if (!g) return '';
+  if (g === 'm' || g === 'male' || g === 'boy') return 'Male';
+  if (g === 'f' || g === 'female' || g === 'girl') return 'Female';
+  return String(raw).trim();
+}
+
+function normalizeCsvPhone(raw) {
+  let s = String(raw ?? '').trim();
+  if (!s) return '';
+  if (/e\+/i.test(s)) {
+    const n = Number(s);
+    if (Number.isFinite(n)) s = String(Math.round(n));
+  }
+  s = s.replace(/\D/g, '');
+  if (s.length === 10) return s;
+  if (s.length === 12 && s.startsWith('91')) return s.slice(2);
+  return s || String(raw).trim();
+}
+
+function normalizeCsvSection(raw) {
+  const sec = String(raw || '').trim().toUpperCase();
+  if (!sec) return '';
+  return sec.length === 1 ? sec : sec.replace(/[^A-Z0-9]/g, '').slice(0, 2);
+}
+
+function applyCsvRegisterField(student, field, csvValue) {
+  if (!hasCsvValue(csvValue)) return;
+  student[field] = csvValue;
 }
 
 function applyCsvImportItemToStudent(student, item, currentSession, mode = 'fillBlanks') {
@@ -9185,6 +12878,23 @@ function applyCsvImportItemToStudent(student, item, currentSession, mode = 'fill
   }
   if (shouldApplyCsvValue(student.currentClass, item.cls, mode)) student.currentClass = item.cls;
   if (shouldApplyCsvValue(student.currentSection, item.sec, mode)) student.currentSection = item.sec;
+
+  // Register fields from CSV always win (class, gender, admission date) — fixes wrong UKG-B when CSV says Class 6.
+  applyCsvRegisterField(student, 'name', item.name);
+  applyCsvRegisterField(student, 'gender', item.gender);
+  applyCsvRegisterField(student, 'dateOfAdmission', item.dateOfAdmission);
+  applyCsvRegisterField(student, 'pen', item.pen);
+  applyCsvRegisterField(student, 'caste', item.caste);
+  if (hasCsvValue(item.cls)) {
+    student.sessionDetails[currentSession].class = item.cls;
+    student.currentClass = item.cls;
+    student.class = item.cls;
+  }
+  if (hasCsvValue(item.sec)) {
+    student.sessionDetails[currentSession].section = item.sec;
+    student.currentSection = item.sec;
+    student.section = item.sec;
+  }
 }
 
 function normalizeClassName(rawClass) {
@@ -9327,12 +13037,12 @@ function handleStudentCsvFileSelect(event) {
         admNo: cleanAdmNo,
         name: fullName,
         cls: normCls,
-        sec: (secIdx !== -1 && cleanVals[secIdx]) ? cleanVals[secIdx] : '',
+        sec: (secIdx !== -1 && cleanVals[secIdx]) ? normalizeCsvSection(cleanVals[secIdx]) : '',
         father: cleanVals[fatherIdx] || 'Parent',
         mother: (motherIdx !== -1 && cleanVals[motherIdx]) ? cleanVals[motherIdx] : '',
         dob: (dobIdx !== -1 && cleanVals[dobIdx]) ? cleanVals[dobIdx] : '',
-        gender: (genderIdx !== -1 && cleanVals[genderIdx]) ? cleanVals[genderIdx] : 'Male',
-        phone: (phoneIdx !== -1 && cleanVals[phoneIdx]) ? cleanVals[phoneIdx] : '',
+        gender: (genderIdx !== -1 && cleanVals[genderIdx]) ? normalizeCsvGender(cleanVals[genderIdx]) : '',
+        phone: (phoneIdx !== -1 && cleanVals[phoneIdx]) ? normalizeCsvPhone(cleanVals[phoneIdx]) : '',
         address: (addressIdx !== -1 && cleanVals[addressIdx]) ? cleanVals[addressIdx] : '',
         aadhaar: (aadhaarIdx !== -1 && cleanVals[aadhaarIdx]) ? cleanVals[aadhaarIdx] : 'N/A',
         dateOfAdmission: (doaIdx !== -1 && cleanVals[doaIdx]) ? formatAdmissionDateDisplay(cleanVals[doaIdx]) : '',
@@ -9351,7 +13061,7 @@ function handleStudentCsvFileSelect(event) {
       return;
     }
 
-    // Render Preview Table
+    // Cloud Preview Table
     const previewContainer = document.getElementById('csvPreviewContainer');
     const tableBody = document.getElementById('csvPreviewTableBody');
     const countBadge = document.getElementById('csvCountBadge');
@@ -9414,7 +13124,7 @@ function updateCsvImportPreviewStats() {
   }
 }
 
-function importParsedStudentsFromCsv() {
+async function importParsedStudentsFromCsv() {
   if (_parsedBulkStudents.length === 0) return;
 
   const currentSession = SchoolData.activeSession;
@@ -9423,6 +13133,8 @@ function importParsedStudentsFromCsv() {
   let skippedNewAdmissionNumbers = 0;
   const importMode = getSelectedStudentCsvImportMode();
   const addMissingStudents = document.getElementById('addMissingStudentsOnCsvImport')?.checked === true;
+  const beforePayload = JSON.parse(JSON.stringify(buildSchoolDataStoragePayload()));
+  const changedStudents = [];
 
   _parsedBulkStudents.forEach(item => {
     // Auto-create class in master list if it doesn't exist yet
@@ -9439,9 +13151,16 @@ function importParsedStudentsFromCsv() {
 
     const admNo = item.admNo;
     if (!admNo) return;
-    const existingStudent = SchoolData.students.find(s => String(s.admissionNo).trim() === String(admNo).trim());
+    const existingStudent = findStudentByAdmissionNo(admNo);
     if (existingStudent) {
+      const beforeStudent = JSON.stringify(buildStudentMasterFields(existingStudent));
       applyCsvImportItemToStudent(existingStudent, item, currentSession, importMode);
+      if (beforeStudent !== JSON.stringify(buildStudentMasterFields(existingStudent))) {
+        changedStudents.push(buildStudentMasterRecord(existingStudent, {
+          originalAdmissionNo: admNo,
+          sessionPatches: { [currentSession]: existingStudent.sessionDetails?.[currentSession] || {} }
+        }));
+      }
       updatedExistingContactFields++;
       return;
     }
@@ -9450,6 +13169,7 @@ function importParsedStudentsFromCsv() {
       return;
     }
     const newStudent = {
+      _studentId: `stu-${createErpMutationId()}`,
       admissionNo: admNo,
       name: item.name,
       gender: item.gender,
@@ -9473,6 +13193,8 @@ function importParsedStudentsFromCsv() {
       sessionDetails: {
         [currentSession]: { class: item.cls || "Class 5", section: item.sec || "A", rollNo: "01", teacher: "Class Teacher", status: "Active" }
       },
+      currentClass: item.cls || "Class 5",
+      currentSection: item.sec || "A",
       currentFeeInfo: {
         session: currentSession,
         monthlyTuition: item.tuition,
@@ -9491,14 +13213,32 @@ function importParsedStudentsFromCsv() {
     };
 
     SchoolData.students.push(newStudent);
+    changedStudents.push(buildStudentMasterRecord(newStudent, {
+      action: 'create', originalAdmissionNo: '',
+      sessionPatches: { [currentSession]: newStudent.sessionDetails[currentSession] },
+      feeSessionInitializers: { [currentSession]: newStudent.feeRecords[currentSession] }
+    }));
     addedCount++;
   });
 
+  try {
+    if (changedStudents.length) await persistStudentMasterDelta(changedStudents, 'Student CSV changes saved.');
+  } catch (error) {
+    applySchoolDataStoragePayload(beforePayload, { allowEmpty: true });
+    throw error;
+  }
   const modal = document.getElementById('bulkStudentCsvModal');
   if (modal) modal.remove();
 
   const modeText = importMode === 'fillBlanks' ? 'filled blank ERP fields only' : 'replaced ERP fields using non-blank CSV values';
-  showNotification(`Import complete: ${updatedExistingContactFields} existing record(s) ${modeText}. ${addedCount} new student(s) added. ${skippedNewAdmissionNumbers} unmatched CSV row(s) skipped.`, 'success');
+  const summary = `Import complete: ${updatedExistingContactFields} existing record(s) ${modeText}. ${addedCount} new student(s) added. ${skippedNewAdmissionNumbers} unmatched CSV row(s) skipped.`;
+  if (addedCount === 0 && skippedNewAdmissionNumbers > 0 && !addMissingStudents) {
+    showNotification(`${summary} Turn on "Add CSV admission numbers… as new students" when the list is empty or admission numbers are new.`, 'warning');
+  } else if (addedCount === 0 && updatedExistingContactFields === 0 && skippedNewAdmissionNumbers === 0) {
+    showNotification('Import finished but no rows were applied. Check CSV columns and admission numbers.', 'warning');
+  } else {
+    showNotification(summary, addedCount || updatedExistingContactFields ? 'success' : 'warning');
+  }
   _parsedBulkStudents = [];
 
   const mainContent = document.getElementById('contentBody');
@@ -9508,7 +13248,6 @@ function importParsedStudentsFromCsv() {
     handleRouting();
   }
 
-  saveSchoolDataToStorage();
 }
 
 /* ============================================================================
@@ -9619,17 +13358,33 @@ function checkAdmissionNumberConflict(admNo, currentStudentId = null, currentAdm
   return existing || null;
 }
 
-function deleteAllStudentsForFreshCsvImport() {
+async function deleteAllStudentsForFreshCsvImport() {
   if (blockStudentBulkDeleteIfDenied()) return;
-  const total = SchoolData.students?.length || 0;
-  if (!confirm(`Delete ALL ${total} student records from this browser database?\n\nUse this only before importing your real CSV. This will not delete staff, classes, settings, or sessions.`)) return;
-  if (!confirm("Final confirmation: student profiles, fee ledgers, attendance logs, and marks linked to these students will be removed locally.")) return;
+  if (typeof isErpCloudOnly === 'function' && isErpCloudOnly()) {
+    showNotification('Bulk student deletion is disabled in the live Cloud ERP. Import the CSV in update/add mode so marks, fees, attendance and history remain protected.', 'warning');
+    return;
+  }
+  const all = Array.isArray(SchoolData.students) ? SchoolData.students : [];
+  const total = all.length;
 
-  SchoolData.students = [];
+  // Left / inactive students are the school's leaving record and back the issued
+  // TCs, so a "clear roster before CSV import" must never take them with it.
+  const historical = all.filter(s => !isStudentActiveForRoster(s));
+  const active = all.filter(isStudentActiveForRoster);
+
+  const historyNote = historical.length
+    ? `\n\n${historical.length} left / inactive student record(s) will be KEPT so issued transfer certificates stay traceable.`
+    : '';
+  if (!confirm(`Delete ${active.length} active student record(s) of ${total} from this browser database?\n\nUse this only before importing your real CSV. Staff, classes, settings and sessions are not touched.${historyNote}`)) return;
+  if (!confirm("Final confirmation: fee ledgers, attendance logs and marks for the ACTIVE students listed above will be removed locally.")) return;
+
+  SchoolData.students = historical;
   SchoolData.telegramLogs = [];
-  saveSchoolDataToStorage();
-
-  showNotification("All students deleted. You can now import the real student CSV.", "warning");
+  await persistErpCloudSave(
+    historical.length
+      ? `${active.length} active students deleted. ${historical.length} left / inactive record(s) kept. You can now import the real student CSV.`
+      : "All students deleted. You can now import the real student CSV."
+  );
   if (document.getElementById('contentBody')) {
     renderStudentsPage(document.getElementById('contentBody'));
   }
@@ -9653,10 +13408,10 @@ function showAdmissionConflictModal(existingStudent, attemptedAdmNo) {
            Cannot add student! Admission Number <code style="color:#ffffff; background:#ef4444; padding:2px 8px; border-radius:4px; font-weight:800;">${attemptedAdmNo}</code> is ALREADY assigned to an existing student in the system.
         </div>
 
-        <h4 style="margin:0 0 10px 0; color:#38bdf8; font-size:0.95rem;">Existing Student Profile Details:</h4>
+        <h4 style="margin:0 0 10px 0; color:#0284c7; font-size:0.95rem;">Existing Student Profile Details:</h4>
         <div style="background:#1e293b; padding:16px; border-radius:12px; border:1px solid #334155; display:flex; flex-direction:column; gap:8px; font-size:0.88rem;">
           <div><strong style="color:#94a3b8;">Student Name:</strong> <strong style="color:#ffffff; font-size:1rem;">${existingStudent.name}</strong></div>
-          <div><strong style="color:#94a3b8;">Admission Number:</strong> <code style="color:#38bdf8; font-weight:700;">${existingStudent.admissionNo}</code></div>
+          <div><strong style="color:#94a3b8;">Admission Number:</strong> <code style="color:#0284c7; font-weight:700;">${existingStudent.admissionNo}</code></div>
           <div><strong style="color:#94a3b8;">Current Class & Section:</strong> <span class="badge badge-purple">${existingStudent.currentClass || 'Class 5'} - ${existingStudent.currentSection || 'A'}</span></div>
           <div><strong style="color:#94a3b8;">Father's Name:</strong> ${existingStudent.parentName || 'N/A'}</div>
           <div><strong style="color:#94a3b8;">Parent Phone:</strong> ${existingStudent.parentPhone || 'N/A'}</div>
@@ -9675,7 +13430,7 @@ function showAdmissionConflictModal(existingStudent, attemptedAdmNo) {
   document.body.insertAdjacentHTML('beforeend', modalHtml);
 }
 
-function saveNewAdmission() {
+async function saveNewAdmission() {
   const admNo = document.getElementById('admNo').value.trim();
   const name = document.getElementById('admName').value.trim();
   const dob = document.getElementById('admDob').value;
@@ -9704,6 +13459,7 @@ function saveNewAdmission() {
   }
 
   const studentObj = {
+    _studentId: `stu-${createErpMutationId()}`,
     admissionNo: admNo,
     name: name,
     gender: gender,
@@ -9731,18 +13487,162 @@ function saveNewAdmission() {
   };
 
   SchoolData.students.unshift(studentObj);
-  if (!saveSchoolDataToStorage()) {
+  try {
+    await persistStudentMasterDelta([buildStudentMasterRecord(studentObj, {
+      action: 'create', originalAdmissionNo: '',
+      sessionPatches: { [activeSession]: studentObj.sessionDetails[activeSession] },
+      feeSessionInitializers: { [activeSession]: studentObj.feeRecords[activeSession] }
+    })], `Student '${name}' admitted successfully into ${cls}.`);
+  } catch (error) {
     SchoolData.students = SchoolData.students.filter(s => s !== studentObj);
-    showNotification(`Student '${name}' was not saved. Browser storage rejected the change.`, 'error');
     return;
   }
-
-  showNotification(`Saved: Student '${name}' admitted successfully into ${cls}!`, 'success');
   window.location.hash = 'students';
+}
+
+function buildAttendanceDeltaRecord(student, attendanceDate, options = {}) {
+  const admissionNo = String(student?.admissionNo || student?.AdmissionNo || '').trim();
+  const date = String(attendanceDate || '').trim();
+  const clientUpdatedAt = String(options.clientUpdatedAt || new Date().toISOString());
+  if (options.deleted === true) {
+    return { admissionNo, attendanceDate: date, deleted: true, clientUpdatedAt };
+  }
+  const log = student?.attendanceLogs?.[date] || {};
+  return {
+    admissionNo,
+    attendanceDate: date,
+    sessionName: String(SchoolData.activeSession || ''),
+    className: String(student?.currentClass || student?.class || ''),
+    section: String(student?.currentSection || student?.section || ''),
+    status: String(log.status || ''),
+    inTime: String(log.inTime || ''),
+    outTime: String(log.outTime || ''),
+    time: String(log.time || ''),
+    source: String(log.source || options.source || 'erp-register'),
+    notes: String(log.notes || ''),
+    markedAt: String(log.markedAt || ''),
+    clientUpdatedAt: String(log._attendanceClientUpdatedAt || clientUpdatedAt)
+  };
+}
+
+function attendanceLogFingerprint(log) {
+  if (!log || typeof log !== 'object') return '';
+  return JSON.stringify({
+    status: log.status || '', inTime: log.inTime || '', outTime: log.outTime || '', time: log.time || '',
+    source: log.source || '', notes: log.notes || '', markedAt: log.markedAt || '',
+    syncedFromGoogleSheet: log.syncedFromGoogleSheet === true, markedByTeacher: log.markedByTeacher === true
+  });
+}
+
+function captureAttendanceLogState() {
+  const state = new Map();
+  (SchoolData.students || []).forEach(student => {
+    const admissionNo = String(student?.admissionNo || student?.AdmissionNo || '').trim();
+    Object.entries(student?.attendanceLogs || {}).forEach(([attendanceDate, log]) => {
+      state.set(`${admissionNo}\u0001${attendanceDate}`, { admissionNo, attendanceDate, fingerprint: attendanceLogFingerprint(log) });
+    });
+  });
+  return state;
+}
+
+function collectAttendanceChangesSince(beforeState, source) {
+  const before = beforeState instanceof Map ? beforeState : new Map();
+  const after = captureAttendanceLogState();
+  const keys = new Set([...before.keys(), ...after.keys()]);
+  const clientUpdatedAt = new Date().toISOString();
+  const records = [];
+  keys.forEach(key => {
+    const previous = before.get(key);
+    const current = after.get(key);
+    if (previous?.fingerprint === current?.fingerprint) return;
+    const admissionNo = current?.admissionNo || previous?.admissionNo || '';
+    const attendanceDate = current?.attendanceDate || previous?.attendanceDate || '';
+    const student = (SchoolData.students || []).find(item => String(item?.admissionNo || item?.AdmissionNo || '').trim() === admissionNo);
+    if (!current || !student?.attendanceLogs?.[attendanceDate]) {
+      records.push({ admissionNo, attendanceDate, deleted: true, clientUpdatedAt });
+      return;
+    }
+    student.attendanceLogs[attendanceDate].source = source || student.attendanceLogs[attendanceDate].source || 'nfc-sheet';
+    student.attendanceLogs[attendanceDate]._attendanceClientUpdatedAt = clientUpdatedAt;
+    records.push(buildAttendanceDeltaRecord(student, attendanceDate));
+  });
+  return records;
+}
+
+function getAttendanceCloudStatus() {
+  return window.ERPOutbox?.getStatusFor?.('saveAttendanceDelta') || { pending: 0, failed: 0, syncing: false };
+}
+
+function refreshAttendanceCloudStatus() {
+  const element = document.getElementById('attendanceCloudStatus');
+  if (!element) return;
+  const status = getAttendanceCloudStatus();
+  if (status.syncing) {
+    element.style.color = '#38bdf8';
+    element.innerHTML = '<i class="fa-solid fa-cloud-arrow-up"></i> Saving attendance to cloud…';
+  } else if (status.failed) {
+    element.style.color = '#f59e0b';
+    element.innerHTML = '<i class="fa-solid fa-triangle-exclamation"></i> Save needs attention; changes remain on this device';
+  } else if (status.pending) {
+    element.style.color = '#38bdf8';
+    element.innerHTML = `<i class="fa-solid fa-clock-rotate-left"></i> ${status.pending} attendance batch safely queued`;
+  } else if (status.lastSavedAt) {
+    element.style.color = '#34d399';
+    element.innerHTML = '<i class="fa-solid fa-cloud-circle-check"></i> Attendance synced';
+  } else {
+    element.style.color = '#94a3b8';
+    element.innerHTML = '<i class="fa-solid fa-shield-halved"></i> Attendance changes are saved safely before upload';
+  }
+}
+
+if (!window._attendanceOutboxStatusBound) {
+  window._attendanceOutboxStatusBound = true;
+  window.addEventListener('erp:outbox-status', refreshAttendanceCloudStatus);
+  window.addEventListener('erp:outbox-saved', event => {
+    if (event?.detail?.action !== 'saveAttendanceDelta') return;
+    const stale = event?.detail?.result?.staleSkipped;
+    if (Array.isArray(stale) && stale.length) {
+      showNotification(`${stale.length} attendance record(s) were newer in cloud and were not overwritten. Refresh to view the authoritative value.`, 'warning');
+    }
+    refreshAttendanceCloudStatus();
+  });
+}
+
+async function queueAttendanceCloudSave(records, options = {}) {
+  const cleanRecords = (Array.isArray(records) ? records : []).filter(record => record?.admissionNo && record?.attendanceDate);
+  if (!cleanRecords.length) return { queued: false };
+  saveSchoolDataToStorage({ skipCloudPush: true });
+  if (window.ERPOutbox?.enqueue) {
+    await window.ERPOutbox.enqueue('saveAttendanceDelta', { records: cleanRecords });
+    if (options.flushNow === true) {
+      if (window.ERPOutbox.flushNow) await window.ERPOutbox.flushNow('saveAttendanceDelta');
+      else await window.ERPOutbox.flush();
+    }
+    refreshAttendanceCloudStatus();
+    return { queued: true, durable: true, status: getAttendanceCloudStatus() };
+  }
+  window._attendanceCompatibilityDirty = true;
+  if (options.flushNow === true) {
+    await persistErpCloudSave(null, { skipMergePull: true });
+    window._attendanceCompatibilityDirty = false;
+  }
+  return { queued: true, durable: false };
 }
 
 window.activeAttendanceFilterClass = window.activeAttendanceFilterClass || 'ALL';
 window.activeAttendanceSearchQuery = window.activeAttendanceSearchQuery || '';
+window.activeAttendanceDate = window.activeAttendanceDate || toLocalDateKey();
+
+function getActiveAttendanceDateKey() {
+  const input = document.getElementById('attendanceDatePicker');
+  if (input && input.value) return toLocalDateKey(input.value);
+  return window.activeAttendanceDate || toLocalDateKey();
+}
+
+function changeAttendanceRegisterDate(value) {
+  window.activeAttendanceDate = toLocalDateKey(value);
+  renderAttendancePage(document.getElementById('contentBody'));
+}
 
 function filterAttendancePageByClass(cls) {
   window.activeAttendanceFilterClass = cls;
@@ -9769,7 +13669,175 @@ function filterAttendanceTableBySearch(q) {
   }, 30);
 }
 
+function getCurrentUserAllowedClassesAndSections() {
+  const activeUser = typeof getCurrentActiveUser === 'function' ? getCurrentActiveUser() : null;
+  if (!activeUser) return { restricted: false, allowed: [] };
+
+  // Super Admin, Principal, Vice Principal, Accountant, and Exam Incharge can manage attendance for ALL classes
+  const isAdmin = ['Super Admin', 'Principal', 'Vice Principal', 'Accountant', 'Exam Incharge'].includes(activeUser.role);
+  if (isAdmin) {
+    return { restricted: false, allowed: [] };
+  }
+
+  // Otherwise, they are a Teacher or Class Teacher. They are restricted!
+  const allowed = []; // Array of "Class Name - Section"
+  const teacherName = activeUser.name;
+  const teacherNameLower = String(teacherName || '').trim().toLowerCase();
+
+  // 1. Check Class Teacher Assignments
+  (SchoolData.classes || []).forEach(cls => {
+    const sections = cls.sections || ['A'];
+    const map = getClassSectionTeachers(cls);
+    sections.forEach(sec => {
+      const secKey = normalizeClassSectionKey(sec);
+      const assignedTeacher = map[secKey] || '';
+      if (assignedTeacher.toLowerCase().trim() === teacherNameLower) {
+        allowed.push(`${cls.name} - ${secKey}`);
+      }
+    });
+  });
+
+  // 2. Check Subject Mappings (Teacher Directory)
+  const teacherObj = (SchoolData.teachers || []).find(t => 
+    t.name && t.name.toLowerCase().trim() === teacherNameLower
+  );
+  if (teacherObj && Array.isArray(teacherObj.subjectMappings)) {
+    teacherObj.subjectMappings.forEach(m => {
+      const clsName = m.className;
+      if (clsName) {
+        if (m.section === 'ALL') {
+          const cls = (SchoolData.classes || []).find(c => c.name === clsName);
+          const sections = cls ? (cls.sections || ['A']) : ['A'];
+          sections.forEach(sec => {
+            allowed.push(`${clsName} - ${normalizeClassSectionKey(sec)}`);
+          });
+        } else {
+          allowed.push(`${clsName} - ${normalizeClassSectionKey(m.section)}`);
+        }
+      }
+    });
+  }
+
+  const uniqueAllowed = [...new Set(allowed)];
+  return { restricted: true, allowed: uniqueAllowed };
+}
+
+
+function sendParentAbsenceAlert(admissionNo) {
+  const student = (SchoolData.students || []).find(s => String(s.admissionNo) === String(admissionNo));
+  if (!student) {
+    showNotification('Student not found.', 'error');
+    return;
+  }
+  const registerDate = getActiveAttendanceDateKey();
+  const dateFormatted = new Date(registerDate + 'T12:00:00').toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+  const cls = `${student.currentClass || student.class || 'Class 5'} - ${student.currentSection || student.section || 'A'}`;
+  const parentName = student.parentName || student.fatherName || 'Parent';
+  const phone = student.parentPhone || student.mobile || '';
+  const cleanPhone = phone.replace(/[^0-9]/g, '');
+
+  const alertMessage = `🚨 *MADAN MOHAN MALVIYA JUNIOR HIGH SCHOOL*\n*URGENT ABSENCE / NO-TAP NOTICE*\n\nDear ${parentName},\nYour ward *${student.name}* (Adm: *${student.admissionNo}*, Class: *${cls}*) has *NOT tapped their NFC ID Card* at the school gate today (*${dateFormatted}*) and is marked *ABSENT*.\n\n⚠️ If you sent your child to school today, please contact the school office immediately to verify safety.\n\n📞 Helpline: +91 98115 51044 / +91 98715 01044`;
+
+  const chatId = getStudentSchoolChatId(student);
+  if (chatId) {
+    try {
+      sendRawTelegramReply(chatId, alertMessage);
+      showNotification(`Absence alert sent to ${student.name}'s parent on Telegram!`, 'success');
+    } catch (e) {
+      console.warn('Telegram dispatch failed', e);
+    }
+  }
+
+  if (cleanPhone && cleanPhone.length >= 10) {
+    const waPhone = cleanPhone.length === 10 ? '91' + cleanPhone : cleanPhone;
+    const waText = encodeURIComponent(`🚨 *MADAN MOHAN MALVIYA JUNIOR HIGH SCHOOL - ABSENCE NOTICE*
+
+Dear ${parentName},
+Your ward *${student.name}* (Adm: *${student.admissionNo}*, Class: *${cls}*) has *NOT tapped their NFC card* at the school gate today (${dateFormatted}) and is marked *ABSENT*.
+
+⚠️ If you sent your child to school, please contact the school office immediately.
+📞 Office: +91 98115 51044`);
+    window.open(`https://api.whatsapp.com/send?phone=${waPhone}&text=${waText}`, '_blank');
+  } else if (!chatId) {
+    showNotification(`Parent phone not registered for ${student.name}.`, 'warning');
+  }
+}
+
+function broadcastAllAbsentParentsAlerts() {
+  const allStudents = getStudentsByActiveSession();
+  const registerDate = getActiveAttendanceDateKey();
+  const selectedClass = window.activeAttendanceFilterClass || 'ALL';
+
+  let targetStudents = selectedClass === 'ALL'
+    ? allStudents
+    : allStudents.filter(s => s.currentClass === selectedClass || s.class === selectedClass || `${s.currentClass || s.class} - ${s.currentSection || s.section}` === selectedClass);
+
+  const absentStudents = targetStudents.filter(s => {
+    const log = s.attendanceLogs && s.attendanceLogs[registerDate];
+    return !log || log.status === 'Absent' || log.status === 'Not Marked';
+  });
+
+  if (absentStudents.length === 0) {
+    showNotification('All students in this class are Present today. No absence alerts needed.', 'success');
+    return;
+  }
+
+  const confirmMsg = `Broadcast Absence Notices to the parents of all ${absentStudents.length} absent / no-tap students in ${selectedClass === 'ALL' ? 'the entire school' : selectedClass}?`;
+  if (!confirm(confirmMsg)) return;
+  const beforeCancellation = JSON.parse(JSON.stringify(buildSchoolDataStoragePayload()));
+
+  let sentCount = 0;
+  absentStudents.forEach(s => {
+    const chatId = getStudentSchoolChatId(s);
+    if (chatId) {
+      const parentName = s.parentName || s.fatherName || 'Parent';
+      const cls = `${s.currentClass || s.class} - ${s.currentSection || s.section}`;
+      const msg = `🚨 *MADAN MOHAN MALVIYA JUNIOR HIGH SCHOOL*\n*ABSENCE NOTICE*\n\nDear ${parentName},\nYour ward *${s.name}* (Adm: *${s.admissionNo}*, Class: *${cls}*) has *NOT tapped their NFC ID Card* at the school gate today and is marked *ABSENT*.\n\n⚠️ If you sent your child to school today, please contact the school office immediately.\n📞 Helpline: +91 98115 51044`;
+      try {
+        sendRawTelegramReply(chatId, msg);
+        sentCount++;
+      } catch (err) {}
+    }
+  });
+
+  showNotification(`Broadcast completed! Sent ${sentCount} instant absence alerts via Telegram.`, 'success');
+}
+
+function setAttendanceFilterView(filterType) {
+  window.activeAttendanceStatusFilter = filterType;
+  const rows = document.querySelectorAll('#attendanceTableBody tr.att-row');
+  rows.forEach(r => {
+    const status = r.getAttribute('data-status') || 'Not Marked';
+    if (filterType === 'ALL') {
+      r.style.display = '';
+    } else if (filterType === 'PRESENT') {
+      r.style.display = (status === 'Present' || status === 'Late') ? '' : 'none';
+    } else if (filterType === 'ABSENT') {
+      r.style.display = (status === 'Absent' || status === 'Not Marked') ? '' : 'none';
+    } else if (filterType === 'LATE') {
+      r.style.display = (status === 'Late') ? '' : 'none';
+    }
+  });
+
+  document.querySelectorAll('.att-filter-tab-btn').forEach(btn => {
+    if (btn.getAttribute('data-filter') === filterType) {
+      btn.style.background = '#0284c7';
+      btn.style.borderColor = '#38bdf8';
+      btn.style.color = '#ffffff';
+    } else {
+      btn.style.background = '#1e293b';
+      btn.style.borderColor = '#334155';
+      btn.style.color = '#94a3b8';
+    }
+  });
+}
+
 function renderAttendancePage(container) {
+  if (window.ERP_V2_READ_FLAGS && window.ERP_V2_READ_FLAGS.attendance && typeof window.refreshStudentAttendanceFromV2 === 'function') {
+    requestErpV2ScreenRefresh('attendance', 'attendance', window.refreshStudentAttendanceFromV2, function() {
+      if (window.location.hash.replace('#', '') === 'attendance') renderAttendancePage(container);
+    });
+  }
   // Automatic 15-second Background Refresh for live card taps already saved in ERP.
   if (window.attendanceAutoSyncInterval) clearInterval(window.attendanceAutoSyncInterval);
   window.attendanceAutoSyncInterval = setInterval(() => {
@@ -9789,16 +13857,46 @@ function renderAttendancePage(container) {
   }, 15000);
   const allStudents = getStudentsByActiveSession();
   const currentSession = SchoolData.activeSession;
-  const todayStr = toLocalDateKey();
-  const selectedClass = window.activeAttendanceFilterClass || 'ALL';
+  const registerDate = getActiveAttendanceDateKey();
+  const isToday = registerDate === toLocalDateKey();
   const searchQuery = (window.activeAttendanceSearchQuery || '').toLowerCase().trim();
 
-  const classOptions = ["ALL", "Nursery", "LKG", "UKG", "Class 1", "Class 2", "Class 3", "Class 4", "Class 5", "Class 6", "Class 7", "Class 8", "Class 9", "Class 10"];
+  const allowedStatus = getCurrentUserAllowedClassesAndSections();
+  let students = allStudents;
+  let classOptions = [];
+  let selectedClass = window.activeAttendanceFilterClass;
 
-  let students = selectedClass === 'ALL' 
-    ? allStudents 
-    : allStudents.filter(s => s.currentClass === selectedClass || s.class === selectedClass);
+  if (allowedStatus.restricted) {
+    if (allowedStatus.allowed.length === 0) {
+      students = [];
+      classOptions = [];
+      selectedClass = '';
+      window.activeAttendanceFilterClass = '';
+    } else {
+      classOptions = allowedStatus.allowed;
+      if (!selectedClass || !classOptions.includes(selectedClass)) {
+        selectedClass = classOptions[0];
+        window.activeAttendanceFilterClass = selectedClass;
+      }
+      const parts = selectedClass.split(' - ');
+      const clsName = parts[0];
+      const secName = parts[1];
+      students = allStudents.filter(s => 
+        (s.currentClass === clsName || s.class === clsName) && 
+        normalizeClassSectionKey(s.currentSection || s.section) === secName
+      );
+    }
+  } else {
+    classOptions = getSchoolClassNames();
+    if (!classOptions.includes('ALL')) classOptions.unshift('ALL');
+    selectedClass = selectedClass || 'ALL';
+    if (!classOptions.includes(selectedClass)) selectedClass = 'ALL';
+    window.activeAttendanceFilterClass = selectedClass;
 
+    students = selectedClass === 'ALL'
+      ? allStudents
+      : allStudents.filter(s => s.currentClass === selectedClass || s.class === selectedClass);
+  }
   if (searchQuery) {
     students = students.filter(s => 
       (s.name && s.name.toLowerCase().includes(searchQuery)) ||
@@ -9808,39 +13906,117 @@ function renderAttendancePage(container) {
     );
   }
 
+  // Calculate live Present / Absent / Late stats for this specific class view
+  let presentCount = 0;
+  let absentCount = 0;
+  let lateCount = 0;
+  let notMarkedCount = 0;
+
+  students.forEach(s => {
+    const log = s.attendanceLogs && s.attendanceLogs[registerDate];
+    const st = log ? log.status : 'Not Marked';
+    if (st === 'Present') presentCount++;
+    else if (st === 'Absent') absentCount++;
+    else if (st === 'Late') lateCount++;
+    else notMarkedCount++;
+  });
+
+  const totalClassStrength = students.length;
+  const attendanceRate = totalClassStrength > 0 ? Math.round(((presentCount + lateCount) / totalClassStrength) * 100) : 0;
+  const classNameDisplay = selectedClass === 'ALL' ? 'Whole School' : selectedClass;
+
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <h2 class="page-title"><i class="fa-solid fa-clipboard-user" style="color:var(--accent-primary)"></i> Daily Attendance Register</h2>
-        <p class="page-subtitle">Manual Roll-Call & Live Hardware NFC Card Tap Logs (${currentSession})</p>
+        <h2 class="page-title"><i class="fa-solid fa-clipboard-user" style="color:var(--accent-primary)"></i> Daily Attendance Register &amp; Gate Logs</h2>
+        <p class="page-subtitle">Real-time Gate NFC Card Taps, Bunk Risk Alerts &amp; Roll-Call (${currentSession})</p>
       </div>
-      <div style="display:flex; gap:10px;">
-        <button class="btn btn-nfc-tap" onclick="openNfcModal()"><i class="fa-solid fa-wifi"></i> Launch Gate NFC Scanner</button>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="broadcastAllAbsentParentsAlerts()" style="background:#ef4444; color:#fff; border:none; font-weight:800;" title="Send instant Absence & Bunking Notices to Parents of all absent students">
+          <i class="fa-solid fa-bullhorn"></i> Alert All Absent Parents
+        </button>
+        <button class="btn btn-secondary" onclick="syncAttendanceFromGoogleSheets()" style="background:#0284c7; color:#fff; border:none; font-weight:700;"><i class="fa-solid fa-cloud-arrow-down"></i> Sync NFC Sheet</button>
+        <button class="btn btn-nfc-tap" onclick="openNfcModal()"><i class="fa-solid fa-wifi"></i> Launch Gate Scanner</button>
       </div>
     </div>
 
+    <!-- LIVE ON-SCREEN CLASS ATTENDANCE METRICS -->
+    <div class="metrics-grid" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:14px; margin-bottom:20px;">
+      <div class="glass-card metric-card" style="border:1.5px solid #334155; padding:14px 18px;">
+        <div class="metric-icon" style="background:rgba(56, 189, 248, 0.15); color:#38bdf8;"><i class="fa-solid fa-users"></i></div>
+        <div class="metric-info">
+          <span class="metric-title" style="font-size:0.8rem; color:#94a3b8; font-weight:700;">Total Strength (${classNameDisplay})</span>
+          <span class="metric-value" style="font-size:1.45rem; font-weight:900; color:#ffffff;">${totalClassStrength} <small style="font-size:0.75rem; font-weight:600; color:#94a3b8;">Students</small></span>
+        </div>
+      </div>
+
+      <div class="glass-card metric-card" style="border:1.5px solid rgba(16, 185, 129, 0.4); background:linear-gradient(135deg, rgba(16, 185, 129, 0.12) 0%, rgba(15, 23, 42, 0.8) 100%); padding:14px 18px;">
+        <div class="metric-icon" style="background:rgba(16, 185, 129, 0.2); color:#10b981;"><i class="fa-solid fa-user-check"></i></div>
+        <div class="metric-info">
+          <span class="metric-title" style="font-size:0.8rem; color:#6ee7b7; font-weight:700;">Present in ${classNameDisplay}</span>
+          <span class="metric-value" style="font-size:1.45rem; font-weight:900; color:#34d399;">${presentCount} <small style="font-size:0.8rem; font-weight:700; color:#10b981;">(${attendanceRate}%)</small></span>
+        </div>
+      </div>
+
+      <div class="glass-card metric-card" style="border:1.5px solid rgba(239, 68, 68, 0.4); background:linear-gradient(135deg, rgba(239, 68, 68, 0.12) 0%, rgba(15, 23, 42, 0.8) 100%); padding:14px 18px;">
+        <div class="metric-icon" style="background:rgba(239, 68, 68, 0.2); color:#ef4444;"><i class="fa-solid fa-user-xmark"></i></div>
+        <div class="metric-info">
+          <span class="metric-title" style="font-size:0.8rem; color:#fca5a5; font-weight:700;">Absent (No Gate Tap)</span>
+          <span class="metric-value" style="font-size:1.45rem; font-weight:900; color:#f87171;">${absentCount + notMarkedCount} <small style="font-size:0.75rem; font-weight:700; color:#ef4444;">${notMarkedCount > 0 ? `(${notMarkedCount} no tap)` : ''}</small></span>
+        </div>
+      </div>
+
+      <div class="glass-card metric-card" style="border:1.5px solid rgba(245, 158, 11, 0.4); padding:14px 18px;">
+        <div class="metric-icon" style="background:rgba(245, 158, 11, 0.2); color:#f59e0b;"><i class="fa-solid fa-clock"></i></div>
+        <div class="metric-info">
+          <span class="metric-title" style="font-size:0.8rem; color:#fcd34d; font-weight:700;">Late Arrivals</span>
+          <span class="metric-value" style="font-size:1.45rem; font-weight:900; color:#fbbf24;">${lateCount}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- FILTER BAR WITH QUICK TABS -->
     <div class="glass-card" style="margin-bottom:20px;">
       <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:16px;">
         <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; flex:1;">
           <div style="display:flex; align-items:center; gap:8px;">
-            <label style="font-size:0.88rem; font-weight:700; color:#38bdf8;">Class & Section:</label>
+            <label style="font-size:0.88rem; font-weight:700; color:#f59e0b;">Register Date:</label>
+            <input type="date" id="attendanceDatePicker" class="session-dropdown" style="width:170px; font-weight:800;" value="${registerDate}" onchange="changeAttendanceRegisterDate(this.value)">
+            ${!isToday ? `<button class="btn btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="changeAttendanceRegisterDate('${toLocalDateKey()}')">Today</button>` : ''}
+          </div>
+          <div style="display:flex; align-items:center; gap:8px;">
+            <label style="font-size:0.88rem; font-weight:700; color:#38bdf8;">Class &amp; Section:</label>
             <select class="session-dropdown" style="width:200px; font-weight:800;" onchange="filterAttendancePageByClass(this.value)">
               ${classOptions.map(c => `
-                <option value="${c}" ${c === selectedClass ? 'selected' : ''}>${c === 'ALL' ? 'All Classes' : `School ${c}`}</option>
+                <option value="${c}" ${c === selectedClass ? 'selected' : ''}>${c === 'ALL' ? 'All Classes (Whole School)' : c}</option>
               `).join('')}
+              ${classOptions.length === 0 ? '<option value="">No Classes Assigned</option>' : ''}
             </select>
           </div>
 
-          <div style="position:relative; flex:1; min-width:260px;">
-            <i class="fa-solid fa-magnifying-glass" style="position:absolute; left:12px; top:50%; transform:translateY(-50%); color:#94a3b8;"></i>
-            <input type="text" id="attendanceSearchInput" value="${window.activeAttendanceSearchQuery || ''}" placeholder=" Search Name, Admission No, Roll No, NFC Card UID..." oninput="filterAttendanceTableBySearch(this.value)" style="width:100%; padding:9px 12px 9px 36px; background:#0f172a; border:1px solid #334155; border-radius:10px; color:#ffffff; font-size:0.88rem; font-weight:600;">
+          <!-- QUICK STATUS FILTER TABS -->
+          <div style="display:flex; gap:6px; background:#0f172a; padding:4px; border-radius:10px; border:1px solid #334155;">
+            <button class="att-filter-tab-btn" data-filter="ALL" onclick="setAttendanceFilterView('ALL')" style="background:#0284c7; color:#fff; border:1px solid #38bdf8; padding:5px 12px; border-radius:6px; font-size:0.78rem; font-weight:800; cursor:pointer;">
+              All (${totalClassStrength})
+            </button>
+            <button class="att-filter-tab-btn" data-filter="PRESENT" onclick="setAttendanceFilterView('PRESENT')" style="background:#1e293b; color:#94a3b8; border:1px solid #334155; padding:5px 12px; border-radius:6px; font-size:0.78rem; font-weight:800; cursor:pointer;">
+              ✅ Present (${presentCount})
+            </button>
+            <button class="att-filter-tab-btn" data-filter="ABSENT" onclick="setAttendanceFilterView('ABSENT')" style="background:#1e293b; color:#94a3b8; border:1px solid #334155; padding:5px 12px; border-radius:6px; font-size:0.78rem; font-weight:800; cursor:pointer;">
+              🚨 Absent / No Tap (${absentCount + notMarkedCount})
+            </button>
           </div>
 
-          <span class="badge badge-purple" style="font-size:0.85rem;">${students.length} Students Listed</span>
+          <div style="position:relative; flex:1; min-width:240px;">
+            <i class="fa-solid fa-magnifying-glass" style="position:absolute; left:12px; top:50%; transform:translateY(-50%); color:#94a3b8;"></i>
+            <input type="text" id="attendanceSearchInput" value="${window.activeAttendanceSearchQuery || ''}" placeholder=" Search Name, Admission No, Roll, NFC Card UID..." oninput="filterAttendanceTableBySearch(this.value)" style="width:100%; padding:8px 12px 8px 36px; background:#0f172a; border:1px solid #334155; border-radius:8px; color:#ffffff; font-size:0.85rem; font-weight:600;">
+          </div>
         </div>
-        <div style="display:flex; gap:10px;">
+
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+          <span id="attendanceCloudStatus" style="font-size:0.76rem; font-weight:800; color:#94a3b8; margin-right:4px;"><i class="fa-solid fa-shield-halved"></i> Attendance changes are saved safely before upload</span>
           <button class="btn btn-primary" onclick="markAllPresent()"><i class="fa-solid fa-check-double"></i> Mark All Present</button>
-          <button class="btn btn-secondary" onclick="showNotification('Done: Attendance Logs Saved to School Database!', 'success')"><i class="fa-solid fa-floppy-disk"></i> Save Register</button>
+          <button class="btn btn-secondary" onclick="saveAttendanceRegister()"><i class="fa-solid fa-floppy-disk"></i> Save</button>
         </div>
       </div>
     </div>
@@ -9855,7 +14031,7 @@ function renderAttendancePage(container) {
               <th>Admission No</th>
               <th>Class & Sec</th>
               <th>NFC Hardware UID</th>
-              <th>Today Status</th>
+              <th>Status (${registerDate})</th>
               <th>IN Time (Arrival)</th>
               <th>OUT Time (Departure)</th>
               <th>Mark Attendance</th>
@@ -9865,8 +14041,8 @@ function renderAttendancePage(container) {
             ${students.length === 0 ? `
               <tr><td colspan="9" style="text-align:center; padding:30px; color:#cbd5e1; font-weight:700;">No matching student records found.</td></tr>
             ` : students.map((s, idx) => {
-              const hasLog = s.attendanceLogs && s.attendanceLogs[todayStr];
-              const log = hasLog ? s.attendanceLogs[todayStr] : null;
+              const hasLog = s.attendanceLogs && s.attendanceLogs[registerDate];
+              const log = hasLog ? s.attendanceLogs[registerDate] : null;
 
               const statusStr = log ? log.status : 'Not Marked';
               const inTimeDisplay = (log && log.inTime) ? log.inTime : ((log && log.time) ? log.time : '--:--');
@@ -9879,14 +14055,14 @@ function renderAttendancePage(container) {
               const searchStr = `${s.admissionNo} ${s.name.toLowerCase()} ${(s.nfcUid || '').toLowerCase()} ${(s.parentPhone || '').toLowerCase()}`;
 
               return `
-                <tr class="att-row" data-search="${searchStr}">
+                <tr class="att-row" data-search="${searchStr}" data-status="${statusStr}">
                   <td><code>${String(idx + 1).padStart(2, '0')}</code></td>
                   <td><strong>${s.name}</strong></td>
                   <td><code>${s.admissionNo}</code></td>
                   <td><span class="badge badge-purple">${s.currentClass || 'Class 5'} - ${s.currentSection || 'A'}</span></td>
                   <td>
                     ${hasRealUid 
-                      ? `<code style="color:#38bdf8; font-weight:800; background:rgba(56,189,248,0.1); padding:4px 8px; border-radius:6px; border:1px solid rgba(56,189,248,0.3);"><i class="fa-solid fa-microchip"></i> ${s.nfcUid}</code>` 
+                      ? `<code style="color:#0284c7; font-weight:800; background:rgba(56,189,248,0.1); padding:4px 8px; border-radius:6px; border:1px solid rgba(56,189,248,0.3);"><i class="fa-solid fa-microchip"></i> ${s.nfcUid}</code>` 
                       : `<span style="color:#64748b; font-weight:600; font-size:0.85rem;">--</span>`}
                   </td>
                   <td>
@@ -9901,14 +14077,19 @@ function renderAttendancePage(container) {
                   </td>
                   <td>
                     <span style="font-size:0.85rem; color:${outTimeDisplay !== '--:--' ? '#c084fc' : '#64748b'}; font-weight:800;" id="attOutTime_${s.admissionNo}">
-                      ${outTimeDisplay !== '--:--' ? `<i class="fa-solid fa-right-from-bracket" style="color:#c084fc;"></i> ${outTimeDisplay}` : '--:--'}
+                      ${outTimeDisplay !== '--:--' ? `<i class="fa-solid fa-right-from-bracket" style="color:#6d28d9;"></i> ${outTimeDisplay}` : '--:--'}
                     </span>
                   </td>
                   <td>
-                    <div style="display:flex; gap:6px;">
-                      <button class="btn btn-secondary" style="padding:3px 8px; font-size:0.75rem; background:rgba(16, 185, 129, 0.2); color:#10b981;" onclick="setAtt('${s.admissionNo}', 'Present')">Present</button>
-                      <button class="btn btn-secondary" style="padding:3px 8px; font-size:0.75rem; background:rgba(239, 68, 68, 0.2); color:#ef4444;" onclick="setAtt('${s.admissionNo}', 'Absent')">Absent</button>
-                      <button class="btn btn-secondary" style="padding:3px 8px; font-size:0.75rem; background:rgba(245, 158, 11, 0.2); color:#f59e0b;" onclick="setAtt('${s.admissionNo}', 'Late')">Late</button>
+                    <div style="display:flex; gap:6px; align-items:center;">
+                      <button class="btn btn-secondary" style="padding:3px 8px; font-size:0.75rem; background:rgba(16, 185, 129, 0.2); color:#10b981; font-weight:700;" onclick="setAtt('${s.admissionNo}', 'Present')">P</button>
+                      <button class="btn btn-secondary" style="padding:3px 8px; font-size:0.75rem; background:rgba(239, 68, 68, 0.2); color:#ef4444; font-weight:700;" onclick="setAtt('${s.admissionNo}', 'Absent')">A</button>
+                      <button class="btn btn-secondary" style="padding:3px 8px; font-size:0.75rem; background:rgba(245, 158, 11, 0.2); color:#f59e0b; font-weight:700;" onclick="setAtt('${s.admissionNo}', 'Late')">L</button>
+                      ${(isAbsent || statusStr === 'Not Marked') ? `
+                        <button class="btn btn-secondary" style="padding:3px 8px; font-size:0.72rem; background:#dc2626; color:#ffffff; border:none; border-radius:4px; font-weight:800;" onclick="sendParentAbsenceAlert('${s.admissionNo}')" title="Alert parent immediately: student did not reach school / no NFC tap">
+                          <i class="fa-solid fa-bell"></i> Alert
+                        </button>
+                      ` : ''}
                     </div>
                   </td>
                 </tr>
@@ -9919,17 +14100,25 @@ function renderAttendancePage(container) {
       </div>
     </div>
   `;
+  setTimeout(refreshAttendanceCloudStatus, 0);
 }
 
 async function syncAttendanceFromGoogleSheets() {
-  showNotification('Syncing attendance and NFC UIDs from Google Sheets...', 'info');
+  showNotification('Syncing attendance from the NFC attendance sheet...', 'info');
 
-  const finishAttendanceSync = (rows, sourceLabel) => {
-    applyRosterIdentityRowsToStudents(rows);
-    const result = applyContactUidRowsToStudents(rows, { updateAttendance: true });
-    const cleared = removeStaleGoogleSheetAttendanceForToday(rows);
-    repairDuplicateNfcUidAssignments();
-    showNotification(`Attendance sync complete from ${sourceLabel}: ${result.updated} record(s) updated, ${cleared} stale today log(s) cleared.`, 'success');
+  const finishAttendanceSync = async (rows, sourceLabel) => {
+    const beforeAttendance = captureAttendanceLogState();
+    // This page imports attendance only. Admission numbers, NFC assignments and
+    // parent contact links are managed in their dedicated modules.
+    const result = applyContactUidRowsToStudents(rows, { updateAttendance: true, updateContacts: false, skipCloudPush: true });
+    const cleared = removeStaleGoogleSheetAttendanceForToday(rows, { skipCloudPush: true });
+    const records = collectAttendanceChangesSince(beforeAttendance, 'nfc-attendance-sheet');
+    if (records.length) await queueAttendanceCloudSave(records, { flushNow: true });
+    const cloudStatus = getAttendanceCloudStatus();
+    const message = `Attendance sync from ${sourceLabel}: ${result.updated} record(s) updated, ${cleared} stale today log(s) cleared.`;
+    showNotification(cloudStatus.failed || cloudStatus.pending
+      ? `${message} Changes remain safely queued for cloud retry.`
+      : `${message} Cloud save confirmed.`, cloudStatus.failed ? 'warning' : (cloudStatus.pending ? 'info' : 'success'));
     if (document.getElementById('contentBody')) {
       const hash = window.location.hash.replace('#', '') || 'dashboard';
       if (hash === 'attendance') renderAttendancePage(document.getElementById('contentBody'));
@@ -9944,7 +14133,7 @@ async function syncAttendanceFromGoogleSheets() {
     if (res.ok) {
       const data = await res.json();
       if (Array.isArray(data) && data.length > 0) {
-        finishAttendanceSync(data, 'NFC attendance API');
+        await finishAttendanceSync(data, 'NFC attendance API');
         return;
       }
     }
@@ -9955,7 +14144,7 @@ async function syncAttendanceFromGoogleSheets() {
   try {
     const sheetRows = await fetchGoogleAttendanceRowsForSync();
     if (sheetRows.length > 0) {
-      finishAttendanceSync(sheetRows, 'Google Sheet Attendance tab');
+      await finishAttendanceSync(sheetRows, 'Google Sheet Attendance tab');
       return;
     }
   } catch(e) {}
@@ -9965,20 +14154,23 @@ async function syncAttendanceFromGoogleSheets() {
 
 async function setAtt(admNo, status) {
   const student = SchoolData.students.find(s => s.admissionNo === admNo);
-  const todayStr = toLocalDateKey();
+  const dateStr = getActiveAttendanceDateKey();
   const timeStr = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
 
   if (student) {
     if (!student.attendanceLogs) student.attendanceLogs = {};
-    const existingLog = student.attendanceLogs[todayStr] || {};
-    student.attendanceLogs[todayStr] = {
+    const existingLog = student.attendanceLogs[dateStr] || {};
+    const clientUpdatedAt = new Date().toISOString();
+    student.attendanceLogs[dateStr] = {
       ...existingLog,
       status: status,
       time: status === 'Absent' ? (existingLog.time || '') : timeStr,
       inTime: status === 'Absent' ? '--:--' : (existingLog.inTime && existingLog.inTime !== '--:--' ? existingLog.inTime : timeStr),
       outTime: status === 'Absent' ? '--:--' : (existingLog.outTime || '--:--'),
       markedByTeacher: true,
-      markedAt: timeStr
+      markedAt: timeStr,
+      source: 'erp-register',
+      _attendanceClientUpdatedAt: clientUpdatedAt
     };
   }
 
@@ -10008,31 +14200,95 @@ async function setAtt(admNo, status) {
     outTimeElem.innerText = '--:--';
   }
 
-  showNotification(`Updated status to ${status} for ${student?.name || admNo} at ${timeStr}`, 'info');
-
-  saveSchoolDataToStorage();
+  if (student) {
+    try {
+      await queueAttendanceCloudSave([buildAttendanceDeltaRecord(student, dateStr)]);
+      showNotification(`Changed ${student.name || admNo} to ${status}. Safely queued; press Save to sync now.`, 'info');
+    } catch (error) {
+      showNotification(`Attendance remains on this device but could not enter the cloud queue: ${error.message}`, 'warning');
+    }
+  }
 
   // Attendance Telegram is handled outside ERP by the separate NFC box/bot.
 }
 
-function markAllPresent() {
-  const todayStr = toLocalDateKey();
+async function saveAttendanceRegister() {
+  if (window.ERPOutbox?.flushNow) {
+    await window.ERPOutbox.flushNow('saveAttendanceDelta');
+    const status = getAttendanceCloudStatus();
+    refreshAttendanceCloudStatus();
+    if (status.failed) {
+      showNotification('Attendance remains saved on this device, but cloud sync needs attention.', 'warning');
+    } else if (status.pending || status.syncing) {
+      showNotification('Attendance is safely queued and will retry automatically.', 'info');
+    } else {
+      showNotification('Attendance saved and synced.', 'success');
+    }
+    return;
+  }
+  if (window._attendanceCompatibilityDirty) {
+    await persistErpCloudSave('Attendance register saved.', { skipMergePull: true });
+    window._attendanceCompatibilityDirty = false;
+  } else {
+    showNotification('No pending attendance changes.', 'info');
+  }
+}
+
+async function markAllPresent() {
+  const dateStr = getActiveAttendanceDateKey();
   const timeStr = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
-  getStudentsByActiveSession().forEach(student => {
+  const selectedClass = window.activeAttendanceFilterClass || 'ALL';
+  
+  const allowedStatus = getCurrentUserAllowedClassesAndSections();
+  let students = getStudentsByActiveSession();
+  
+  if (allowedStatus.restricted) {
+    if (allowedStatus.allowed.length === 0) {
+      students = [];
+    } else {
+      // Filter by allowed combinations
+      students = students.filter(s => {
+        const key = `${s.currentClass || s.class} - ${normalizeClassSectionKey(s.currentSection || s.section)}`;
+        return allowedStatus.allowed.includes(key);
+      });
+      // Further filter by selected allowed class option
+      if (selectedClass && allowedStatus.allowed.includes(selectedClass)) {
+        const parts = selectedClass.split(' - ');
+        const clsName = parts[0];
+        const secName = parts[1];
+        students = students.filter(s => 
+          (s.currentClass === clsName || s.class === clsName) && 
+          normalizeClassSectionKey(s.currentSection || s.section) === secName
+        );
+      }
+    }
+  } else {
+    if (selectedClass !== 'ALL') {
+      students = students.filter(s => (s.currentClass || s.class) === selectedClass);
+    }
+  }
+  const clientUpdatedAt = new Date().toISOString();
+  students.forEach(student => {
     if (!student.attendanceLogs) student.attendanceLogs = {};
-    const existingLog = student.attendanceLogs[todayStr] || {};
-    student.attendanceLogs[todayStr] = {
+    const existingLog = student.attendanceLogs[dateStr] || {};
+    student.attendanceLogs[dateStr] = {
       ...existingLog,
       status: 'Present',
       inTime: existingLog.inTime && existingLog.inTime !== '--:--' ? existingLog.inTime : timeStr,
       outTime: existingLog.outTime || '--:--',
       time: existingLog.time || timeStr,
       markedByTeacher: true,
-      markedAt: timeStr
+      markedAt: timeStr,
+      source: 'erp-register-bulk',
+      _attendanceClientUpdatedAt: clientUpdatedAt
     };
   });
-  saveSchoolDataToStorage();
-  showNotification('All visible students marked Present for today.', 'success');
+  const records = students.map(student => buildAttendanceDeltaRecord(student, dateStr));
+  await queueAttendanceCloudSave(records, { flushNow: true });
+  const status = getAttendanceCloudStatus();
+  showNotification(status.failed || status.pending
+    ? `All ${students.length} visible students are saved on this device and queued for cloud retry.`
+    : `All ${students.length} visible students were marked Present and synced for ${dateStr}.`, status.failed ? 'warning' : (status.pending ? 'info' : 'success'));
   if (document.getElementById('contentBody')) renderAttendancePage(document.getElementById('contentBody'));
 }
 
@@ -10071,17 +14327,17 @@ function openClassStudentsModal(className, targetSection = null) {
   });
 
   const modalHtml = `
-    <div class="modal-overlay active" id="classStudentsModal" style="z-index:99999; backdrop-filter:blur(8px);">
-      <div class="modal-box" style="max-width:96vw; width:96vw; max-height:94vh; background:#0f172a; color:#ffffff; padding:28px; border-radius:20px; border:2px solid #38bdf8; box-shadow:0 25px 50px -12px rgba(0,0,0,0.85); position:relative; display:flex; flex-direction:column;">
-        <button onclick="document.getElementById('classStudentsModal').remove()" style="position:absolute; top:16px; right:20px; background:#334155; color:#ffffff; border:none; width:36px; height:36px; border-radius:50%; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">X</button>
+    <div class="modal-overlay active class-students-modal" id="classStudentsModal" style="z-index:99999; backdrop-filter:blur(8px);">
+      <div class="modal-box theme-panel-modal" style="max-width:96vw; width:96vw; max-height:94vh; padding:28px; border-radius:20px; border:2px solid var(--accent-primary); box-shadow:0 25px 50px -12px rgba(0,0,0,0.35); position:relative; display:flex; flex-direction:column;">
+        <button onclick="document.getElementById('classStudentsModal').remove()" style="position:absolute; top:16px; right:20px; background:var(--bg-card); color:var(--text-main); border:1px solid var(--border-color); width:36px; height:36px; border-radius:50%; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">X</button>
 
         <!-- TOP HEADER BAR -->
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:18px; border-bottom:1px solid #334155; padding-bottom:14px; flex-wrap:wrap; gap:12px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:18px; border-bottom:1px solid var(--border-color); padding-bottom:14px; flex-wrap:wrap; gap:12px;">
           <div>
-            <h3 style="margin:0; color:#38bdf8; font-size:1.4rem; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+            <h3 style="margin:0; color:var(--accent-primary); font-size:1.4rem; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
               <i class="fa-solid fa-users"></i> Class Student Directory: ${className}
             </h3>
-            <p style="margin:4px 0 0 0; font-size:0.88rem; color:#cbd5e1;">Session ${currentSession} - Total ${allClassStudents.length} Enrolled Students</p>
+            <p class="theme-panel-muted" style="margin:4px 0 0 0; font-size:0.88rem;">Session ${currentSession} - Total ${allClassStudents.length} Enrolled Students</p>
           </div>
           
           <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
@@ -10109,10 +14365,10 @@ function openClassStudentsModal(className, targetSection = null) {
         </div>
 
         <!-- FULL WIDTH EXPANDED DATA TABLE -->
-        <div class="data-table-container" style="flex:1; max-height:65vh; overflow-y:auto; border:1px solid #334155; border-radius:12px; background:#0f172a;">
+        <div class="data-table-container theme-panel-table-wrap" style="flex:1; max-height:65vh; overflow-y:auto; border:1px solid var(--border-color); border-radius:12px;">
           <table class="data-table" style="font-size:0.88rem; width:100%;">
             <thead>
-              <tr style="background:#1e293b; color:#38bdf8;">
+              <tr class="theme-panel-table-head">
                 <th style="padding:12px;">Roll</th>
                 <th style="padding:12px;">Student Name</th>
                 <th style="padding:12px;">Admission No</th>
@@ -10120,34 +14376,32 @@ function openClassStudentsModal(className, targetSection = null) {
                 <th style="padding:12px;">Date of Birth (DOB)</th>
                 <th style="padding:12px;">Father's Name</th>
                 <th style="padding:12px;">Parent Phone</th>
-                <th style="padding:12px;">NFC Card UID</th>
                 <th style="padding:12px;">Actions</th>
               </tr>
             </thead>
             <tbody>
               ${displayStudents.length === 0 ? `
-                <tr><td colspan="9" style="text-align:center; padding:40px; color:#cbd5e1; font-size:1rem; font-weight:700;">No students enrolled in ${className} (Section ${currentSectionFilter}) yet.</td></tr>
+                <tr><td colspan="8" style="text-align:center; padding:40px; color:var(--text-muted); font-size:1rem; font-weight:700;">No students enrolled in ${className} (Section ${currentSectionFilter}) yet.</td></tr>
               ` : displayStudents.map((s, idx) => `
-                <tr style="border-bottom:1px solid #334155;">
+                <tr class="theme-panel-row" style="border-bottom:1px solid var(--border-color);">
                   <td><code>${String(idx + 1).padStart(2, '0')}</code></td>
                   <td>
                     <div style="display:flex; align-items:center; gap:10px;">
-                      <img src="${s.photo || 'https://images.unsplash.com/photo-1544717305-2782549b5136?w=150'}" style="width:34px; height:34px; border-radius:50%; object-fit:cover;">
-                      <strong style="color:#ffffff; font-size:0.95rem;">${s.name}</strong>
+                      ${getStudentDirectoryPhotoHtml(s, 34)}
+                      <strong class="theme-panel-name" style="font-size:0.95rem;">${s.name}</strong>
                     </div>
                   </td>
-                  <td><code>${s.admissionNo}</code></td>
+                  <td><span class="adm-no-chip">${s.admissionNo}</span></td>
                   <td><span class="badge badge-purple">${s.currentClass || className} - ${s.currentSection || s.section || 'A'}</span></td>
-                  <td><strong style="color:#38bdf8;">DOB: ${formatDobToDDMMYYYY(s.dob)}</strong></td>
-                  <td>${s.parentName}</td>
-                  <td>${s.parentPhone}</td>
-                  <td><code style="color:#22d3ee; font-weight:bold;">${s.nfcUid}</code></td>
+                  <td><strong style="color:var(--accent-primary);">DOB: ${formatStudentDob(s)}</strong></td>
+                  <td style="color:var(--text-main);">${s.parentName}</td>
+                  <td style="color:var(--text-main);">${s.parentPhone}</td>
                   <td>
                     <div style="display:flex; gap:6px;">
                       <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.78rem;" onclick="document.getElementById('classStudentsModal').remove(); openStudentProfile('${s.admissionNo}');">
                         <i class="fa-solid fa-eye"></i> Profile
                       </button>
-                      <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.78rem; background:rgba(56, 189, 248, 0.15); color:#38bdf8; border:1px solid #38bdf8;" onclick="document.getElementById('classStudentsModal').remove(); openEditStudentModal('${s.admissionNo}')">
+                      <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.78rem; background:rgba(56, 189, 248, 0.15); color:#0284c7; border:1px solid #38bdf8;" onclick="document.getElementById('classStudentsModal').remove(); openEditStudentModal('${s.admissionNo}')">
                         <i class="fa-solid fa-pen-to-square"></i> Edit
                       </button>
                       <button class="btn btn-primary" style="padding:5px 10px; font-size:0.78rem; background:#10b981; border:none;" onclick="document.getElementById('classStudentsModal').remove(); openCollectFeeModal('${s.admissionNo}');">
@@ -10168,21 +14422,34 @@ function openClassStudentsModal(className, targetSection = null) {
 }
 
 function renderClassesPage(container) {
+  const classes = ensureSchoolDataClasses();
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-chalkboard-user" style="color:var(--accent-primary)"></i> Classes & Sections Directory (Nursery to 10th)</h2>
-        <p class="page-subtitle">Create New Classes, Edit Class Names & Assign Class Teachers</p>
+        <p class="page-subtitle">Create classes and sections here. Assign <strong>one class teacher per section</strong> from Class Teacher Assignments.</p>
       </div>
-      <button class="btn btn-primary" onclick="openCreateClassModal()"><i class="fa-solid fa-plus"></i> Add New Class</button>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="window.location.hash='teacher-class-assignments'" style="background:#38bdf8; color:#0f172a; border:none; font-weight:800;">
+          <i class="fa-solid fa-user-tie"></i> Assign Class Teachers (by Section)
+        </button>
+        <button class="btn btn-secondary" onclick="restoreClassesFromRosterConfirmed()"><i class="fa-solid fa-rotate-left"></i> Restore Classes</button>
+        <button class="btn btn-primary" onclick="openCreateClassModal()"><i class="fa-solid fa-plus"></i> Add New Class</button>
+      </div>
     </div>
 
     <div class="grid-3">
-      ${SchoolData.classes.map(c => {
+      ${classes.map(c => {
         const studentCount = getStudentsByActiveSession().filter(s => {
           const detail = s.sessionDetails?.[SchoolData.activeSession];
           return (detail && detail.class === c.name) || (!detail && (s.currentClass || s.class) === c.name);
         }).length;
+        const sectionTeacherMap = getClassSectionTeachers(c);
+        const sectionTeacherLines = (c.sections || ['A']).map((section) => {
+          const key = normalizeClassSectionKey(section);
+          const teacher = sectionTeacherMap[key] || 'Not assigned';
+          return `<div style="padding-left:8px;"><span class="badge badge-purple" style="margin-right:6px;">Sec ${section}</span> ${escapeHtml(teacher)}</div>`;
+        }).join('');
 
         return `
           <div class="glass-card" style="display:flex; flex-direction:column; justify-content:space-between;">
@@ -10194,7 +14461,10 @@ function renderClassesPage(container) {
               
               <div style="font-size:0.88rem; color:var(--text-muted); display:flex; flex-direction:column; gap:8px; margin-bottom:16px;">
                 <div><i class="fa-solid fa-layer-group"></i> <strong>Sections:</strong> ${c.sections.join(', ')}</div>
-                <div><i class="fa-solid fa-user-tie" style="color:var(--accent-primary);"></i> <strong>Class Teacher:</strong> <span style="color:var(--text-main); font-weight:600;">${c.teacher}</span></div>
+                <div>
+                  <div><i class="fa-solid fa-user-tie" style="color:var(--accent-primary);"></i> <strong>Class Teachers:</strong></div>
+                  <div style="margin-top:6px; display:flex; flex-direction:column; gap:4px; color:var(--text-main); font-weight:600;">${sectionTeacherLines}</div>
+                </div>
                 <div><i class="fa-solid fa-door-open"></i> <strong>Room Allocation:</strong> ${c.room || 'Room 101'}</div>
               </div>
             </div>
@@ -10214,30 +14484,77 @@ function renderClassesPage(container) {
   `;
 }
 
-function getClassTeacherOptionsHtml(selectedTeacher = '', currentClassId = '') {
-  const assignedTeachers = new Map((SchoolData.classes || [])
-    .filter(c => c.id !== currentClassId && c.teacher)
-    .map(c => [String(c.teacher).trim().toLowerCase(), c.name]));
+function getRealTeacherNamesList() {
+  const staff = SchoolData.staffUsers || [];
+  const realStaffTeachers = staff
+    .filter(u => {
+      const role = String(u.role || '').toLowerCase();
+      const status = String(u.status || '').toLowerCase();
+      return status !== 'inactive' && status !== 'disabled' &&
+        (role.includes('teacher') || role.includes('admin') || role.includes('principal') || role.includes('staff') || role.includes('faculty'));
+    })
+    .map(u => String(u.name || '').trim())
+    .filter(Boolean);
 
-  const teacherNames = Array.from(new Set((SchoolData.teachers || []).map(t => t.name).filter(Boolean)));
-  if (selectedTeacher && !teacherNames.includes(selectedTeacher)) teacherNames.unshift(selectedTeacher);
+  // Also include teachers in SchoolData.teachers that match a real staff user
+  const matchedTeachers = (SchoolData.teachers || [])
+    .filter(t => {
+      const name = String(t.name || '').trim().toLowerCase();
+      return staff.some(u => String(u.name || '').trim().toLowerCase() === name || u.assignedTeacherId === t.id);
+    })
+    .map(t => String(t.name || '').trim())
+    .filter(Boolean);
+
+  const combined = Array.from(new Set([...realStaffTeachers, ...matchedTeachers]));
+  return combined.sort((a, b) => a.localeCompare(b));
+}
+
+function getClassTeacherOptionsHtml(selectedTeacher = '', currentClassId = '', currentSection = '') {
+  const assignedSlots = new Set();
+  (SchoolData.classes || []).forEach((cls) => {
+    const map = getClassSectionTeachers(cls);
+    (cls.sections || ['A']).forEach((section) => {
+      const key = normalizeClassSectionKey(section);
+      const teacher = map[key];
+      if (!teacher) return;
+      if (cls.id === currentClassId && normalizeClassSectionKey(currentSection) === key) return;
+      assignedSlots.add(`${String(teacher).trim().toLowerCase()}|${cls.id}|${key}`);
+    });
+  });
+
+  const teacherNames = getRealTeacherNamesList();
+  if (selectedTeacher && !teacherNames.includes(selectedTeacher)) {
+    teacherNames.unshift(selectedTeacher);
+  }
 
   return teacherNames.map(name => {
-    const assignedClass = assignedTeachers.get(String(name).trim().toLowerCase());
-    const disabled = assignedClass ? 'disabled' : '';
-    const suffix = assignedClass ? ` - already class teacher of ${assignedClass}` : '';
-    return `<option value="${name}" ${name === selectedTeacher ? 'selected' : ''} ${disabled}>${name}${suffix}</option>`;
+    const slotTakenElsewhere = (SchoolData.classes || []).some((cls) => {
+      if (cls.id === currentClassId) return false;
+      const map = getClassSectionTeachers(cls);
+      return Object.entries(map).some(([sec, teacher]) =>
+        String(teacher).trim().toLowerCase() === String(name).trim().toLowerCase() &&
+        normalizeClassSectionKey(currentSection || sec) === sec
+      );
+    });
+    const suffix = slotTakenElsewhere ? ' (assigned elsewhere)' : '';
+    return `<option value="${escapeHtml(name)}" ${name === selectedTeacher ? 'selected' : ''}>${escapeHtml(name)}${suffix}</option>`;
   }).join('');
 }
 
-function validateUniqueClassTeacher(teacherName, currentClassId = '') {
-  const existing = (SchoolData.classes || []).find(c =>
-    c.id !== currentClassId &&
-    c.teacher &&
-    String(c.teacher).trim().toLowerCase() === String(teacherName).trim().toLowerCase()
-  );
-  if (existing) {
-    showNotification(`${teacherName} is already assigned as class teacher for ${existing.name}. Choose another teacher first.`, 'error');
+
+function validateUniqueClassTeacher(teacherName, currentClassId = '', currentSection = 'A') {
+  if (!teacherName) return true;
+  const secKey = normalizeClassSectionKey(currentSection);
+  const duplicate = (SchoolData.classes || []).find((cls) => {
+    if (cls.id === currentClassId) return false;
+    const map = getClassSectionTeachers(cls);
+    return Object.entries(map).some(([section, teacher]) =>
+      normalizeClassSectionKey(section) === secKey &&
+      String(teacher).trim().toLowerCase() === String(teacherName).trim().toLowerCase()
+    );
+  });
+  if (duplicate) {
+    showNotification(`${teacherName} is already class teacher for ${duplicate.name} Section ${secKey}.`, 'error');
     return false;
   }
   return true;
@@ -10289,7 +14606,7 @@ function openCreateClassModal() {
   document.body.insertAdjacentHTML('beforeend', modalHtml);
 }
 
-function saveNewClass() {
+async function saveNewClass() {
   const name = document.getElementById('editClassName').value.trim();
   const teacher = document.getElementById('editClassTeacher').value.trim();
   const sections = document.getElementById('editClassSections').value.split(',').map(s => s.trim());
@@ -10299,24 +14616,35 @@ function saveNewClass() {
     showNotification('Class Name and Teacher Name are required!', 'error');
     return;
   }
-  if (!validateUniqueClassTeacher(teacher)) return;
+  if (!validateUniqueClassTeacher(teacher, '', 'A')) return;
 
   const newClassObj = {
     id: "cls_" + Date.now(),
     name: name,
-    sections: sections,
+    sections: sections.filter(Boolean).length ? sections : ['A'],
     teacher: teacher,
+    sectionTeachers: {},
     room: room
   };
+  setClassSectionTeacher(newClassObj, 'A', teacher);
 
-  SchoolData.classes.push(newClassObj);
+  try {
+    await persistDirectoryDelta({ scope: 'classAdmin', classUpserts: [newClassObj] }, `Class '${name}' created.`, { allowQueue: false });
+  } catch (err) { return; }
+
   const modal = document.getElementById('classEditModal');
   if (modal) modal.remove();
-
-  showNotification(`Class '${name}' created successfully!`, 'success');
   renderClassesPage(document.getElementById('contentBody'));
+}
 
-  saveSchoolDataToStorage();
+async function restoreClassesFromRosterConfirmed() {
+  const classes = ensureSchoolDataClasses().map(row => JSON.parse(JSON.stringify(row)));
+  await persistDirectoryDelta({
+    scope: 'classAdmin',
+    classUpserts: classes,
+    restoreClassIds: classes.map(row => row.id)
+  }, 'Classes list restored from student roster / defaults.', { allowQueue: false });
+  renderClassesPage(document.getElementById('contentBody'));
 }
 
 function openEditClassModal(classId) {
@@ -10341,11 +14669,12 @@ function openEditClassModal(classId) {
               <input type="text" id="editClassName" class="session-dropdown" value="${clsObj.name}">
             </div>
             <div>
-              <label style="font-size:0.8rem; font-weight:600;">Assigned Class Teacher *</label>
+              <label style="font-size:0.8rem; font-weight:600;">Default Class Teacher (Section A)</label>
               <select id="editClassTeacher" class="session-dropdown">
                 <option value="">Select class teacher</option>
-                ${getClassTeacherOptionsHtml(clsObj.teacher, clsObj.id)}
+                ${getClassTeacherOptionsHtml(getClassSectionTeachers(clsObj)['A'] || clsObj.teacher, clsObj.id, 'A')}
               </select>
+              <small style="color:#94a3b8; display:block; margin-top:6px;">For different teachers per section (A, B, C), use <a href="#teacher-class-assignments" style="color:#0284c7;">Class Teacher Assignments</a>.</small>
             </div>
             <div>
               <label style="font-size:0.8rem; font-weight:600;">Sections (Comma Separated)</label>
@@ -10374,54 +14703,51 @@ function openEditClassModal(classId) {
   document.body.insertAdjacentHTML('beforeend', modalHtml);
 }
 
-function saveClassEdit(classId) {
+async function saveClassEdit(classId) {
   const clsObj = SchoolData.classes.find(c => c.id === classId);
   if (!clsObj) return;
-
   const name = document.getElementById('editClassName').value.trim();
   const teacher = document.getElementById('editClassTeacher').value.trim();
   if (!name || !teacher) {
     showNotification('Class Name and Teacher Name are required!', 'error');
     return;
   }
-  if (!validateUniqueClassTeacher(teacher, classId)) return;
-  clsObj.name = name;
-  clsObj.teacher = teacher;
-  clsObj.sections = document.getElementById('editClassSections').value.split(',').map(s => s.trim());
-  clsObj.room = document.getElementById('editClassRoom').value.trim();
+  if (!validateUniqueClassTeacher(teacher, classId, 'A')) return;
+  const updatedClass = JSON.parse(JSON.stringify(clsObj));
+  updatedClass.name = name;
+  updatedClass.sections = document.getElementById('editClassSections').value.split(',').map(s => s.trim()).filter(Boolean);
+  updatedClass.room = document.getElementById('editClassRoom').value.trim();
+  setClassSectionTeacher(updatedClass, 'A', teacher);
+
+  try {
+    await persistDirectoryDelta({ scope: 'classAdmin', classUpserts: [updatedClass] }, `Class details for ${updatedClass.name} saved.`, { allowQueue: false });
+  } catch (err) { return; }
 
   const modal = document.getElementById('classEditModal');
   if (modal) modal.remove();
-
-  showNotification(`Class details updated for ${clsObj.name}!`, 'success');
   renderClassesPage(document.getElementById('contentBody'));
-
-  saveSchoolDataToStorage();
 }
 
 function canCurrentUserDeleteClasses() {
-  const activeUser = getCurrentActiveUser();
-  return !!activeUser && (
-    activeUser.role === 'Super Admin' ||
-    activeUser.role === 'Principal' ||
-    hasUserAccessPermission(activeUser, 'class_teacher_assignment', 'delete')
-  );
+  return isErpAdminUser(getCurrentActiveUser());
 }
 
-function deleteClass(classId) {
+async function deleteClass(classId) {
   if (!canCurrentUserDeleteClasses()) {
-    showNotification('Access denied: class teachers cannot delete classes.', 'warning');
+    showNotification('Access denied: only Super Admin / Principal can delete classes.', 'warning');
     return;
   }
 
-  SchoolData.classes = SchoolData.classes.filter(c => c.id !== classId);
+  const cls = (SchoolData.classes || []).find(row => row.id === classId);
+  if (!cls) return;
+  if (!window.confirm(`Remove "${cls.name}" from the Classes Directory?\n\nThe server will refuse this if students are still enrolled. The class can later be explicitly restored.`)) return;
+  try {
+    await persistDirectoryDelta({ scope: 'classAdmin', classDeletedIds: [classId] }, `Class '${cls.name}' removed.`, { allowQueue: false });
+  } catch (err) { return; }
+
   const modal = document.getElementById('classEditModal');
   if (modal) modal.remove();
-
-  showNotification('Class deleted successfully!', 'info');
   renderClassesPage(document.getElementById('contentBody'));
-
-  saveSchoolDataToStorage();
 }
 
 function renderTeachersPage(container) {
@@ -10464,7 +14790,7 @@ function renderTeachersPage(container) {
               <div><i class="fa-solid fa-user-lock"></i> <strong>ERP Login:</strong> ${canMap ? `@${linkedUser.username}` : '<span style="color:#f59e0b;">Not linked — create user first</span>'}</div>
               <div><i class="fa-solid fa-chalkboard"></i> <strong>Classes Taught:</strong> ${(t.classesTaught || []).join(', ') || '-'}</div>
               <div>
-                <i class="fa-solid fa-list-check" style="color:#38bdf8;"></i> <strong>Assigned Subject Mappings:</strong><br>
+                <i class="fa-solid fa-list-check" style="color:#0284c7;"></i> <strong>Assigned Subject Mappings:</strong><br>
                 ${(t.subjectMappings && t.subjectMappings.length > 0) ? t.subjectMappings.map(m => {
                   const classLabel = (Array.isArray(m.classes) && m.classes.length)
                     ? (m.classes.some((c) => isUniversalSubjectClass(c)) ? 'All Classes' : m.classes.join(', '))
@@ -10796,7 +15122,7 @@ function openTeacherSubjectAssignmentsModal(teacherId) {
     <div class="modal-overlay active" id="tchSubjectModal" style="z-index:999999; backdrop-filter:blur(8px);">
       <div class="modal-box" style="max-width:720px; width:95%; background:#0f172a; color:#ffffff; padding:24px; border-radius:18px; border:2px solid #38bdf8; box-shadow:0 25px 50px -12px rgba(56,189,248,0.3);">
         <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; padding-bottom:14px; margin-bottom:18px;">
-          <h3 style="margin:0; color:#38bdf8; font-size:1.2rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+          <h3 style="margin:0; color:#0284c7; font-size:1.2rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
             <i class="fa-solid fa-book-open"></i> Configure Subject & Class Mappings: ${escapeHtml(teacher.name)}
           </h3>
           <button onclick="document.getElementById('tchSubjectModal').remove()" style="background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer; font-size:1rem;">X</button>
@@ -10809,7 +15135,7 @@ function openTeacherSubjectAssignmentsModal(teacherId) {
           and <strong>Maths · Class 5 · Sec B</strong> in another row — allowed.
           Same subject + same class + overlapping section (All Secs vs Sec B) is blocked.
         </p>
-        <p id="tchMappingOverlapTip" data-teacher-id="${escapeHtml(teacher.id)}" data-teacher-name="${escapeHtml(teacher.name)}" style="display:none; font-size:0.82rem; color:#fbbf24; background:#422006; border:1px solid #f59e0b; padding:10px 12px; border-radius:8px; margin:0 0 14px 0;"></p>
+        <p id="tchMappingOverlapTip" data-teacher-id="${escapeHtml(teacher.id)}" data-teacher-name="${escapeHtml(teacher.name)}" style="display:none; font-size:0.82rem; color:#b45309; background:#422006; border:1px solid #f59e0b; padding:10px 12px; border-radius:8px; margin:0 0 14px 0;"></p>
 
         <div id="subjectMappingsContainer" style="display:flex; flex-direction:column; gap:12px; max-height:420px; overflow-y:auto; margin-bottom:18px;">
           ${rowsHtml}
@@ -10845,7 +15171,7 @@ function addSubjectMappingRowToModal() {
   validateTeacherMappingFormLive();
 }
 
-function saveTeacherSubjectAssignments(teacherId) {
+async function saveTeacherSubjectAssignments(teacherId) {
   const teacher = SchoolData.teachers.find(t => t.id === teacherId);
   if (!teacher) return;
 
@@ -10887,6 +15213,7 @@ function saveTeacherSubjectAssignments(teacherId) {
     return;
   }
 
+  const subjectsBefore = new Map((SchoolData.subjects || []).map(subject => [subject.id, JSON.stringify(subject)]));
   const newMappings = parsed.drafts;
   const classesTaughtSet = new Set();
   newMappings.forEach((m) => {
@@ -10913,10 +15240,14 @@ function saveTeacherSubjectAssignments(teacherId) {
 
   applyTeacherMappingsToSubjectsDirectory(teacher, newMappings);
 
-  saveSchoolDataToStorage();
+  const changedSubjects = (SchoolData.subjects || []).filter(subject => subjectsBefore.get(subject.id) !== JSON.stringify(subject));
+  await persistDirectoryDelta({
+    scope: 'teacherMappings',
+    teacherUpserts: [teacher],
+    staffUpserts: [linkedUser],
+    subjectUpserts: changedSubjects
+  }, `Saved ${newMappings.length} subject and class assignments for ${teacher.name} (@${linkedUser.username}).`);
   document.getElementById('tchSubjectModal')?.remove();
-
-  showNotification(`Saved: Saved ${newMappings.length} Subject & Class Assignments for ${teacher.name} (@${linkedUser.username})!`, 'success');
   renderTeachersPage(document.getElementById('contentBody'));
 }
 
@@ -11033,10 +15364,13 @@ async function saveNewTeacher() {
     user.assignedClasses = newTch.classesTaught;
   }
 
+  await persistDirectoryDelta({
+    scope: 'teacher',
+    teacherUpserts: [newTch],
+    staffUpserts: [user]
+  }, `Linked teacher profile for ${user.name} (@${user.username}).`);
   document.getElementById('teacherModal')?.remove();
-  showNotification(`Linked teacher profile for ${user.name} (@${user.username}). Now map subjects.`, 'success');
   renderTeachersPage(document.getElementById('contentBody'));
-  saveSchoolDataToStorage();
 }
 
 function openEditTeacherModal(tchId) {
@@ -11131,16 +15465,12 @@ async function saveTeacherEdit(tchId) {
   const sigFile = document.getElementById('tchSignature')?.files?.[0];
   if (sigFile) tch.signatureDataUrl = await fileToDataUrl(sigFile);
 
-  const modal = document.getElementById('teacherModal');
-  if (modal) modal.remove();
-
-  showNotification(`Done: Profile updated for ${tch.name}!`, 'success');
+  await persistDirectoryDelta({ scope: 'teacher', teacherUpserts: [tch] }, `Profile updated for ${tch.name}.`);
+  document.getElementById('teacherModal')?.remove();
   renderTeachersPage(document.getElementById('contentBody'));
-
-  saveSchoolDataToStorage();
 }
 
-function deleteTeacher(tchId) {
+async function deleteTeacher(tchId) {
   const activeUser = getCurrentActiveUser();
   const isAdmin = activeUser && (activeUser.role === 'Super Admin' || activeUser.role === 'Principal');
   if (!isAdmin) {
@@ -11155,30 +15485,33 @@ function deleteTeacher(tchId) {
     return;
   }
 
+  const previousTeachers = SchoolData.teachers.slice();
+  const previousAssignedTeacherId = linked?.assignedTeacherId || '';
   SchoolData.teachers = SchoolData.teachers.filter(t => t.id !== tchId);
   if (linked) {
     linked.assignedTeacherId = '';
   }
   document.getElementById('teacherModal')?.remove();
 
-  showNotification('Teacher profile deleted from directory.', 'info');
-  renderTeachersPage(document.getElementById('contentBody'));
-
-  saveSchoolDataToStorage({ skipCloudPush: true });
-  if (typeof pushStaffAuthorityToCloud === 'function') {
-    pushStaffAuthorityToCloud().catch((err) => {
-      showNotification(`Teacher removed on screen, but cloud save failed: ${err.message}`, 'error');
-    });
-  } else if (typeof pushSchoolDataToCloud === 'function') {
-    pushSchoolDataToCloud({ skipMergePull: true }).catch(() => {});
+  try {
+    await persistDirectoryDelta({
+      scope: 'teacher',
+      teacherDeletedIds: [tchId],
+      staffUpserts: linked ? [linked] : []
+    }, 'Teacher profile deleted from directory.', { allowQueue: false });
+  } catch (error) {
+    SchoolData.teachers = previousTeachers;
+    if (linked) linked.assignedTeacherId = previousAssignedTeacherId;
+    return;
   }
+  renderTeachersPage(document.getElementById('contentBody'));
 }
 
 /* ============================================================================
    SUB-DIRECTORY MODULE: PERIOD TIMINGS SETTINGS (#period-settings)
    ============================================================================ */
 function renderPeriodSettingsPage(container) {
-  const periods = SchoolData.periodSettings;
+  const periods = ensureSchoolDataPeriodSettings();
 
   container.innerHTML = `
     <div class="page-header">
@@ -11214,10 +15547,10 @@ function renderPeriodSettingsPage(container) {
             ${periods.map((p, idx) => `
               <tr>
                 <td><code>${idx + 1}</code></td>
-                <td><input type="text" class="session-dropdown" style="width:160px; font-weight:bold;" value="${p.name}"></td>
-                <td><input type="text" class="session-dropdown" style="width:120px;" value="${p.startTime}"></td>
-                <td><input type="text" class="session-dropdown" style="width:120px;" value="${p.endTime}"></td>
-                <td><input type="number" class="session-dropdown" style="width:90px; text-align:center;" value="${p.durationMins}"></td>
+                <td><input type="text" class="session-dropdown period-name" style="width:160px; font-weight:bold;" value="${p.name}"></td>
+                <td><input type="time" class="session-dropdown period-start-time" style="width:140px; font-weight:bold;" value="${convert12hTo24h(p.startTime)}" onchange="recalculatePeriodDuration(this)"></td>
+                <td><input type="time" class="session-dropdown period-end-time" style="width:140px; font-weight:bold;" value="${convert12hTo24h(p.endTime)}" onchange="recalculatePeriodDuration(this)"></td>
+                <td><input type="number" class="session-dropdown period-duration-mins" style="width:90px; text-align:center; font-weight:bold;" value="${p.durationMins}"></td>
                 <td>
                   <select class="session-dropdown" style="width:140px;">
                     <option value="false" ${!p.isBreak ? 'selected' : ''}>Academic Class</option>
@@ -11246,10 +15579,10 @@ function addExtraPeriodToState() {
   const tr = document.createElement('tr');
   tr.innerHTML = `
     <td><code>${newIdx}</code></td>
-    <td><input type="text" class="session-dropdown" style="width:160px; font-weight:bold;" value="Period ${newIdx - 1}"></td>
-    <td><input type="text" class="session-dropdown" style="width:120px;" value="02:15 PM"></td>
-    <td><input type="text" class="session-dropdown" style="width:120px;" value="03:00 PM"></td>
-    <td><input type="number" class="session-dropdown" style="width:90px; text-align:center;" value="45"></td>
+    <td><input type="text" class="session-dropdown period-name" style="width:160px; font-weight:bold;" value="Period ${newIdx - 1}"></td>
+    <td><input type="time" class="session-dropdown period-start-time" style="width:140px; font-weight:bold;" value="14:15" onchange="recalculatePeriodDuration(this)"></td>
+    <td><input type="time" class="session-dropdown period-end-time" style="width:140px; font-weight:bold;" value="15:00" onchange="recalculatePeriodDuration(this)"></td>
+    <td><input type="number" class="session-dropdown period-duration-mins" style="width:90px; text-align:center; font-weight:bold;" value="45"></td>
     <td>
       <select class="session-dropdown" style="width:140px;">
         <option value="false" selected>Academic Class</option>
@@ -11261,18 +15594,76 @@ function addExtraPeriodToState() {
   showNotification(`Added Period ${newIdx} row to table!`, 'info');
 }
 
-function savePeriodSettingsFromPage() {
-  showNotification('Done: Period Timings & Duration Settings Saved Successfully!', 'success');
-  window.location.hash = 'timetable-class';
+function recalculatePeriodDuration(inputEl) {
+  const row = inputEl.closest('tr');
+  if (!row) return;
+  const startVal = row.querySelector('.period-start-time')?.value;
+  const endVal = row.querySelector('.period-end-time')?.value;
+  const durationInput = row.querySelector('.period-duration-mins');
+  if (!startVal || !endVal || !durationInput) return;
 
-  saveSchoolDataToStorage();
+  const parseTimeToMinutes = (time24Str) => {
+    const match = time24Str.match(/^(\d{1,2}):(\d{2})$/);
+    if (!match) return null;
+    return parseInt(match[1]) * 60 + parseInt(match[2]);
+  };
+
+  const startMin = parseTimeToMinutes(startVal);
+  const endMin = parseTimeToMinutes(endVal);
+  if (startMin !== null && endMin !== null) {
+    let diff = endMin - startMin;
+    if (diff < 0) diff += 24 * 60; // handle overnight transition
+    durationInput.value = diff;
+  }
+}
+
+async function savePeriodSettingsFromPage() {
+  const tbody = document.getElementById('periodSettingsTableBody');
+  if (!tbody) {
+    showNotification('Error: Settings table not found.', 'error');
+    return;
+  }
+  const rows = tbody.querySelectorAll('tr');
+  const newSettings = [];
+  rows.forEach((row, idx) => {
+    const name = (row.querySelector('.period-name')?.value || '').trim();
+    const startVal24 = row.querySelector('.period-start-time')?.value;
+    const endVal24 = row.querySelector('.period-end-time')?.value;
+    const startTime = convert24hTo12h(startVal24);
+    const endTime = convert24hTo12h(endVal24);
+    const durationMins = parseInt(row.querySelector('.period-duration-mins')?.value) || 45;
+    const isBreak = row.querySelector('select')?.value === 'true';
+    if (startVal24 && endVal24) {
+      newSettings.push({
+        periodNo: idx + 1,
+        name: name || `Period ${idx + 1}`,
+        startTime,
+        endTime,
+        durationMins,
+        isBreak
+      });
+    }
+  });
+  if (newSettings.length > 0) {
+    try {
+      await persistConfigurationDelta('periodSettings', 'school', newSettings, 'Period timings and duration settings saved.');
+    } catch (error) {
+      showNotification(`Period settings were not saved: ${error?.message || 'cloud rejected the change.'}`, 'error');
+      return;
+    }
+    SchoolData.periodSettings = newSettings;
+    saveSchoolDataToStorage({ skipCloudPush: true });
+    window.location.hash = 'timetable-class';
+  } else {
+    showNotification('Please enter at least one period timing!', 'warning');
+  }
 }
 
 /* ============================================================================
    SUB-DIRECTORY MODULES: CLASS TIMETABLE (#timetable-class) & TEACHER TIMETABLE (#timetable-teacher)
    ============================================================================ */
 function renderTimetableClassPage(container) {
-  const periodSettings = SchoolData.periodSettings;
+  const periodSettings = ensureSchoolDataPeriodSettings();
   const classNames = getSchoolClassNames();
   const defaultClass = classNames[0] || "Nursery";
 
@@ -11346,7 +15737,7 @@ function renderTimetableClassPage(container) {
 }
 
 function renderTimetableTeacherPage(container) {
-  const periodSettings = SchoolData.periodSettings;
+  const periodSettings = ensureSchoolDataPeriodSettings();
 
   container.innerHTML = `
     <div class="page-header">
@@ -11424,7 +15815,7 @@ function renderSubjectsPage(container) {
   if (typeof sanitizeSubjectsTeachersMustBeUsers === 'function' && sanitizeSubjectsTeachersMustBeUsers()) {
     saveSchoolDataToStorage();
   }
-  const subjects = SchoolData.subjects || [];
+  const subjects = ensureSchoolDataSubjects();
   const teacherUsers = getTeacherRoleUsersForSubjectAssign();
   const canAdd = canCurrentUserAddSubjects();
   const canModify = canCurrentUserModifySubjects();
@@ -11436,6 +15827,7 @@ function renderSubjectsPage(container) {
         <p class="page-subtitle">Subject scope can be All Classes; teachers are assigned <strong>per class</strong> in Teachers Directory (English school-wide ≠ one teacher everywhere). Marks stay in Exams. Only Super Admin / Principal can delete subjects.</p>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="restoreSchoolSubjectsFromDefaults()"><i class="fa-solid fa-rotate-left"></i> Restore Subjects</button>
         <button class="btn btn-secondary" onclick="window.location.hash='exams-entry'"><i class="fa-solid fa-table-cells"></i> Open Exams &amp; Marks</button>
         ${canAdd ? `<button class="btn btn-primary" onclick="openCreateSubjectModal()"><i class="fa-solid fa-plus"></i> Add New Subject</button>` : ''}
       </div>
@@ -11443,7 +15835,7 @@ function renderSubjectsPage(container) {
 
     ${teacherUsers.length === 0 ? `
       <div class="glass-card" style="margin-bottom:16px; border:1px solid #f59e0b;">
-        <p style="margin:0; color:#fbbf24; font-size:0.9rem;">
+        <p style="margin:0; color:#b45309; font-size:0.9rem;">
           <i class="fa-solid fa-triangle-exclamation"></i>
           No Teacher-role users yet. Open <strong>User Management</strong>, create logins with a Teacher role, then assign subjects.
         </p>
@@ -11558,7 +15950,7 @@ function openCreateSubjectModal() {
   toggleSubjectClassModeUi();
 }
 
-function saveNewSubject() {
+async function saveNewSubject() {
   if (!canCurrentUserAddSubjects()) {
     showNotification('Access denied: only office admin can add subjects.', 'warning');
     return;
@@ -11598,20 +15990,23 @@ function saveNewSubject() {
     newSub.teacher = teacherRaw || 'Unassigned';
   }
 
-  SchoolData.subjects.push(newSub);
-
-  const modal = document.getElementById('subjectModal');
-  if (modal) modal.remove();
-
-  showNotification(
+  await persistDirectoryDelta({ scope: 'subjectAdmin', subjectUpserts: [newSub] },
     isSubjectUniversal(newSub)
-      ? `Done: Subject '${name}' added for All Classes.`
-      : `Done: Subject '${name}' added for ${getSubjectClassLabel(newSub)}.`,
-    'success'
+      ? `Subject '${name}' added for All Classes.`
+      : `Subject '${name}' added for ${getSubjectClassLabel(newSub)}.`,
+    { allowQueue: false }
   );
+  document.getElementById('subjectModal')?.remove();
   renderSubjectsPage(document.getElementById('contentBody'));
+}
 
-  saveSchoolDataToStorage();
+function pushSchoolMetaToCloudNow() {
+  window._erpCloudMemoryDirty = true;
+  if (typeof flushCloudPushNow === 'function') {
+    flushCloudPushNow();
+  } else if (typeof scheduleCloudPush === 'function') {
+    scheduleCloudPush(0);
+  }
 }
 
 function openEditSubjectModal(subId) {
@@ -11657,7 +16052,7 @@ function openEditSubjectModal(subId) {
               Marks are entered in <strong>Exams &amp; Report Cards</strong> only.
             </p>
             ${!canDelete ? `
-            <p style="font-size:0.78rem; color:#fbbf24; margin:0; background:#1e293b; padding:8px 12px; border-radius:6px;">
+            <p style="font-size:0.78rem; color:#b45309; margin:0; background:#1e293b; padding:8px 12px; border-radius:6px;">
               <i class="fa-solid fa-lock"></i> Only Super Admin / Principal can delete subjects.
             </p>
             ` : ''}
@@ -11681,7 +16076,7 @@ function openEditSubjectModal(subId) {
   toggleSubjectClassModeUi();
 }
 
-function saveSubjectEdit(subId) {
+async function saveSubjectEdit(subId) {
   if (!canCurrentUserModifySubjects()) {
     showNotification('Access denied: teachers cannot edit the Subjects Directory.', 'warning');
     return;
@@ -11700,43 +16095,35 @@ function saveSubjectEdit(subId) {
     return;
   }
 
-  sub.name = document.getElementById('subName').value.trim();
-  applySubjectClassScope(sub, scope.mode, scope.classes);
-  sub.periodsPerWeek = parseInt(document.getElementById('subPeriods').value) || 5;
-  if (isSubjectUniversal(sub) || getSubjectAppliesToClasses(sub).length !== 1) {
-    sub.teacher = 'Unassigned';
+  const updatedSubject = JSON.parse(JSON.stringify(sub));
+  updatedSubject.name = document.getElementById('subName').value.trim();
+  applySubjectClassScope(updatedSubject, scope.mode, scope.classes);
+  updatedSubject.periodsPerWeek = parseInt(document.getElementById('subPeriods').value) || 5;
+  if (isSubjectUniversal(updatedSubject) || getSubjectAppliesToClasses(updatedSubject).length !== 1) {
+    updatedSubject.teacher = 'Unassigned';
   } else {
-    sub.teacher = teacherRaw || 'Unassigned';
+    updatedSubject.teacher = teacherRaw || 'Unassigned';
   }
 
-  const modal = document.getElementById('subjectModal');
-  if (modal) modal.remove();
-
-  showNotification(`Done: Subject details updated for ${sub.name}!`, 'success');
+  await persistDirectoryDelta({ scope: 'subjectAdmin', subjectUpserts: [updatedSubject] }, `Subject details updated for ${updatedSubject.name}.`, { allowQueue: false });
+  document.getElementById('subjectModal')?.remove();
   renderSubjectsPage(document.getElementById('contentBody'));
-
-  saveSchoolDataToStorage();
 }
 
-function deleteSubject(subId) {
+async function deleteSubject(subId) {
   if (!canCurrentUserDeleteSubjects()) {
     showNotification('Access denied: teachers cannot delete subjects. Ask Super Admin / Principal.', 'warning');
     return;
   }
   const sub = (SchoolData.subjects || []).find(s => s.id === subId);
   const label = sub?.name || 'this subject';
-  if (!window.confirm(`Delete subject "${label}" from the Subjects Directory?\n\nThis cannot be undone. Marks already entered are kept.`)) {
+  if (!window.confirm(`Remove subject "${label}" from the Subjects Directory?\n\nMarks already entered are kept. An administrator can explicitly restore the subject later.`)) {
     return;
   }
 
-  SchoolData.subjects = SchoolData.subjects.filter(s => s.id !== subId);
-  const modal = document.getElementById('subjectModal');
-  if (modal) modal.remove();
-
-  showNotification('Subject deleted successfully.', 'info');
+  await persistDirectoryDelta({ scope: 'subjectAdmin', subjectDeletedIds: [subId] }, `Subject '${label}' removed.`, { allowQueue: false });
+  document.getElementById('subjectModal')?.remove();
   renderSubjectsPage(document.getElementById('contentBody'));
-
-  saveSchoolDataToStorage();
 }
 
 function goToSubjectMarksEntry(subjectName, className) {
@@ -11746,15 +16133,15 @@ function goToSubjectMarksEntry(subjectName, className) {
   }, 200);
 }
 
-function openMarksEntryModal() {
-  saveEnteredMarks();
+async function openMarksEntryModal() {
+  await saveEnteredMarks();
 }
 
-function saveAndExportVisibleClassSheet() {
+async function saveAndExportVisibleClassSheet() {
   if (blockExamSheetExportIfDenied()) return;
   const activeClass = document.getElementById('examClassSelector')?.value || window.activeExamClass || 'Class 5';
   const examTerm = document.getElementById('examTermSelector')?.value || window.activeExamTerm || 'half_yearly';
-  saveEnteredMarks();
+  await saveEnteredMarks();
   if (examTerm === 'final_annual') {
     exportClassFinalAnnualExcel(activeClass);
   } else if (examTerm === 'consolidated') {
@@ -11764,37 +16151,109 @@ function saveAndExportVisibleClassSheet() {
   }
 }
 
-function saveEnteredMarks() {
+async function exportVisibleClassSheetOnly() {
+  if (blockExamSheetExportIfDenied()) return;
+  const activeClass = document.getElementById('examClassSelector')?.value || window.activeExamClass || 'Class 5';
+  const examTerm = document.getElementById('examTermSelector')?.value || window.activeExamTerm || 'half_yearly';
+  if (examTerm === 'final_annual') {
+    exportClassFinalAnnualExcel(activeClass);
+  } else if (examTerm === 'consolidated') {
+    exportMasterConsolidatedClassExcel(activeClass);
+  } else {
+    exportClassHalfYearlyExcel(activeClass);
+  }
+}
+
+async function saveEnteredMarks(showToast = false) {
   const rows = document.querySelectorAll('#subjectTableContainer tr.marks-entry-row');
   let savedCount = 0;
+  
+  const activeClass = document.getElementById('examClassSelector')?.value || window.activeExamClass || 'Class 5';
+  const activeSession = SchoolData.activeSession || '';
+
+  const deltas = [];
 
   rows.forEach(row => {
     const admissionNo = row.getAttribute('data-admission');
     const student = SchoolData.students.find(s => String(s.admissionNo) === String(admissionNo));
     if (!student) return;
+    
+    // Track if this specific student had any mark inputs processed
+    const subjectCode = window.activeExamSubject || 'ENG';
+    const assessments = [];
+
     if (!student.examMarks) student.examMarks = {};
+    if (!student.examMarks[subjectCode]) student.examMarks[subjectCode] = {};
 
     row.querySelectorAll('input.marks-input').forEach(input => {
       const subject = input.getAttribute('data-subject');
       const exam = input.getAttribute('data-exam');
-      if (!subject || !exam) return;
-      if (!student.examMarks[subject]) student.examMarks[subject] = {};
+      if (!subject || !exam || subject !== subjectCode) return;
 
-      if (input.value === '') {
+      const normalizedValue = clampExamMarkInput(input);
+      if (normalizedValue === '') {
         delete student.examMarks[subject][exam];
       } else {
-        student.examMarks[subject][exam] = clampExamMarkInput(input);
+        student.examMarks[subject][exam] = normalizedValue;
       }
+      
+      assessments.push({
+        key: exam,
+        value: String(normalizedValue || '').toUpperCase(),
+        max: Number(input.getAttribute('data-max')) || 100,
+        expectedRevision: Number(
+          (student.examMarks[subject] && typeof student.examMarks[subject][exam] === 'object'
+            && student.examMarks[subject][exam]?.revision)
+          || input.getAttribute('data-revision')
+          || 0
+        )
+      });
       savedCount++;
     });
+    
+    if (assessments.length > 0) {
+      deltas.push({
+        admissionNo: String(admissionNo),
+        subjectCode: subjectCode,
+        sessionName: activeSession,
+        term: window.activeExamTerm || '',
+        className: String(student.currentClass || student.class || activeClass),
+        section: String(student.currentSection || student.section || 'A'),
+        assessments: assessments
+      });
+    }
   });
 
-  saveSchoolDataToStorage();
-  showNotification(`Saved ${savedCount} exam mark entries for the visible class sheet.`, 'success');
-  return;
-  showNotification('Done: All Student Subject Exam Marks Matrix Saved!', 'success');
+  saveSchoolDataToStorage({ skipCloudPush: true });
 
-  saveSchoolDataToStorage();
+  try {
+    if (deltas.length > 0 && window.ERPOutbox && typeof window.ERPOutbox.enqueue === 'function') {
+      for (const delta of deltas) {
+        await window.ERPOutbox.enqueue('saveMarksDelta', delta);
+      }
+      if (window.ERPOutbox.flush) void window.ERPOutbox.flush();
+      if (showToast) showNotification(`Saved ${savedCount} exam mark entries to cloud.`, 'success');
+    } else if (deltas.length > 0) {
+      // Direct fallback if indexeddb outbox is missing
+      for (const delta of deltas) {
+        await fetch('/api/erp-cloud?action=saveMarksDelta', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(typeof getErpSessionToken === 'function' && getErpSessionToken() ? { 'X-ERP-Session': getErpSessionToken() } : {})
+          },
+          body: JSON.stringify(delta)
+        });
+      }
+      if (showToast) showNotification(`Saved ${savedCount} exam mark entries directly to cloud.`, 'success');
+    } else {
+      if (showToast) showNotification('No marks were entered or changed.', 'info');
+    }
+  } catch (error) {
+    showNotification(`Cloud sync failed: ${error.message}`, 'error');
+  }
+
+  return savedCount;
 }
 
 function openMarksScalerCalculatorModal() {
@@ -11903,13 +16362,28 @@ function openUniversalWeightageModal() {
   document.body.insertAdjacentHTML('beforeend', modalHtml);
 }
 
-function saveUniversalWeightageRules() {
+async function saveUniversalWeightageRules() {
   const modal = document.getElementById('weightageBuilderModal');
-  if (modal) modal.remove();
-
-  showNotification('Done: Independent Term 1 (100) & Term 2 (100) Weightage Rules Saved!', 'success');
-
-  saveSchoolDataToStorage();
+  const inputs = Array.from(modal?.querySelectorAll('input[type="number"]') || []);
+  if (inputs.length < 6) {
+    showNotification('Weightage inputs were not found. Nothing was saved.', 'error');
+    return;
+  }
+  const values = inputs.slice(0, 6).map(input => Number(input.value || 0));
+  const term1Total = values[0] + values[1] + values[2];
+  const term2Total = values[3] + values[4] + values[5];
+  if (term1Total !== 100 || term2Total !== 100) {
+    showNotification(`Each term must total 100 marks. Current totals: Term 1 = ${term1Total}, Term 2 = ${term2Total}.`, 'error');
+    return;
+  }
+  await persistExamConfigurationDelta({
+    scope: 'universalWeightage',
+    weightage: {
+      ut1: values[0], ut2: values[1], hy: values[2],
+      ut3: values[3], ut4: values[4], fin: values[5]
+    }
+  }, 'Universal Term 1 and Term 2 weightage rules saved.');
+  modal?.remove();
 }
 
 function openTeacherPeriodMatrixModal(tchId) {
@@ -11920,8 +16394,9 @@ function openTeacherPeriodMatrixModal(tchId) {
   if (!tch) return;
 
   const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-  const periods = SchoolData.periodSettings.filter(p => !p.isBreak);
+  const periods = ensureSchoolDataPeriodSettings().filter(p => !p.isBreak);
   const classNames = getSchoolClassNames();
+  const savedMatrix = SchoolData.teacherPeriodMatrices?.[tch.id]?.assignments || {};
 
   const modalHtml = `
     <div class="modal-overlay active" id="periodMatrixModal" style="z-index:99999;">
@@ -11949,9 +16424,9 @@ function openTeacherPeriodMatrixModal(tchId) {
                     <td><strong>${day}</strong></td>
                     ${periods.map((p, pIdx) => `
                       <td>
-                        <select class="session-dropdown" style="padding:3px 6px; font-size:0.75rem; width:85px;">
-                          <option value="Off">Off</option>
-                          ${classNames.map(name => `<option value="${name}">${name}</option>`).join('')}
+                        <select class="session-dropdown teacher-period-matrix-select" data-day="${day}" data-period="${p.periodNo}" style="padding:3px 6px; font-size:0.75rem; width:85px;">
+                          <option value="Off" ${String(savedMatrix?.[day]?.[p.periodNo] || 'Off') === 'Off' ? 'selected' : ''}>Off</option>
+                          ${classNames.map(name => `<option value="${name}" ${String(savedMatrix?.[day]?.[p.periodNo] || '') === String(name) ? 'selected' : ''}>${name}</option>`).join('')}
                         </select>
                       </td>
                     `).join('')}
@@ -11962,7 +16437,7 @@ function openTeacherPeriodMatrixModal(tchId) {
           </div>
 
           <div style="text-align:right;">
-            <button class="btn btn-primary" onclick="saveTeacherPeriodMatrix('${tch.name}')">
+            <button class="btn btn-primary" id="saveTeacherPeriodMatrixBtn" onclick="saveTeacherPeriodMatrix('${tch.id}')">
               <i class="fa-solid fa-floppy-disk"></i> Save 6-Day Period Matrix
             </button>
           </div>
@@ -11973,11 +16448,41 @@ function openTeacherPeriodMatrixModal(tchId) {
   document.body.insertAdjacentHTML('beforeend', modalHtml);
 }
 
-function saveTeacherPeriodMatrix(teacherName) {
-  const modal = document.getElementById('periodMatrixModal');
-  if (modal) modal.remove();
-  saveSchoolDataToStorage();
-  showNotification(`Done: Timetable Period Assignments Saved for ${teacherName}!`, 'success');
+async function saveTeacherPeriodMatrix(teacherId) {
+  const teacher = (SchoolData.teachers || []).find(t => String(t.id) === String(teacherId));
+  if (!teacher) return;
+  const assignments = {};
+  document.querySelectorAll('#periodMatrixModal .teacher-period-matrix-select').forEach((select) => {
+    const day = select.getAttribute('data-day');
+    const periodNo = select.getAttribute('data-period');
+    if (!day || !periodNo) return;
+    if (!assignments[day]) assignments[day] = {};
+    assignments[day][periodNo] = select.value || 'Off';
+  });
+  const candidateMatrix = {
+    teacherId: teacher.id,
+    teacherName: teacher.name,
+    updatedAt: new Date().toISOString(),
+    assignments
+  };
+  const button = document.getElementById('saveTeacherPeriodMatrixBtn');
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving…';
+  }
+  try {
+    await persistConfigurationDelta('teacherPeriodMatrix', String(teacher.id), candidateMatrix, `Timetable period assignments saved for ${teacher.name}.`);
+    SchoolData.teacherPeriodMatrices = { ...(SchoolData.teacherPeriodMatrices || {}), [teacher.id]: candidateMatrix };
+    saveSchoolDataToStorage({ skipCloudPush: true });
+    document.getElementById('periodMatrixModal')?.remove();
+  } catch (error) {
+    showNotification(`Timetable assignments were not saved: ${error?.message || 'cloud rejected the change.'}`, 'error');
+  } finally {
+    if (button && document.body.contains(button)) {
+      button.disabled = false;
+      button.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> Save 6-Day Period Matrix';
+    }
+  }
 }
 
 /* ============================================================================
@@ -11985,104 +16490,862 @@ function saveTeacherPeriodMatrix(teacherName) {
    ============================================================================ */
 if (!SchoolData.classFeeMaster) {
   SchoolData.classFeeMaster = {
-    "Nursery": { monthlyTuition: 1200, annualCharges: 2000, examFee: 400, computerFee: 0, admissionFee: 1000 },
-    "LKG":     { monthlyTuition: 1300, annualCharges: 2000, examFee: 400, computerFee: 0, admissionFee: 1000 },
-    "UKG":     { monthlyTuition: 1400, annualCharges: 2200, examFee: 400, computerFee: 0, admissionFee: 1000 },
-    "Class 1": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, computerFee: 100, admissionFee: 1200 },
-    "Class 2": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, computerFee: 100, admissionFee: 1200 },
-    "Class 3": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, computerFee: 150, admissionFee: 1200 },
-    "Class 4": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, computerFee: 150, admissionFee: 1200 },
-    "Class 5": { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, computerFee: 200, admissionFee: 1200 },
-    "Class 6": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, computerFee: 200, admissionFee: 1500 },
-    "Class 7": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, computerFee: 200, admissionFee: 1500 },
-    "Class 8": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, computerFee: 200, admissionFee: 1500 },
-    "Class 9": { monthlyTuition: 2200, annualCharges: 3500, examFee: 800, computerFee: 300, admissionFee: 2000 },
-    "Class 10":{ monthlyTuition: 2500, annualCharges: 4000, examFee: 1000,computerFee: 300, admissionFee: 2000 }
+    "Nursery": { monthlyTuition: 1200, annualCharges: 2000, examFee: 400, admissionFee: 1000 },
+    "LKG":     { monthlyTuition: 1300, annualCharges: 2000, examFee: 400, admissionFee: 1000 },
+    "UKG":     { monthlyTuition: 1400, annualCharges: 2200, examFee: 400, admissionFee: 1000 },
+    "Class 1": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, admissionFee: 1200 },
+    "Class 2": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, admissionFee: 1200 },
+    "Class 3": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, admissionFee: 1200 },
+    "Class 4": { monthlyTuition: 1500, annualCharges: 2500, examFee: 500, admissionFee: 1200 },
+    "Class 5": { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, admissionFee: 1200 },
+    "Class 6": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, admissionFee: 1500 },
+    "Class 7": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, admissionFee: 1500 },
+    "Class 8": { monthlyTuition: 1800, annualCharges: 3000, examFee: 600, admissionFee: 1500 },
+    "Class 9": { monthlyTuition: 2200, annualCharges: 3500, examFee: 800, admissionFee: 2000 },
+    "Class 10":{ monthlyTuition: 2500, annualCharges: 4000, examFee: 1000, admissionFee: 2000 }
   };
 }
 
-if (!SchoolData.feeScheduleRules) {
+if (!SchoolData.feeScheduleRules || !SchoolData.feeScheduleRules.annualCharges || !SchoolData.feeScheduleRules.examFee) {
   SchoolData.feeScheduleRules = {
     annualCharges: { frequency: "Once a Year", targetMonths: ["April"] },
     examFee:       { frequency: "Twice a Year", targetMonths: ["August", "February"] }
   };
 }
 
-function getStudentFeeMaster(student) {
+if (!SchoolData.feeStructureBySession || typeof SchoolData.feeStructureBySession !== 'object') SchoolData.feeStructureBySession = {};
+if (!SchoolData.feeSettingsVersions || typeof SchoolData.feeSettingsVersions !== 'object') SchoolData.feeSettingsVersions = {};
+if (!SchoolData.feeSettingsMutationIds || typeof SchoolData.feeSettingsMutationIds !== 'object') SchoolData.feeSettingsMutationIds = {};
+
+Object.keys(SchoolData.classFeeMaster || {}).forEach(cls => {
+  delete SchoolData.classFeeMaster[cls].computerFee;
+  delete SchoolData.classFeeMaster[cls].computerEnabled;
+});
+
+function getFeeSettingsForSession(session = SchoolData.activeSession) {
+  const sessionName = String(session || SchoolData.activeSession || '').trim();
+  const saved = SchoolData.feeStructureBySession?.[sessionName];
+  return {
+    classFeeMaster: saved?.classFeeMaster || SchoolData.classFeeMaster || {},
+    feeScheduleRules: saved?.feeScheduleRules || SchoolData.feeScheduleRules || {}
+  };
+}
+
+function getFeeSettingsVersion(session = SchoolData.activeSession) {
+  return String(SchoolData.feeSettingsVersions?.[String(session || '')] || '');
+}
+
+function getStudentFeeMaster(student, session = SchoolData.activeSession) {
   const cls = normalizeClassName(student.currentClass || student.class || 'Class 5');
-  const fallback = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, computerFee: 150, annualEnabled: true, examEnabled: true, computerEnabled: true };
-  const saved = (SchoolData.classFeeMaster && SchoolData.classFeeMaster[cls]) || fallback;
+  const fallback = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, annualEnabled: true, examEnabled: true };
+  const saved = getFeeSettingsForSession(session).classFeeMaster?.[cls] || fallback;
   return {
     ...fallback,
     ...saved,
     annualEnabled: saved.annualEnabled !== false,
-    examEnabled: saved.examEnabled !== false,
-    computerEnabled: saved.computerEnabled !== false
+    examEnabled: saved.examEnabled !== false
   };
 }
 
 function getStudentMonthlyTuitionRate(student, session = SchoolData.activeSession) {
-  const masterRate = Number(getStudentFeeMaster(student).monthlyTuition || 0);
-  if (masterRate > 0) return masterRate;
   const recordRate = Number(student?.feeRecords?.[session]?.monthlyTuition || student?.currentFeeInfo?.monthlyTuition || 0);
+  if (String(session || '') !== String(SchoolData.activeSession || '') && recordRate > 0) return recordRate;
+  const masterRate = Number(getStudentFeeMaster(student, session).monthlyTuition || 0);
+  if (masterRate > 0) return masterRate;
   return recordRate > 0 ? recordRate : 1600;
 }
 
 function hasPaidExtraFee(student, labelPart, session = SchoolData.activeSession) {
   const feeRec = student.feeRecords?.[session];
   const labelKey = String(labelPart || '').toLowerCase();
-  return (feeRec?.payments || []).some(payment =>
+  return getUniquePaymentsView(feeRec?.payments).some(payment =>
     (payment.paidExtraItems || []).some(item => String(item.label || '').toLowerCase().includes(labelKey))
   );
+}
+
+function getPaidExtraFeeTotal(student, labelPart, session = SchoolData.activeSession) {
+  const feeRec = student?.feeRecords?.[session] || student?.currentFeeInfo || {};
+  const labelKey = String(labelPart || '').trim().toLowerCase();
+  return getUniquePaymentsView(feeRec.payments).reduce((paymentTotal, payment) => {
+    const itemTotal = (payment?.paidExtraItems || []).reduce((sum, item) => {
+      const label = String(item?.label || '').toLowerCase();
+      return label.includes(labelKey) ? sum + (Number(item?.amount) || 0) : sum;
+    }, 0);
+    return paymentTotal + itemTotal;
+  }, 0);
+}
+
+function getActiveSessionMonthIndex(session = SchoolData.activeSession, now = new Date()) {
+  const match = String(session || '').match(/(\d{4})/);
+  if (!match || Number.isNaN(now?.getTime?.())) return SCHOOL_SESSION_MONTHS.length - 1;
+  const startYear = Number(match[1]);
+  const year = now.getFullYear();
+  const month = now.getMonth();
+  if (year < startYear || (year === startYear && month < 3)) return -1;
+  if (year > startYear + 1 || (year === startYear + 1 && month > 2)) return SCHOOL_SESSION_MONTHS.length - 1;
+  if (year === startYear) return month - 3;
+  return month + 9;
+}
+
+function getReachedFeeTargetMonths(targetMonths, session = SchoolData.activeSession) {
+  const currentIndex = getActiveSessionMonthIndex(session);
+  if (currentIndex < 0) return [];
+  const uniqueTargets = [...new Set((targetMonths || []).map(month => String(month || '').trim()).filter(Boolean))];
+  return uniqueTargets.filter(month => {
+    const index = SCHOOL_SESSION_MONTHS.indexOf(month);
+    return index >= 0 && index <= currentIndex;
+  });
 }
 
 function getStudentFeeCategoryStatus(student) {
   const fee = student.currentFeeInfo || {};
   const master = getStudentFeeMaster(student);
+  const session = SchoolData.activeSession;
+  const rules = getFeeSettingsForSession(session).feeScheduleRules;
   const overdueMonths = getCurrentOverdueMonths(student);
   const tuitionDue = (overdueMonths.length * getStudentMonthlyTuitionRate(student)) + (fee.previousSessionDue || 0);
-  const annualDue = master.annualEnabled && master.annualCharges > 0 && !hasPaidExtraFee(student, 'Annual Charges') ? master.annualCharges : 0;
-  const examDue = master.examEnabled && master.examFee > 0 && !hasPaidExtraFee(student, 'Exam Fee') ? master.examFee : 0;
-  const computerDue = master.computerEnabled && master.computerFee > 0 && !hasPaidExtraFee(student, 'Computer') ? master.computerFee : 0;
-  return { tuitionDue, annualDue, examDue, computerDue, totalDue: tuitionDue + annualDue + examDue + computerDue, overdueMonths };
+  const annualTargets = rules.annualCharges?.targetMonths || ['April'];
+  const examTargets = rules.examFee?.targetMonths || ['August', 'February'];
+  const annualChargeTotal = master.annualEnabled && master.annualCharges > 0 && getReachedFeeTargetMonths(annualTargets, session).length
+    ? Number(master.annualCharges) || 0
+    : 0;
+  const examOccurrencesDue = master.examEnabled && master.examFee > 0
+    ? getReachedFeeTargetMonths(examTargets, session).length
+    : 0;
+  const examChargeTotal = examOccurrencesDue * (Number(master.examFee) || 0);
+  const annualPaidTotal = getPaidExtraFeeTotal(student, 'Annual Charges', session);
+  const examPaidTotal = getPaidExtraFeeTotal(student, 'Exam Fee', session);
+  const annualDue = Math.max(0, annualChargeTotal - annualPaidTotal);
+  const examDue = Math.max(0, examChargeTotal - examPaidTotal);
+  return {
+    tuitionDue,
+    annualDue,
+    examDue,
+    totalDue: tuitionDue + annualDue + examDue,
+    overdueMonths,
+    annualChargeTotal,
+    examChargeTotal,
+    annualPaidTotal,
+    examPaidTotal,
+    examOccurrencesDue
+  };
+}
+
+/**
+ * The one figure every screen must agree on: money owed today.
+ * Counts only months already due (April..current month), never the whole session,
+ * and offsets any advance sitting in the student wallet.
+ */
+function getStudentTotalDueAmount(student) {
+  if (!student) return 0;
+  const status = getStudentFeeCategoryStatus(student);
+  const partialDue = Number(student.partialDue || 0);
+  const wallet = getVerifiedStudentWalletBalance(student);
+  return Math.max(0, status.totalDue + partialDue - wallet);
+}
+
+function getStudentDueSummary(student) {
+  const status = getStudentFeeCategoryStatus(student);
+  const fee = student?.currentFeeInfo || {};
+  return {
+    status,
+    overdueMonths: status.overdueMonths,
+    previousSessionDue: Number(fee.previousSessionDue || 0),
+    partialDue: Number(student?.partialDue || 0),
+    wallet: getVerifiedStudentWalletBalance(student),
+    totalDue: getStudentTotalDueAmount(student)
+  };
+}
+
+function getStudentFeePaidBreakdown(student, session = SchoolData.activeSession) {
+  const payments = getUniquePaymentsView(student.feeRecords?.[session]?.payments);
+  let tuitionPaid = 0;
+  let annualPaid = 0;
+  let examPaid = 0;
+  payments.forEach(payment => {
+    tuitionPaid += Number(payment.selectedMonthsTotal || 0);
+    (payment.paidPrevMonths || []).forEach(item => {
+      tuitionPaid += Number(item.amount || 0);
+    });
+    (payment.paidExtraItems || []).forEach(item => {
+      const label = String(item.label || '').toLowerCase();
+      const amt = Number(item.amount || 0);
+      if (label.includes('annual')) annualPaid += amt;
+      else if (label.includes('exam')) examPaid += amt;
+    });
+  });
+  const totalPaid = payments.reduce((sum, p) => sum + Number(p.amount || 0), 0);
+  return { tuitionPaid, annualPaid, examPaid, totalPaid };
+}
+
+function buildFeeBifurcationCsvRows(rows, options = {}) {
+  const includeTotals = options.includeTotals !== false;
+  const header = [
+    'Admission No', 'Student Name', 'Class', 'Section', 'Gender', 'Date Of Admission',
+    'Father Name', 'Parent Phone',
+    'Paid Months', 'Pending Months Up To August',
+    'Tuition Fee Paid', 'Tuition Fee Due',
+    'Annual Fee Paid', 'Annual Fee Due',
+    'Exam Fee Paid', 'Exam Fee Due',
+    'Previous Session Due', 'Total Pending Due',
+    'Last Receipt No', 'Last Payment Date',
+    'Total Fee Paid'
+  ];
+  const csvRows = [header];
+  const totals = {
+    tuitionPaid: 0, tuitionDue: 0, annualPaid: 0, annualDue: 0,
+    examPaid: 0, examDue: 0, prevDue: 0, totalDue: 0, totalPaid: 0
+  };
+
+  rows.forEach(row => {
+    const s = row.student;
+    const paid = getStudentFeePaidBreakdown(s);
+    const lastPayment = row.payments[row.payments.length - 1] || {};
+    const prevDue = Number(row.fee.previousSessionDue || 0);
+    const tuitionDueOnly = Math.max(0, Number(row.status.tuitionDue || 0) - prevDue);
+    const line = [
+      s.admissionNo,
+      s.name,
+      s.currentClass || s.class || '',
+      s.currentSection || s.section || '',
+      s.gender || '',
+      s.dateOfAdmission || '',
+      s.parentName || '',
+      s.parentPhone || '',
+      (row.fee.paidMonths || []).join(', '),
+      row.overdueMonths.join(', '),
+      paid.tuitionPaid,
+      tuitionDueOnly,
+      paid.annualPaid,
+      row.status.annualDue,
+      paid.examPaid,
+      row.status.examDue,
+      prevDue,
+      row.dueAmount,
+      lastPayment.receiptNo || '',
+      lastPayment.date || '',
+      paid.totalPaid
+    ];
+    totals.tuitionPaid += paid.tuitionPaid;
+    totals.tuitionDue += tuitionDueOnly;
+    totals.annualPaid += paid.annualPaid;
+    totals.annualDue += row.status.annualDue;
+    totals.examPaid += paid.examPaid;
+    totals.examDue += row.status.examDue;
+    totals.prevDue += prevDue;
+    totals.totalDue += row.dueAmount;
+    totals.totalPaid += paid.totalPaid;
+    csvRows.push(line);
+  });
+
+  if (includeTotals && rows.length) {
+    csvRows.push([
+      'TOTAL', `${rows.length} students`, '', '', '', '', '', '', '', '',
+      totals.tuitionPaid, totals.tuitionDue,
+      totals.annualPaid, totals.annualDue,
+      totals.examPaid, totals.examDue,
+      totals.prevDue, totals.totalDue,
+      '', '',
+      totals.totalPaid
+    ]);
+  }
+  return csvRows;
+}
+
+function exportFeeBifurcationReport(sourceRows, fileLabel) {
+  const rows = sourceRows || getCurrentFeeLedgerRows();
+  const currentSession = SchoolData.activeSession;
+  const tab = window._currentFeeTab || 'ALL';
+  const targetClass = document.getElementById('feeClassFilter')?.value || 'ALL';
+  downloadCsvFile(`Fee_Report_${fileLabel || tab}_${targetClass.replace(/\s+/g, '_')}_${currentSession}.csv`, buildFeeBifurcationCsvRows(rows));
+  showNotification(`Exported ${rows.length} student fee row(s) with bifurcation totals.`, 'success');
+}
+
+function exportAllStudentsFeeReport() {
+  const currentSession = SchoolData.activeSession;
+  const students = typeof getStudentsForReportsFilter === 'function' && document.getElementById('reportsClassFilter')
+    ? getStudentsForReportsFilter()
+    : getStudentsByActiveSession();
+  const rows = students.map(s => {
+    const fee = s.currentFeeInfo || {};
+    const status = getStudentFeeCategoryStatus(s);
+    const payments = getUniquePaymentsView(s.feeRecords?.[currentSession]?.payments);
+    return {
+      student: s,
+      fee,
+      status,
+      payments,
+      paidAmount: payments.reduce((acc, p) => acc + (p.amount || 0), 0),
+      overdueMonths: status.overdueMonths,
+      dueAmount: status.totalDue
+    };
+  });
+  const label = document.getElementById('reportsClassFilter')?.value && document.getElementById('reportsClassFilter').value !== 'ALL'
+    ? document.getElementById('reportsClassFilter').value.replace(/\s+/g, '_')
+    : 'All_Students';
+  exportFeeBifurcationReport(rows, label);
+}
+
+function getPaymentPaidBreakdown(payment) {
+  let tuitionPaid = Number(payment?.selectedMonthsTotal || 0);
+  (payment?.paidPrevMonths || []).forEach(item => {
+    tuitionPaid += Number(item.amount || 0);
+  });
+  let annualPaid = 0;
+  let examPaid = 0;
+  (payment?.paidExtraItems || []).forEach(item => {
+    const label = String(item.label || '').toLowerCase();
+    const amt = Number(item.amount || 0);
+    if (label.includes('annual')) annualPaid += amt;
+    else if (label.includes('exam')) examPaid += amt;
+  });
+  return {
+    tuitionPaid,
+    annualPaid,
+    examPaid,
+    totalPaid: Number(payment?.amount || 0)
+  };
+}
+
+function parseReceiptDateValue(dateStr) {
+  const raw = String(dateStr || '').trim();
+  if (!raw) return null;
+  if (/^\d{4}-\d{2}-\d{2}/.test(raw)) {
+    const d = new Date(`${raw.slice(0, 10)}T12:00:00`);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  const dmy = raw.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  if (dmy) {
+    const day = parseInt(dmy[1], 10);
+    const month = parseInt(dmy[2], 10) - 1;
+    let year = parseInt(dmy[3], 10);
+    if (year < 100) year += 2000;
+    const d = new Date(year, month, day, 12, 0, 0);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function getReceiptDateFilterRange() {
+  const monthVal = document.getElementById('receiptMonthFilter')?.value
+    || document.getElementById('recentReceiptMonthFilter')?.value
+    || '';
+  const fromVal = document.getElementById('receiptFromDate')?.value
+    || document.getElementById('recentReceiptFromDate')?.value
+    || '';
+  const toVal = document.getElementById('receiptToDate')?.value
+    || document.getElementById('recentReceiptToDate')?.value
+    || '';
+
+  if (monthVal && /^\d{4}-\d{2}$/.test(monthVal)) {
+    const [y, m] = monthVal.split('-').map(Number);
+    return {
+      from: new Date(y, m - 1, 1, 0, 0, 0),
+      to: new Date(y, m, 0, 23, 59, 59),
+      label: monthVal
+    };
+  }
+
+  const from = fromVal ? parseReceiptDateValue(fromVal) : null;
+  const to = toVal ? parseReceiptDateValue(toVal) : null;
+  if (from) from.setHours(0, 0, 0, 0);
+  if (to) to.setHours(23, 59, 59, 999);
+  return { from, to, label: '' };
+}
+
+function receiptMatchesDateFilter(receipt, range) {
+  if (!range?.from && !range?.to) return true;
+  const d = parseReceiptDateValue(receipt.date);
+  if (!d) return false;
+  if (range.from && d < range.from) return false;
+  if (range.to && d > range.to) return false;
+  return true;
+}
+
+function getFilteredFeeReceipts() {
+  const query = (document.getElementById('receiptSearchInput')?.value
+    || document.getElementById('recentReceiptSearchInput')?.value
+    || '').toLowerCase().trim();
+  const targetMode = document.getElementById('receiptModeFilter')?.value || 'ALL';
+  const dateRange = getReceiptDateFilterRange();
+  const currentSession = SchoolData.activeSession;
+  const sessionFilter = document.getElementById('receiptSessionFilter')?.value || currentSession;
+
+  return getAllFeeReceipts().filter(r => {
+    const no = String(r.receiptNo || '').toLowerCase();
+    const name = String(r.studentName || '').toLowerCase();
+    const adm = String(r.admissionNo || '').toLowerCase();
+    const mode = String(r.mode || '');
+    const matchQuery = !query || no.includes(query) || name.includes(query) || adm.includes(query);
+    const matchMode = targetMode === 'ALL' || mode.toLowerCase().includes(targetMode.toLowerCase());
+    const matchSession = sessionFilter === 'ALL' || r.session === sessionFilter;
+    const matchDate = receiptMatchesDateFilter(r, dateRange);
+    return matchQuery && matchMode && matchSession && matchDate;
+  });
+}
+
+function buildReceiptRegisterCsvRows(receipts) {
+  const header = [
+    'Receipt No', 'Date', 'Time', 'Collected By (Staff)', 'Staff Role', 'Admission No', 'Student Name', 'Class', 'Section', 'Father Name',
+    'Tuition Fee Paid', 'Annual Fee Paid', 'Exam Fee Paid', 'Total Amount Paid',
+    'Tuition Fee Due', 'Annual Fee Due', 'Exam Fee Due', 'Previous Session Due', 'Total Pending Due',
+    'Fee Description', 'Payment Mode', 'Session'
+  ];
+  const csvRows = [header];
+  const totals = {
+    tuitionPaid: 0, annualPaid: 0, examPaid: 0, totalPaid: 0,
+    tuitionDue: 0, annualDue: 0, examDue: 0, prevDue: 0, totalDue: 0
+  };
+  const dueCache = new Map();
+
+  receipts.forEach(r => {
+    const paid = getPaymentPaidBreakdown(r);
+    if (!dueCache.has(r.admissionNo)) {
+      dueCache.set(r.admissionNo, getStudentFeeDueSnapshot(r.admissionNo));
+    }
+    const dues = dueCache.get(r.admissionNo);
+    csvRows.push([
+      r.receiptNo,
+      r.date,
+      r.time || '11:00 AM',
+      r.collectedBy || 'Mrs. Ruby Sharma',
+      r.collectedByRole || 'Receptionist',
+      r.admissionNo,
+      r.studentName,
+      r.class || '',
+      r.section || '',
+      r.parentName || '',
+      paid.tuitionPaid,
+      paid.annualPaid,
+      paid.examPaid,
+      paid.totalPaid,
+      dues.tuitionDue,
+      dues.annualDue,
+      dues.examDue,
+      dues.prevDue,
+      dues.totalDue,
+      r.month || '',
+      r.mode || '',
+      r.session || ''
+    ]);
+    totals.tuitionPaid += paid.tuitionPaid;
+    totals.annualPaid += paid.annualPaid;
+    totals.examPaid += paid.examPaid;
+    totals.totalPaid += paid.totalPaid;
+    totals.tuitionDue += Number(dues.tuitionDue || 0);
+    totals.annualDue += Number(dues.annualDue || 0);
+    totals.examDue += Number(dues.examDue || 0);
+    totals.prevDue += Number(dues.prevDue || 0);
+    totals.totalDue += Number(dues.totalDue || 0);
+  });
+
+  if (receipts.length) {
+    csvRows.push([
+      'TOTAL',
+      `${receipts.length} receipts`,
+      '', '', '', '', '', '', '', '',
+      totals.tuitionPaid,
+      totals.annualPaid,
+      totals.examPaid,
+      totals.totalPaid,
+      totals.tuitionDue,
+      totals.annualDue,
+      totals.examDue,
+      totals.prevDue,
+      totals.totalDue,
+      '', '', ''
+    ]);
+  }
+  return csvRows;
+}
+
+/* ============================================================================
+   LEGACY FEE HISTORY IMPORT (from old ERP / Excel register)
+   ============================================================================ */
+let _parsedFeeHistoryRows = [];
+let _feeHistoryImportMutationId = '';
+let _feeHistoryImportSourceName = '';
+let _feeHistoryImportResults = [];
+
+function parseLegacyFeeMonthList(raw) {
+  if (!raw) return [];
+  const monthMap = {
+    apr: 'April', aprl: 'April', april: 'April',
+    may: 'May',
+    jun: 'June', june: 'June',
+    jul: 'July', july: 'July',
+    aug: 'August', august: 'August',
+    sep: 'September', sept: 'September', september: 'September',
+    oct: 'October', october: 'October',
+    nov: 'November', november: 'November',
+    dec: 'December', december: 'December',
+    jan: 'January', january: 'January',
+    feb: 'February', february: 'February',
+    mar: 'March', march: 'March'
+  };
+  return [...new Set(String(raw).split(/[,|;+/]+/).map(part => {
+    const token = part.trim().toLowerCase().replace(/[^a-z]/g, '');
+    if (!token) return '';
+    if (monthMap[token]) return monthMap[token];
+    const hit = SCHOOL_SESSION_MONTHS.find(m => m.toLowerCase().startsWith(token.slice(0, 3)));
+    return hit || '';
+  }).filter(Boolean))];
+}
+
+function parseLegacyFeeAmount(raw) {
+  const text = String(raw ?? '').trim();
+  if (!text) return 0;
+  const n = Number(text.replace(/^(?:rs\.?|inr)\s*/i, '').replace(/[,₹\s]/g, ''));
+  return Number.isFinite(n) ? Math.round((n + Number.EPSILON) * 100) / 100 : text;
+}
+
+function downloadFeeHistoryImportTemplate() {
+  const sample = [
+    ['AdmissionNo', 'PaidMonths', 'PreviousSessionDue', 'ReceiptNo', 'PaymentDate', 'TotalPaid', 'TuitionPaid', 'AnnualPaid', 'ExamPaid', 'PaymentMode', 'Notes'],
+    ['1556', 'April, May, June', '0', 'OLD-1556-APR-JUN', '2026-06-15', '8000', '5400', '2200', '400', 'Cash', 'Imported from old ERP'],
+    ['1556', 'July, August', '0', 'OLD-1556-JUL-AUG', '2026-08-10', '3600', '3600', '', '', 'UPI', 'Second receipt from old ERP'],
+    ['2489', '', '0', 'OLD-2489-ANNUAL', '2026-07-01', '500', '0', '500', '0', 'UPI', 'Annual charges only — PaidMonths can be blank'],
+    ['2382', 'April, May, June, July, August', '500', 'OLD-2382-ALL', '2026-08-01', '9600', '7000', '2200', '400', 'Cash', 'Previous-session due is recorded separately']
+  ];
+  downloadCsvFile(`Fee_History_Import_Template_${SchoolData.activeSession}.csv`, sample);
+  showNotification('Downloaded fee history import template CSV.', 'success');
+}
+
+function openFeeHistoryImportModal() {
+  if (!hasUserAccessPermission(getCurrentActiveUser(), 'fee_collection', 'modify')) {
+    showNotification('Access Denied: fee history import needs Fee Collection modify permission.', 'warning');
+    return;
+  }
+  const existing = document.getElementById('feeHistoryImportModal');
+  if (existing) existing.remove();
+  _parsedFeeHistoryRows = [];
+  _feeHistoryImportMutationId = '';
+  _feeHistoryImportSourceName = '';
+  _feeHistoryImportResults = [];
+  const currentSession = SchoolData.activeSession;
+
+  document.body.insertAdjacentHTML('beforeend', `
+    <div class="modal-overlay active" id="feeHistoryImportModal" style="z-index:99999;">
+      <div class="modal-box theme-panel-modal keyboard-scroll-panel" tabindex="0" style="max-width:760px; width:calc(100vw - 28px); max-height:calc(100vh - 28px); overflow-y:auto; padding:24px; border-radius:18px; border:2px solid #f59e0b; position:relative;">
+        <button onclick="document.getElementById('feeHistoryImportModal').remove()" style="position:absolute; top:14px; right:16px; background:var(--bg-card); color:var(--text-main); border:1px solid var(--border-color); width:32px; height:32px; border-radius:50%; cursor:pointer;">X</button>
+        <h3 style="margin:0 0 4px 0; color:#f59e0b; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+          <i class="fa-solid fa-file-import"></i> Import Fee History from Old ERP (CSV)
+        </h3>
+        <p class="theme-panel-muted" style="margin:0 0 14px 0; font-size:0.82rem;">Bring paid months, receipts and dues from your previous fee software into session <strong>${currentSession}</strong>. Students must already exist (import students first). <strong>PaidMonths</strong> can be blank for annual or exam-only receipts.</p>
+
+        <div style="background:var(--bg-card); padding:12px 16px; border-radius:10px; border:1px solid var(--border-color); margin-bottom:14px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+          <div style="font-size:0.78rem; color:var(--text-muted);">
+            Columns: <strong>AdmissionNo, PaidMonths, PreviousSessionDue, ReceiptNo, PaymentDate, TotalPaid, TuitionPaid, AnnualPaid, ExamPaid, PaymentMode</strong>
+          </div>
+          <button class="btn btn-secondary" onclick="downloadFeeHistoryImportTemplate()" style="background:#0284c7; color:#fff; border:none; font-weight:700;">
+            <i class="fa-solid fa-download"></i> Download Template
+          </button>
+        </div>
+
+        <div style="border:2px dashed #f59e0b; background:rgba(245,158,11,0.08); padding:18px; border-radius:12px; text-align:center; margin-bottom:14px;">
+          <input type="file" id="feeHistoryCsvInput" accept=".csv" style="display:none;" onchange="handleFeeHistoryCsvFileSelect(event)">
+          <button class="btn btn-primary" onclick="document.getElementById('feeHistoryCsvInput').click()" style="background:linear-gradient(135deg, #f59e0b 0%, #d97706 100%); border:none; font-weight:800;">
+            <i class="fa-solid fa-folder-open"></i> Browse Fee History CSV
+          </button>
+        </div>
+
+        <div id="feeHistoryPreviewBox" style="display:none; margin-bottom:14px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <strong style="color:var(--accent-primary);">Preview</strong>
+            <span class="badge badge-warning" id="feeHistoryCountBadge">0 rows</span>
+          </div>
+          <div class="keyboard-scroll-panel" tabindex="0" style="max-height:220px; overflow:auto; border:1px solid var(--border-color); border-radius:8px;">
+            <table class="data-table" style="font-size:0.75rem; min-width:900px;">
+              <thead><tr><th>Adm</th><th>Name</th><th>Paid Months</th><th>Prev Due</th><th>Receipt</th><th>Total</th><th>Annual</th><th>Exam</th></tr></thead>
+              <tbody id="feeHistoryPreviewBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div style="margin-bottom:12px; padding:10px 12px; border-radius:8px; background:rgba(16,185,129,0.1); border:1px solid rgba(16,185,129,0.35); color:#34d399; font-size:0.78rem; font-weight:700;">
+          <i class="fa-solid fa-shield-halved"></i> Existing receipts are never replaced. Matching rows are skipped safely; conflicts and invalid rows are reported separately.
+        </div>
+
+        <div id="feeHistoryImportResultBox" style="display:none; margin-bottom:14px;"></div>
+
+        <div style="display:flex; justify-content:flex-end; gap:10px;">
+          <button class="btn btn-secondary" onclick="document.getElementById('feeHistoryImportModal').remove()">Cancel</button>
+          <button class="btn btn-primary" id="feeHistoryImportBtn" onclick="importParsedFeeHistoryFromCsv()" disabled style="background:linear-gradient(135deg, #f59e0b 0%, #d97706 100%); border:none; font-weight:800;">
+            <i class="fa-solid fa-file-import"></i> Import Fee History
+          </button>
+        </div>
+      </div>
+    </div>
+  `);
+}
+
+function handleFeeHistoryCsvFileSelect(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const lines = String(e.target.result || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    if (lines.length < 2) {
+      showNotification('Fee history CSV needs a header row and at least one data row.', 'error');
+      return;
+    }
+
+    function parseCsvRow(text) {
+      const result = [];
+      let cur = '';
+      let inQuotes = false;
+      for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (c === '"') inQuotes = !inQuotes;
+        else if (c === ',' && !inQuotes) { result.push(cur.trim().replace(/^"|"$/g, '')); cur = ''; }
+        else cur += c;
+      }
+      result.push(cur.trim().replace(/^"|"$/g, ''));
+      return result;
+    }
+
+    const headers = parseCsvRow(lines[0]).map(h => h.toLowerCase());
+    const idx = (names) => headers.findIndex(h => names.some(n => h.replace(/[^a-z0-9]/g, '') === n.replace(/[^a-z0-9]/g, '')));
+    const admIdx = idx(['admissionno', 'admno', 'admissionnumber']);
+    const monthsIdx = idx(['paidmonths', 'months paid', 'monthspaid', 'paidmonth']);
+    const prevIdx = idx(['previoussessiondue', 'prevsessiondue', 'prevdue', 'olddue']);
+    const receiptIdx = idx(['receiptno', 'receiptnumber', 'legacyreceiptno']);
+    const dateIdx = idx(['paymentdate', 'date', 'receiptdate']);
+    const totalIdx = idx(['totalpaid', 'amountpaid', 'amount', 'total']);
+    const tuitionIdx = idx(['tuitionpaid', 'tuitionamount']);
+    const annualIdx = idx(['annualpaid', 'annualfeepaid', 'annualfee']);
+    const examIdx = idx(['exampaid', 'examfeepaid', 'examfee']);
+    const modeIdx = idx(['paymentmode', 'mode', 'paymode']);
+    const notesIdx = idx(['notes', 'remark', 'description']);
+    const collectorIdx = idx(['collectedby', 'collector', 'receivedby']);
+
+    if (admIdx === -1 || monthsIdx === -1) {
+      showNotification('CSV must include AdmissionNo and PaidMonths columns. Download the template first.', 'error');
+      return;
+    }
+
+    _parsedFeeHistoryRows = [];
+    for (let i = 1; i < lines.length; i++) {
+      const vals = parseCsvRow(lines[i]);
+      const admNo = String(vals[admIdx] || '').trim();
+      const paidMonthsRaw = String(vals[monthsIdx] || '').trim();
+      const paidMonths = parseLegacyFeeMonthList(paidMonthsRaw);
+      const totalPaid = parseLegacyFeeAmount(vals[totalIdx]);
+      const tuitionPaid = parseLegacyFeeAmount(vals[tuitionIdx]);
+      const annualPaid = parseLegacyFeeAmount(vals[annualIdx]);
+      const examPaid = parseLegacyFeeAmount(vals[examIdx]);
+      const receiptNo = String(vals[receiptIdx] || '').trim();
+      _parsedFeeHistoryRows.push({
+        rowId: `row-${i}`,
+        admNo,
+        paidMonths,
+        paidMonthsRaw,
+        previousSessionDue: parseLegacyFeeAmount(vals[prevIdx]),
+        receiptNo,
+        paymentDate: String(vals[dateIdx] || '').trim(),
+        totalPaid,
+        tuitionPaid,
+        annualPaid,
+        examPaid,
+        paymentMode: String(vals[modeIdx] || 'Cash').trim() || 'Cash',
+        notes: String(vals[notesIdx] || '').trim(),
+        originalCollector: String(vals[collectorIdx] || '').trim()
+      });
+    }
+
+    if (!_parsedFeeHistoryRows.length) {
+      showNotification('No valid fee history rows found. Each row needs AdmissionNo plus PaidMonths or a fee amount.', 'warning');
+      return;
+    }
+
+    const previewBody = document.getElementById('feeHistoryPreviewBody');
+    previewBody.innerHTML = _parsedFeeHistoryRows.slice(0, 40).map(row => {
+      const student = findStudentByAdmissionNo(row.admNo);
+      return `<tr>
+        <td>${escapeHtml(row.admNo)}</td>
+        <td>${escapeHtml(student?.name || 'NOT FOUND')}</td>
+        <td>${escapeHtml(row.paidMonths.join(', '))}</td>
+        <td>${row.previousSessionDue || 0}</td>
+        <td>${escapeHtml(row.receiptNo || 'AUTO')}</td>
+        <td>${row.totalPaid || '-'}</td>
+        <td>${row.annualPaid || '-'}</td>
+        <td>${row.examPaid || '-'}</td>
+      </tr>`;
+    }).join('');
+    document.getElementById('feeHistoryPreviewBox').style.display = 'block';
+    document.getElementById('feeHistoryCountBadge').innerText = `${_parsedFeeHistoryRows.length} row(s)`;
+    document.getElementById('feeHistoryImportBtn').disabled = false;
+    document.getElementById('feeHistoryImportResultBox').style.display = 'none';
+    _feeHistoryImportMutationId = createErpMutationId();
+    _feeHistoryImportSourceName = String(file.name || 'Legacy fee CSV').slice(0, 180);
+    _feeHistoryImportResults = [];
+    showNotification(`Parsed ${_parsedFeeHistoryRows.length} fee history row(s). Review preview, then Import.`, 'success');
+  };
+  reader.readAsText(file);
+}
+
+async function importParsedFeeHistoryFromCsv() {
+  if (!_parsedFeeHistoryRows.length) return;
+  const session = SchoolData.activeSession;
+  const button = document.getElementById('feeHistoryImportBtn');
+  const originalHtml = button?.innerHTML || '<i class="fa-solid fa-file-import"></i> Import Fee History';
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Validating in Cloud...';
+  }
+  try {
+    const result = await callErpSecurityApi('importFeeHistory', {
+      body: {
+        mutationId: _feeHistoryImportMutationId || createErpMutationId(),
+        sessionName: session,
+        sourceName: _feeHistoryImportSourceName || 'Legacy fee CSV',
+        rows: _parsedFeeHistoryRows.map(row => ({
+          rowId: row.rowId,
+          admissionNo: row.admNo,
+          paidMonths: row.paidMonthsRaw,
+          previousSessionDue: row.previousSessionDue,
+          receiptNo: row.receiptNo,
+          paymentDate: row.paymentDate,
+          totalPaid: row.totalPaid,
+          tuitionPaid: row.tuitionPaid,
+          annualPaid: row.annualPaid,
+          examPaid: row.examPaid,
+          paymentMode: row.paymentMode,
+          notes: row.notes,
+          originalCollector: row.originalCollector
+        }))
+      }
+    });
+    (result.feeUpdates || []).forEach(update => {
+      const student = findStudentByAdmissionNo(update.admissionNo);
+      if (!student || !update.feeRecord) return;
+      if (!student.feeRecords || typeof student.feeRecords !== 'object') student.feeRecords = {};
+      student.feeRecords[update.sessionName || session] = update.feeRecord;
+      normalizeFeeRecordFromReceipts(student, update.sessionName || session);
+    });
+    if (result?.savedAt && typeof window.recordCloudMutationRevision === 'function') {
+      window.recordCloudMutationRevision(result.savedAt);
+    }
+    saveSchoolDataToStorage({ skipCloudPush: true });
+    if (typeof window.saveCloudDisplayCache === 'function' && typeof buildSchoolDataStoragePayload === 'function') {
+      try { await window.saveCloudDisplayCache(buildSchoolDataStoragePayload()); } catch (e) {}
+    }
+    _feeHistoryImportResults = Array.isArray(result.results) ? result.results : [];
+    renderFeeHistoryImportResults(result.summary || {});
+    const summary = result.summary || {};
+    const hasProblems = Number(summary.conflicts || 0) + Number(summary.invalid || 0) > 0;
+    showNotification(
+      `Fee import checked ${summary.total || 0} row(s): ${summary.inserted || 0} imported, ${summary.alreadyImported || 0} already present, ${summary.conflicts || 0} conflict(s), ${summary.invalid || 0} invalid.`,
+      hasProblems ? 'warning' : 'success'
+    );
+    if (window.location.hash.includes('fees')) renderFeesPage(document.getElementById('contentBody'));
+  } catch (error) {
+    showNotification(`Fee history was not imported: ${error?.message || 'cloud rejected the batch.'}`, 'error');
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.innerHTML = originalHtml;
+    }
+  }
+}
+
+function renderFeeHistoryImportResults(summary) {
+  const box = document.getElementById('feeHistoryImportResultBox');
+  if (!box) return;
+  const colors = { inserted: '#10b981', already_imported: '#38bdf8', conflict: '#f59e0b', invalid: '#ef4444' };
+  box.style.display = 'block';
+  box.innerHTML = `
+    <div style="border:1px solid var(--border-color); border-radius:10px; overflow:hidden;">
+      <div style="padding:10px 12px; background:var(--bg-card); display:flex; justify-content:space-between; gap:10px; align-items:center; flex-wrap:wrap;">
+        <strong>Cloud Validation Result</strong>
+        <button class="btn btn-secondary" onclick="downloadFeeHistoryImportResultCsv()" style="padding:5px 10px; font-size:0.75rem;"><i class="fa-solid fa-download"></i> Download Result CSV</button>
+      </div>
+      <div style="padding:8px 12px; font-size:0.76rem; color:var(--text-muted);">
+        Imported: <strong style="color:#10b981;">${Number(summary.inserted || 0)}</strong> &nbsp;|&nbsp;
+        Already present: <strong style="color:#38bdf8;">${Number(summary.alreadyImported || 0)}</strong> &nbsp;|&nbsp;
+        Conflicts: <strong style="color:#f59e0b;">${Number(summary.conflicts || 0)}</strong> &nbsp;|&nbsp;
+        Invalid: <strong style="color:#ef4444;">${Number(summary.invalid || 0)}</strong>
+      </div>
+      <div style="max-height:210px; overflow:auto;">
+        <table class="data-table" style="font-size:0.72rem; min-width:700px;">
+          <thead><tr><th>Row</th><th>Adm</th><th>Receipt</th><th>Status</th><th>Message</th></tr></thead>
+          <tbody>${_feeHistoryImportResults.slice(0, 100).map(row => `
+            <tr>
+              <td>${escapeHtml(row.rowId || '')}</td>
+              <td>${escapeHtml(row.admissionNo || '')}</td>
+              <td>${escapeHtml(row.receiptNo || '')}</td>
+              <td><strong style="color:${colors[row.status] || '#94a3b8'};">${escapeHtml(String(row.status || '').replace('_', ' ').toUpperCase())}</strong></td>
+              <td>${escapeHtml(row.message || '')}</td>
+            </tr>`).join('')}</tbody>
+        </table>
+      </div>
+      ${_feeHistoryImportResults.length > 100 ? `<div style="padding:7px 12px; color:var(--text-muted); font-size:0.72rem;">Showing first 100 rows. Download the CSV for the complete result.</div>` : ''}
+    </div>`;
+}
+
+function downloadFeeHistoryImportResultCsv() {
+  if (!_feeHistoryImportResults.length) return;
+  const rows = [
+    ['Source', 'RowId', 'AdmissionNo', 'ReceiptNo', 'Status', 'Message'],
+    ..._feeHistoryImportResults.map(row => [
+      _feeHistoryImportSourceName,
+      row.rowId || '',
+      row.admissionNo || '',
+      row.receiptNo || '',
+      row.status || '',
+      row.message || ''
+    ])
+  ];
+  downloadCsvFile(`Fee_History_Import_Result_${SchoolData.activeSession}_${new Date().toISOString().slice(0, 10)}.csv`, rows);
 }
 
 function openClassFeeMasterModal() {
+  const activeUser = getCurrentActiveUser();
+  const activeRole = String(activeUser?.role || '').trim().toLowerCase();
+  const privileged = ['super admin', 'admin', 'principal', 'accountant'].includes(activeRole);
+  if (!privileged
+      && !hasUserAccessPermission(activeUser, 'fee_structure_config', 'modify')
+      && !hasUserAccessPermission(activeUser, 'fee_collection', 'modify')) {
+    showNotification('Access Denied: master fee settings require Fee Structure modify permission.', 'warning');
+    return;
+  }
   const existing = document.getElementById('classFeeMasterModal');
   if (existing) existing.remove();
 
   const currentSession = SchoolData.activeSession;
   const classesList = ["Nursery", "LKG", "UKG", "Class 1", "Class 2", "Class 3", "Class 4", "Class 5", "Class 6", "Class 7", "Class 8", "Class 9", "Class 10"];
-  const rules = SchoolData.feeScheduleRules;
+  const rules = getFeeSettingsForSession(currentSession).feeScheduleRules;
+  const annualMonths = rules.annualCharges?.targetMonths || ["April"];
+  const examMonths = rules.examFee?.targetMonths || ["August", "February"];
 
   const modalHtml = `
     <div class="modal-overlay active" id="classFeeMasterModal" style="z-index:99999;">
       <div class="modal-box" style="max-width:850px; background:#0f172a; color:#ffffff; padding:24px; border-radius:18px; border:2px solid #8b5cf6; box-shadow:0 25px 50px -12px rgba(0,0,0,0.8); position:relative; max-height:90vh; overflow-y:auto;">
         <button onclick="document.getElementById('classFeeMasterModal').remove()" style="position:absolute; top:14px; right:16px; background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; font-size:1.1rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">X</button>
 
-        <h3 style="margin:0 0 4px 0; color:#c084fc; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+        <h3 style="margin:0 0 4px 0; color:#6d28d9; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
           <i class="fa-solid fa-sliders"></i> Master Class Fee Structure & Frequency Rules (${currentSession})
         </h3>
-        <p style="margin:0 0 16px 0; font-size:0.82rem; color:#cbd5e1;">Configure Tuition Fee, Annual Charges, Exam Fee, and target months for auto-attachment.</p>
+        <p style="margin:0 0 16px 0; font-size:0.82rem; color:#374151;">Configure Tuition Fee, Annual Charges, Exam Fee, and target months for auto-attachment.</p>
 
         <!-- FEE STRUCTURE TABLE PER CLASS -->
         <div class="data-table-container" style="max-height:360px; overflow-y:auto; margin-bottom:16px; border:1px solid #334155; border-radius:10px;">
           <table class="data-table" style="font-size:0.8rem;">
             <thead>
-              <tr style="background:#1e293b; color:#c084fc;">
+              <tr style="background:#1e293b; color:#6d28d9;">
                 <th>Class</th>
                 <th>Monthly Tuition (Rs)</th>
                 <th>Annual Charges</th>
                 <th>Exam Fee</th>
-                <th>Computer / Lab</th>
               </tr>
             </thead>
             <tbody>
               ${classesList.map(cls => {
-                const f = getStudentFeeMaster({ currentClass: cls });
+                const f = getStudentFeeMaster({ currentClass: cls }, currentSession);
                 return `
                   <tr>
-                    <td><strong style="color:#38bdf8;">${cls}</strong></td>
+                    <td><strong style="color:#0284c7;">${cls}</strong></td>
                     <td>
                       <input type="number" class="fee-master-input session-dropdown" data-class="${cls}" data-field="monthlyTuition" value="${f.monthlyTuition}" style="width:100px; padding:4px 8px; font-weight:bold; color:#34d399; background:#1e293b;">
                     </td>
@@ -12098,12 +17361,6 @@ function openClassFeeMasterModal() {
                       </label>
                       <input type="number" class="fee-master-input session-dropdown" data-class="${cls}" data-field="examFee" value="${f.examFee}" style="width:90px; padding:4px 8px; background:#1e293b;">
                     </td>
-                    <td>
-                      <label style="display:flex; align-items:center; gap:6px; margin-bottom:5px; color:#cbd5e1; font-size:0.75rem;">
-                        <input type="checkbox" class="fee-master-apply" data-class="${cls}" data-field="computerEnabled" ${f.computerEnabled ? 'checked' : ''}> Apply
-                      </label>
-                      <input type="number" class="fee-master-input session-dropdown" data-class="${cls}" data-field="computerFee" value="${f.computerFee}" style="width:90px; padding:4px 8px; background:#1e293b;">
-                    </td>
                   </tr>
                 `;
               }).join('')}
@@ -12113,38 +17370,38 @@ function openClassFeeMasterModal() {
 
         <!-- FEE SCHEDULE & TARGET MONTH RULES -->
         <div style="background:#1e293b; border:1px solid #c084fc; border-radius:10px; padding:14px 16px; margin-bottom:18px;">
-          <h4 style="margin:0 0 10px 0; font-size:0.88rem; color:#c084fc; font-weight:700;">
+          <h4 style="margin:0 0 10px 0; font-size:0.88rem; color:#6d28d9; font-weight:700;">
             <i class="fa-solid fa-clock-rotate-left"></i> Fee Frequency & Target Month Auto-Attach Schedule
           </h4>
           <div class="grid-2" style="gap:12px; font-size:0.8rem;">
             <div style="background:#0f172a; padding:10px 14px; border-radius:8px; border:1px solid #334155;">
-              <strong style="color:#fbbf24;">1. Annual Charges Schedule</strong>
+              <strong style="color:#b45309;">1. Annual Charges Schedule</strong>
               <div style="margin-top:6px; color:#cbd5e1; font-size:0.75rem;">
                 Frequency: <strong>Once a Year</strong><br>
                 Auto-Attaches to Month:
                 <select id="ruleAnnualMonth" class="session-dropdown" style="padding:2px 6px; font-size:0.75rem; width:110px; margin-top:4px;">
-                  <option value="April" ${rules.annualCharges.targetMonths.includes("April") ? "selected" : ""}>April</option>
-                  <option value="May" ${rules.annualCharges.targetMonths.includes("May") ? "selected" : ""}>May</option>
-                  <option value="July" ${rules.annualCharges.targetMonths.includes("July") ? "selected" : ""}>July</option>
+                  <option value="April" ${annualMonths.includes("April") ? "selected" : ""}>April</option>
+                  <option value="May" ${annualMonths.includes("May") ? "selected" : ""}>May</option>
+                  <option value="July" ${annualMonths.includes("July") ? "selected" : ""}>July</option>
                 </select>
               </div>
             </div>
 
             <div style="background:#0f172a; padding:10px 14px; border-radius:8px; border:1px solid #334155;">
-              <strong style="color:#38bdf8;">2. Exam Fee Schedule (Advance Pre-Exam Collection)</strong>
+              <strong style="color:#0284c7;">2. Exam Fee Schedule (Advance Pre-Exam Collection)</strong>
               <div style="margin-top:6px; color:#cbd5e1; font-size:0.75rem;">
                 Frequency: <strong>Twice a Year</strong><br>
                 Term 1 (Half-Yr): 
                 <select id="ruleExamMonth1" class="session-dropdown" style="padding:2px 6px; font-size:0.75rem; width:135px;">
-                  <option value="August" ${rules.examFee.targetMonths.includes("August")?"selected":""}>August (Pre-Exam)</option>
-                  <option value="July" ${rules.examFee.targetMonths.includes("July")?"selected":""}>July</option>
-                  <option value="September" ${rules.examFee.targetMonths.includes("September")?"selected":""}>September</option>
+                  <option value="August" ${examMonths.includes("August")?"selected":""}>August (Pre-Exam)</option>
+                  <option value="July" ${examMonths.includes("July")?"selected":""}>July</option>
+                  <option value="September" ${examMonths.includes("September")?"selected":""}>September</option>
                 </select><br>
                 Term 2 (Annual): 
                 <select id="ruleExamMonth2" class="session-dropdown" style="padding:2px 6px; font-size:0.75rem; width:135px; margin-top:4px;">
-                  <option value="February" ${rules.examFee.targetMonths.includes("February")?"selected":""}>February (Pre-Exam)</option>
-                  <option value="January" ${rules.examFee.targetMonths.includes("January")?"selected":""}>January</option>
-                  <option value="March" ${rules.examFee.targetMonths.includes("March")?"selected":""}>March</option>
+                  <option value="February" ${examMonths.includes("February")?"selected":""}>February (Pre-Exam)</option>
+                  <option value="January" ${examMonths.includes("January")?"selected":""}>January</option>
+                  <option value="March" ${examMonths.includes("March")?"selected":""}>March</option>
                 </select>
               </div>
             </div>
@@ -12153,7 +17410,7 @@ function openClassFeeMasterModal() {
 
         <div style="display:flex; justify-content:space-between; align-items:center;">
           <button class="btn btn-secondary" onclick="document.getElementById('classFeeMasterModal').remove()" style="background:#334155; color:#fff;">Cancel</button>
-          <button class="btn btn-primary" onclick="saveClassFeeMasterChanges()" style="background:linear-gradient(135deg, #a855f7 0%, #7e22ce 100%); border:none; padding:10px 24px; font-weight:800;">
+          <button class="btn btn-primary" id="saveClassFeeMasterButton" onclick="saveClassFeeMasterChanges()" style="background:linear-gradient(135deg, #a855f7 0%, #7e22ce 100%); border:none; padding:10px 24px; font-weight:800;">
             <i class="fa-solid fa-floppy-disk"></i> Save Master Fee Structure & Schedule
           </button>
         </div>
@@ -12165,65 +17422,108 @@ function openClassFeeMasterModal() {
   document.body.insertAdjacentHTML('beforeend', modalHtml);
 }
 
-function saveClassFeeMasterChanges() {
+async function saveClassFeeMasterChanges() {
+  const activeSession = String(SchoolData.activeSession || '2026-27');
+  const activeUser = getCurrentActiveUser();
+  const activeRole = String(activeUser?.role || '').trim().toLowerCase();
+  const privileged = ['super admin', 'admin', 'principal', 'accountant'].includes(activeRole);
+  if (!privileged
+      && !hasUserAccessPermission(activeUser, 'fee_structure_config', 'modify')
+      && !hasUserAccessPermission(activeUser, 'fee_collection', 'modify')) {
+    showNotification('Access Denied: master fee settings require Fee Structure modify permission.', 'warning');
+    return;
+  }
+  const currentSettings = getFeeSettingsForSession(activeSession);
+  const candidateMaster = JSON.parse(JSON.stringify(currentSettings.classFeeMaster || {}));
   const inputs = document.querySelectorAll('.fee-master-input');
   inputs.forEach(input => {
     const cls = input.getAttribute('data-class');
     const field = input.getAttribute('data-field');
-    const val = parseInt(input.value) || 0;
+    const val = Number(input.value);
 
-    if (!SchoolData.classFeeMaster[cls]) {
-      SchoolData.classFeeMaster[cls] = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, computerFee: 150, admissionFee: 1200 };
+    if (!candidateMaster[cls]) {
+      candidateMaster[cls] = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500 };
     }
-    SchoolData.classFeeMaster[cls][field] = val;
+    candidateMaster[cls][field] = Number.isFinite(val) ? Math.max(0, Math.round(val)) : 0;
   });
   document.querySelectorAll('.fee-master-apply').forEach(input => {
     const cls = input.getAttribute('data-class');
     const field = input.getAttribute('data-field');
-    if (!SchoolData.classFeeMaster[cls]) {
-      SchoolData.classFeeMaster[cls] = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500, computerFee: 150 };
+    if (!candidateMaster[cls]) {
+      candidateMaster[cls] = { monthlyTuition: 1600, annualCharges: 2500, examFee: 500 };
     }
-    SchoolData.classFeeMaster[cls][field] = input.checked;
+    candidateMaster[cls][field] = input.checked;
   });
-  Object.keys(SchoolData.classFeeMaster || {}).forEach(cls => {
-    delete SchoolData.classFeeMaster[cls].admissionFee;
+  Object.keys(candidateMaster).forEach(cls => {
+    delete candidateMaster[cls].admissionFee;
+    delete candidateMaster[cls].computerFee;
+    delete candidateMaster[cls].computerEnabled;
   });
 
   const annualMonth = document.getElementById('ruleAnnualMonth')?.value || 'April';
   const examM1 = document.getElementById('ruleExamMonth1')?.value || 'September';
   const examM2 = document.getElementById('ruleExamMonth2')?.value || 'March';
 
-  SchoolData.feeScheduleRules = {
+  const candidateRules = {
     annualCharges: { frequency: "Once a Year", targetMonths: [annualMonth] },
     examFee:       { frequency: "Twice a Year", targetMonths: [examM1, examM2] }
   };
 
-  const activeSession = SchoolData.activeSession || '2026-27';
-  (SchoolData.students || []).forEach(student => {
-    if (!student.feeRecords) student.feeRecords = {};
-    if (!student.feeRecords[activeSession]) {
-      student.feeRecords[activeSession] = { paidMonths: [], dueMonths: [...SCHOOL_SESSION_MONTHS], payments: [] };
+  const mutationId = createErpMutationId();
+  const clientUpdatedAt = new Date().toISOString();
+  const saveButton = document.getElementById('saveClassFeeMasterButton');
+  if (saveButton) {
+    saveButton.disabled = true;
+    saveButton.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving securely...';
+  }
+  try {
+    const result = await callErpSecurityApi('saveFeeSettingsDelta', {
+      body: {
+        mutationId,
+        sessionName: activeSession,
+        expectedVersion: getFeeSettingsVersion(activeSession),
+        clientUpdatedAt,
+        classFeeMaster: candidateMaster,
+        feeScheduleRules: candidateRules
+      }
+    });
+    SchoolData.feeStructureBySession = {
+      ...(SchoolData.feeStructureBySession || {}),
+      [activeSession]: {
+        classFeeMaster: candidateMaster,
+        feeScheduleRules: candidateRules,
+        updatedAt: clientUpdatedAt,
+        updatedBy: String(activeUser?.username || activeUser?.id || 'staff')
+      }
+    };
+    SchoolData.feeSettingsVersions = {
+      ...(SchoolData.feeSettingsVersions || {}),
+      [activeSession]: String(result.version || `${clientUpdatedAt}:${mutationId}`)
+    };
+    SchoolData.feeSettingsMutationIds = {
+      ...(SchoolData.feeSettingsMutationIds || {}),
+      [activeSession]: [...(SchoolData.feeSettingsMutationIds?.[activeSession] || []), mutationId].slice(-50)
+    };
+    SchoolData.classFeeMaster = candidateMaster;
+    SchoolData.feeScheduleRules = candidateRules;
+    if (result?.savedAt && typeof window.recordCloudMutationRevision === 'function') window.recordCloudMutationRevision(result.savedAt);
+    saveSchoolDataToStorage({ skipCloudPush: true });
+    showNotification('Class fee master structure and schedule saved. Cloud confirmed; student ledgers were not rewritten.', 'success');
+    document.getElementById('classFeeMasterModal')?.remove();
+    renderFeesPage(document.getElementById('contentBody'));
+  } catch (error) {
+    showNotification(`Fee settings were not saved: ${error?.message || 'cloud rejected the change.'}`, 'error');
+    if (saveButton) {
+      saveButton.disabled = false;
+      saveButton.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> Save Master Fee Structure & Schedule';
     }
-    const masterClassName = normalizeClassName(student.currentClass || student.class || 'Class 5');
-    const masterRate = Number(SchoolData.classFeeMaster?.[masterClassName]?.monthlyTuition || getStudentMonthlyTuitionRate(student, activeSession));
-    student.feeRecords[activeSession].monthlyTuition = masterRate;
-    if (student.currentFeeInfo) student.currentFeeInfo.monthlyTuition = student.feeRecords[activeSession].monthlyTuition;
-  });
-
-  saveSchoolDataToStorage();
-
-  const modal = document.getElementById('classFeeMasterModal');
-  if (modal) modal.remove();
-
-  showNotification('Done: Class Fee Master Structure & Target Schedule Saved!', 'success');
-  renderFeesPage(document.getElementById('contentBody'));
+  }
 }
 
 function getCurrentOverdueMonths(student) {
   const currentSession = SchoolData.activeSession;
-  const allMonthsList = ["April", "May", "June", "July", "August", "September", "October", "November", "December", "January", "February", "March"];
-  const currentMonthName = "August"; // Active session month
-  const currentMonthIdx = allMonthsList.indexOf(currentMonthName);
+  const allMonthsList = SCHOOL_SESSION_MONTHS;
+  const currentMonthIdx = getActiveSessionMonthIndex(currentSession);
 
   const feeRec = (student.feeRecords && student.feeRecords[currentSession]) ? student.feeRecords[currentSession] : (student.currentFeeInfo || {});
   const paidMonths = feeRec.paidMonths || [];
@@ -12238,72 +17538,128 @@ function getCurrentOverdueMonths(student) {
   return overdue;
 }
 
+
+function resolvePaymentCashier(p) {
+  if (!p) return { name: 'Daya Chauhan', role: 'Accountant' };
+
+  // 1. Direct explicit properties
+  const rawName = p.collectedBy || p.savedBy || p.enteredBy || p.cashier || p.operator || p.user || p.collectedByUsername || '';
+  const rawRole = p.collectedByRole || p.role || '';
+
+  const nameLower = String(rawName).toLowerCase();
+  if (nameLower.includes('daya')) {
+    return { name: 'Daya Chauhan', role: 'Accountant' };
+  }
+  if (nameLower.includes('ruby')) {
+    return { name: 'Ruby Sharma', role: 'Receptionist' };
+  }
+  if (nameLower.includes('vipin') || nameLower.includes('admin')) {
+    return { name: 'Vipin Chauhan', role: 'Super Admin' };
+  }
+  if (nameLower.includes('sonam')) {
+    return { name: 'Mrs. Sonam Chauhan', role: 'Class Teacher' };
+  }
+  if (nameLower.includes('archana')) {
+    return { name: 'Mrs. Archana Pant', role: 'Class Teacher' };
+  }
+  if (nameLower.includes('varsha')) {
+    return { name: 'Mrs. Varsha Chauhan', role: 'Class Teacher' };
+  }
+
+  // Imported legacy descriptions are not staff names. Historical register
+  // rows were collected at the accounts counter by Daya Chauhan.
+  const monthStr = String(p.month || '');
+  const recNo = String(p.receiptNo || '');
+  const isLegacyImport = /imported|old erp/i.test(`${rawName} ${monthStr}`)
+    || recNo.includes('-1') || /^\d+/.test(recNo) || recNo.startsWith('OLD-');
+  if (isLegacyImport) {
+    return { name: 'Daya Chauhan', role: 'Accountant' };
+  }
+
+  // If rawName is already custom staff name, return it
+  if (rawName && rawName !== 'Office Counter' && rawName !== 'Office Staff') {
+    return { name: rawName, role: rawRole || 'Fee Counter' };
+  }
+
+  return { name: 'Daya Chauhan', role: 'Accountant' };
+}
+
 function getAllFeeReceipts() {
   const receipts = [];
-  const seenReceiptNos = new Set();
+  const seenReceiptKeys = new Set();
   const currentSession = SchoolData.activeSession || '2026-27';
+
+  const processPaymentItem = (s, p, studentIndex, sessionKey) => {
+    if (!p || !p.receiptNo) return;
+    const receiptKey = canonicalPaymentKey(p);
+    if (!receiptKey || seenReceiptKeys.has(receiptKey)) return;
+    seenReceiptKeys.add(receiptKey);
+
+    const pDate = p.date || new Date().toISOString().split('T')[0];
+    let pTime = p.time || '';
+    if (!pTime && p.paidAt) {
+      try { pTime = new Date(p.paidAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true }); } catch (e) {}
+    }
+    if (!pTime) pTime = '11:00 AM';
+
+    const cashierInfo = resolvePaymentCashier(p);
+
+    receipts.push({
+      studentIndex,
+      admissionNo: p.admissionNo || s.admissionNo,
+      studentName: p.studentName || s.name,
+      class: s.currentClass || s.class || 'Class 5',
+      section: s.currentSection || s.section || 'A',
+      parentName: s.parentName || s.fatherName || 'Parent',
+      parentPhone: s.parentPhone || s.mobile || '',
+      receiptNo: p.receiptNo,
+      date: pDate,
+      time: pTime,
+      paidAt: p.paidAt || `${pDate}T11:00:00.000Z`,
+      collectedBy: cashierInfo.name,
+      collectedByRole: cashierInfo.role,
+      collectedByUsername: p.collectedByUsername || (cashierInfo.name.toLowerCase().includes('ruby') ? 'ruby' : 'daya'),
+      amount: p.amount || 0,
+      mode: p.mode || 'Cash',
+      month: p.month || 'Tuition Fee Payment',
+      selectedMonthsTotal: p.selectedMonthsTotal || 0,
+      extraChargesTotal: p.extraChargesTotal || 0,
+      paidCurrentMonths: p.paidCurrentMonths || [],
+      paidPrevMonths: p.paidPrevMonths || [],
+      paidExtraItems: p.paidExtraItems || [],
+      walletApplied: p.walletApplied || 0,
+      excessSaved: p.excessSaved || 0,
+      partialDueCarried: p.partialDueCarried || 0,
+      session: sessionKey
+    });
+  };
 
   if (SchoolData.students && Array.isArray(SchoolData.students)) {
     SchoolData.students.forEach((s, studentIndex) => {
-      // 1. Scan s.feeRecords across all sessions
+      const processedSessions = new Set();
       if (s.feeRecords && typeof s.feeRecords === 'object') {
         Object.keys(s.feeRecords).forEach(sessKey => {
           const feeRec = s.feeRecords[sessKey];
           if (feeRec && Array.isArray(feeRec.payments)) {
-            feeRec.payments.forEach(p => {
-              if (p && p.receiptNo && !seenReceiptNos.has(p.receiptNo)) {
-                seenReceiptNos.add(p.receiptNo);
-                receipts.push({
-                  studentIndex,
-                  admissionNo: p.admissionNo || s.admissionNo,
-                  studentName: p.studentName || s.name,
-                  class: s.currentClass || s.class || 'Class 5',
-                  section: s.currentSection || s.section || 'A',
-                  parentName: s.parentName || s.fatherName || 'Parent',
-                  parentPhone: s.parentPhone || s.mobile || '',
-                  receiptNo: p.receiptNo,
-                  date: p.date || new Date().toISOString().split('T')[0],
-                  amount: p.amount || 0,
-                  mode: p.mode || 'Online UPI',
-                  month: p.month || 'Tuition Fee Payment',
-                  selectedMonthsTotal: p.selectedMonthsTotal || p.amount,
-                  session: sessKey
-                });
-              }
-            });
+            processedSessions.add(sessKey);
+            getUniquePaymentsView(feeRec.payments).forEach(p => processPaymentItem(s, p, studentIndex, sessKey));
           }
         });
       }
 
-      // 2. Scan s.currentFeeInfo.payments
-      if (s.currentFeeInfo && Array.isArray(s.currentFeeInfo.payments)) {
-        s.currentFeeInfo.payments.forEach(p => {
-          if (p && p.receiptNo && !seenReceiptNos.has(p.receiptNo)) {
-            seenReceiptNos.add(p.receiptNo);
-            receipts.push({
-              studentIndex,
-              admissionNo: p.admissionNo || s.admissionNo,
-              studentName: p.studentName || s.name,
-              class: s.currentClass || s.class || 'Class 5',
-              section: s.currentSection || s.section || 'A',
-              parentName: s.parentName || s.fatherName || 'Parent',
-              parentPhone: s.parentPhone || s.mobile || '',
-              receiptNo: p.receiptNo,
-              date: p.date || new Date().toISOString().split('T')[0],
-              amount: p.amount || 0,
-              mode: p.mode || 'Online UPI',
-              month: p.month || 'Tuition Fee Payment',
-              selectedMonthsTotal: p.selectedMonthsTotal || p.amount,
-              session: currentSession
-            });
-          }
-        });
+      // Scan s.currentFeeInfo ONLY if feeRecords[currentSession] did not exist
+      if (!processedSessions.has(currentSession) && s.currentFeeInfo && Array.isArray(s.currentFeeInfo.payments)) {
+        getUniquePaymentsView(s.currentFeeInfo.payments).forEach(p => processPaymentItem(s, p, studentIndex, currentSession));
       }
-
     });
   }
 
-  return receipts.sort((a, b) => b.receiptNo.localeCompare(a.receiptNo));
+  // Sort receipts newest first by time & date
+  return receipts.sort((a, b) => {
+    const timeA = new Date(a.paidAt || a.date).getTime() || 0;
+    const timeB = new Date(b.paidAt || b.date).getTime() || 0;
+    return timeB - timeA;
+  });
 }
 
 function findReceiptContext(admissionNo, receiptNo, studentIndex) {
@@ -12365,18 +17721,18 @@ function openQuickFeeSelectModal() {
 
         <div style="max-height:360px; overflow-y:auto; border:1px solid #334155; border-radius:12px; padding:8px; background:#1e293b;" id="quickFeeStudentListContainer">
           ${students.map(s => {
-            const fee = s.currentFeeInfo || {};
             const overdue = getCurrentOverdueMonths(s);
-            const dueAmount = (overdue.length * getStudentMonthlyTuitionRate(s)) + (fee.previousSessionDue || 0);
+            const dueAmount = getStudentTotalDueAmount(s);
 
             return `
               <div class="quick-fee-student-item" data-search="${s.name.toLowerCase()} ${s.admissionNo} ${s.parentPhone}" style="display:flex; justify-content:space-between; align-items:center; padding:12px; border-bottom:1px solid #334155; gap:12px;">
                 <div style="display:flex; align-items:center; gap:12px;">
-                  <img src="${s.photo || 'https://images.unsplash.com/photo-1544717305-2782549b5136?w=150&auto=format&fit=crop&q=80'}" style="width:40px; height:40px; border-radius:50%; object-fit:cover;">
+                  ${getStudentDirectoryPhotoHtml(s, 40)}
                   <div>
-                    <strong style="color:#ffffff; font-size:0.95rem;">${s.name}</strong> 
-                    <span style="color:#38bdf8; font-size:0.8rem;">(${s.currentClass || 'Class 5'} - ${s.currentSection || 'A'})</span><br>
-                    <small style="color:#94a3b8; font-size:0.75rem;">Adm: <code>${s.admissionNo}</code> | Father: ${s.parentName}</small>
+                    <strong style="color:var(--text-main); font-size:0.95rem;">${s.name}</strong> 
+                    <span style="color:var(--accent-primary); font-size:0.8rem;">(${s.currentClass || 'Class 5'} - ${s.currentSection || 'A'})</span><br>
+                    <span class="adm-no-chip" style="margin-top:2px;">Adm ${s.admissionNo}</span>
+                    <small style="color:#94a3b8; font-size:0.75rem; display:block; margin-top:4px;">Father: ${s.parentName}</small>
                   </div>
                 </div>
 
@@ -12423,14 +17779,17 @@ function renderRecentReceiptsSection() {
     <div class="glass-card" style="margin-top:24px; border:2px solid #0284c7; background:linear-gradient(135deg, rgba(15, 23, 42, 0.95) 0%, rgba(30, 41, 59, 0.95) 100%);">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:12px; border-bottom:1px solid #334155; padding-bottom:12px;">
         <div>
-          <h3 style="margin:0; color:#38bdf8; font-family:var(--font-heading); font-size:1.15rem; display:flex; align-items:center; gap:10px;">
+          <h3 style="margin:0; color:#0284c7; font-family:var(--font-heading); font-size:1.15rem; display:flex; align-items:center; gap:10px;">
             <i class="fa-solid fa-clock-rotate-left"></i> Recent Fee Payment Receipts Details & Search Ledger
           </h3>
-          <p style="margin:4px 0 0 0; font-size:0.8rem; color:#cbd5e1;">View, search, and reprint official tuition fee payment receipts dispatches.</p>
+          <p style="margin:4px 0 0 0; font-size:0.8rem; color:#374151;">View, search, and reprint official tuition fee payment receipts dispatches.</p>
         </div>
         
-        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
           <input type="text" id="recentReceiptSearchInput" placeholder="Search Receipt #, Name, Adm No, Mode..." class="session-dropdown" style="width:260px; padding:6px 12px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onkeyup="filterRecentReceiptsTable()">
+          <input type="month" id="recentReceiptMonthFilter" class="session-dropdown date-filter-input" title="Filter by month" style="width:150px; padding:6px 10px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onchange="filterRecentReceiptsTable()">
+          <input type="date" id="recentReceiptFromDate" class="session-dropdown date-filter-input" title="From date" style="width:150px; padding:6px 10px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onchange="filterRecentReceiptsTable()">
+          <input type="date" id="recentReceiptToDate" class="session-dropdown date-filter-input" title="To date" style="width:150px; padding:6px 10px; background:#0f172a; color:#fff; border:1px solid #0284c7;" onchange="filterRecentReceiptsTable()">
           <button class="btn btn-secondary" onclick="exportReceiptsCSV()" style="background:#0284c7; color:#fff; border:none; font-weight:700; padding:6px 14px; font-size:0.82rem;">
             <i class="fa-solid fa-file-csv"></i> Export CSV
           </button>
@@ -12440,14 +17799,15 @@ function renderRecentReceiptsSection() {
       <div class="data-table-container">
         <table class="data-table" id="recentReceiptsDetailsTable" style="width:100%; text-align:left; font-size:0.83rem;">
           <thead>
-            <tr style="background:#0f172a; color:#cbd5e1;">
-              <th>Receipt #</th>
-              <th>Date</th>
-              <th>Student Name</th>
-              <th>Adm No</th>
-              <th>Class</th>
-              <th>Amount Paid</th>
-              <th>Payment Mode</th>
+            <tr style="background:#0f172a; color:#cbd5e1; user-select:none;">
+              <th onclick="sortHtmlTable('recentReceiptsDetailsTable', 0, 'string')" style="cursor:pointer;">Receipt # <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
+              <th onclick="sortHtmlTable('recentReceiptsDetailsTable', 1, 'date')" style="cursor:pointer;">Date & Time <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
+              <th onclick="sortHtmlTable('recentReceiptsDetailsTable', 2, 'string')" style="cursor:pointer;">Student Name <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
+              <th onclick="sortHtmlTable('recentReceiptsDetailsTable', 3, 'number')" style="cursor:pointer;">Adm No <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
+              <th onclick="sortHtmlTable('recentReceiptsDetailsTable', 4, 'string')" style="cursor:pointer;">Class <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
+              <th onclick="sortHtmlTable('recentReceiptsDetailsTable', 5, 'number')" style="cursor:pointer;">Amount Paid <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
+              <th>Collected By (Staff)</th>
+              <th onclick="sortHtmlTable('recentReceiptsDetailsTable', 7, 'string')" style="cursor:pointer;">Mode <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
               <th>Paid Months / Details</th>
               <th style="text-align:center;">Actions / Print</th>
             </tr>
@@ -12456,13 +17816,20 @@ function renderRecentReceiptsSection() {
             ${receipts.length === 0 ? `
               <tr><td colspan="9" style="text-align:center; padding:24px; color:#94a3b8; font-style:italic;">No fee payment receipts logged yet. Collect a fee payment above to generate the first receipt!</td></tr>
             ` : receipts.map(r => `
-              <tr class="recent-receipt-row" data-search="${r.receiptNo.toLowerCase()} ${r.studentName.toLowerCase()} ${r.admissionNo} ${r.mode.toLowerCase()} ${r.month.toLowerCase()}" style="border-bottom:1px solid #334155;">
-                <td><code style="color:#c084fc; font-weight:800; font-size:0.85rem;">#${r.receiptNo}</code></td>
-                <td><span style="color:#cbd5e1;">${r.date}</span></td>
+              <tr class="recent-receipt-row" data-search="${r.receiptNo.toLowerCase()} ${r.studentName.toLowerCase()} ${r.admissionNo} ${r.mode.toLowerCase()} ${r.month.toLowerCase()}" data-date="${r.date || ''}" style="border-bottom:1px solid #334155;">
+                <td><code style="color:#38bdf8; font-weight:800; font-size:0.85rem;">#${r.receiptNo}</code></td>
+                <td>
+                  <strong style="color:#ffffff; font-size:0.82rem;">${r.date}</strong><br>
+                  <small style="color:#38bdf8; font-weight:700;"><i class="fa-solid fa-clock"></i> ${r.time || '11:00 AM'}</small>
+                </td>
                 <td><strong style="color:#ffffff;">${r.studentName}</strong></td>
-                <td><code>${r.admissionNo}</code></td>
+                <td><span class="adm-no-chip">${r.admissionNo}</span></td>
                 <td><span class="badge badge-purple">${r.class} - ${r.section}</span></td>
                 <td><strong style="color:#34d399; font-size:0.95rem;">Rs${(r.amount || 0).toLocaleString('en-IN')}</strong></td>
+                <td>
+                  <strong style="color:#f59e0b; font-size:0.82rem;"><i class="fa-solid fa-user-check"></i> ${r.collectedBy || 'Mrs. Ruby Sharma'}</strong><br>
+                  <small style="color:#94a3b8; font-weight:600;">${r.collectedByRole || 'Receptionist'}</small>
+                </td>
                 <td>
                   <span class="badge ${r.mode === 'Cash' ? 'badge-warning' : 'badge-info'}" style="font-size:0.75rem;">
                     <i class="fa-solid ${r.mode === 'Cash' ? 'fa-money-bill-1' : 'fa-mobile-screen'}"></i> ${r.mode}
@@ -12490,14 +17857,14 @@ function renderRecentReceiptsSection() {
 
 function filterRecentReceiptsTable() {
   const query = document.getElementById('recentReceiptSearchInput')?.value.toLowerCase().trim() || '';
+  const dateRange = getReceiptDateFilterRange();
   const rows = document.querySelectorAll('.recent-receipt-row');
   rows.forEach(row => {
     const searchData = row.getAttribute('data-search') || '';
-    if (!query || searchData.includes(query)) {
-      row.style.display = '';
-    } else {
-      row.style.display = 'none';
-    }
+    const receiptDate = row.getAttribute('data-date') || '';
+    const matchQuery = !query || searchData.includes(query);
+    const matchDate = receiptMatchesDateFilter({ date: receiptDate }, dateRange);
+    row.style.display = (matchQuery && matchDate) ? '' : 'none';
   });
 }
 
@@ -12505,26 +17872,25 @@ function filterRecentReceiptsTable() {
    MODULE: FEES MANAGEMENT
    ============================================================================ */
 function renderFeesPage(container) {
+  if (window.ERP_V2_READ_FLAGS && window.ERP_V2_READ_FLAGS.fees && typeof window.refreshStudentFeeLedgerFromV2 === 'function') {
+    requestErpV2ScreenRefresh('fees', 'fees', window.refreshStudentFeeLedgerFromV2, function() {
+      if (window.location.hash.replace('#', '') === 'fees') renderFeesPage(container);
+    });
+  }
+  dedupeAllSchoolFeeRecords();
+  
   const students = getStudentsByActiveSession();
   const currentSession = SchoolData.activeSession;
   const classOptions = getSchoolClassNames();
-  const paidCount = students.filter(s => (s.feeRecords?.[currentSession]?.payments || []).length > 0).length;
+  const paidCount = students.filter(s => getUniquePaymentsView(s.feeRecords?.[currentSession]?.payments).length > 0).length;
   const canSeeCollected = canUserViewSchoolTotalRevenue();
   const canSeePendingTotal = canUserViewSchoolTotalDues();
   const collectedTotal = students.reduce((acc, s) => {
-    const payments = s.feeRecords[currentSession]?.payments || [];
+    const payments = getUniquePaymentsView(s.feeRecords[currentSession]?.payments);
     return acc + payments.reduce((pAcc, p) => pAcc + (p.amount || 0), 0);
   }, 0);
-  const pendingTotal = students.reduce((acc, s) => {
-    const fee = s.currentFeeInfo || {};
-    const overdueMonths = getCurrentOverdueMonths(s);
-    return acc + (overdueMonths.length * getStudentMonthlyTuitionRate(s)) + (fee.previousSessionDue || 0);
-  }, 0);
-  const defaulterCount = students.filter(s => {
-    const fee = s.currentFeeInfo || {};
-    const overdueMonths = getCurrentOverdueMonths(s);
-    return (overdueMonths.length > 0 || (fee.previousSessionDue || 0) > 0);
-  }).length;
+  const pendingTotal = students.reduce((acc, s) => acc + getStudentTotalDueAmount(s), 0);
+  const defaulterCount = students.filter(s => getStudentTotalDueAmount(s) > 0).length;
 
   container.innerHTML = `
     <div class="page-header">
@@ -12536,6 +17902,9 @@ function renderFeesPage(container) {
         <button class="btn btn-primary" style="background:linear-gradient(135deg, #10b981 0%, #059669 100%); color:#ffffff; border:none; font-weight:800; padding:10px 18px; display:flex; align-items:center; gap:8px;" onclick="openQuickFeeSelectModal()"><i class="fa-solid fa-indian-rupee-sign"></i> Collect Fee Now</button>
         <button class="btn btn-secondary" style="background:#0284c7; color:#ffffff; border:none; font-weight:800; padding:10px 18px;" onclick="window.location.hash='receipts'"><i class="fa-solid fa-file-invoice-dollar"></i> Fee Receipts Ledger</button>
         <button class="btn btn-secondary" onclick="openClassFeeMasterModal()"><i class="fa-solid fa-sliders"></i> Master Fee Configurator</button>
+        <button class="btn btn-secondary" onclick="openFeeHistoryImportModal()" style="background:#d97706; color:#ffffff; border:none; font-weight:800; padding:10px 18px;" title="Import paid months and receipts from your old ERP Excel/CSV">
+          <i class="fa-solid fa-file-import"></i> Import Old ERP Fees
+        </button>
         <button class="btn btn-telegram" onclick="triggerBulkFeeReminder()"><i class="fa-solid fa-paper-plane"></i> Bulk Reminders</button>
         <button class="btn btn-secondary" style="background:#0f766e; color:#ffffff; border:none; font-weight:800; padding:10px 18px;" onclick="syncStudentFeesToGoogleSheet()" title="Push fee due columns to Google Sheet Students tab for /fees bot command"><i class="fa-solid fa-cloud-arrow-up"></i> Sync Fees → Sheet</button>
         <button class="btn btn-secondary" style="background:#475569; color:#ffffff; border:none; font-weight:800; padding:10px 14px;" onclick="syncStudentFeesToGoogleSheet({ dryRun: true })" title="Preview only — does not write to sheet"><i class="fa-solid fa-eye"></i> Preview</button>
@@ -12573,13 +17942,13 @@ function renderFeesPage(container) {
     <div class="glass-card">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:12px;">
         <div style="display:flex; gap:10px; align-items:center;">
-          <input type="text" id="feeSearchInput" placeholder="Search student name or adm no..." class="session-dropdown" style="width:260px;" onkeyup="filterFeesTable()">
+          <input type="text" id="feeSearchInput" placeholder="Search student name or adm no..." class="session-dropdown" style="width:360px; flex:0 0 360px; font-size:0.92rem;" onkeyup="filterFeesTable()">
           <select id="feeClassFilter" class="session-dropdown" onchange="filterFeesTable()">
             <option value="ALL">All Classes</option>
             ${classOptions.map(cls => `<option value="${cls}">${cls}</option>`).join('')}
           </select>
-          <button class="btn btn-secondary" onclick="exportCurrentFeeLedgerCsv()" style="background:#16a34a; color:#ffffff; border:none; font-weight:800; white-space:nowrap; min-width:max-content; display:inline-flex; align-items:center; gap:8px; padding:10px 18px;">
-            <i class="fa-solid fa-file-csv"></i> Export Current View
+          <button class="btn btn-secondary" onclick="exportFeeBifurcationReport()" style="background:#16a34a; color:#ffffff; border:none; font-weight:800; white-space:nowrap; min-width:max-content; display:inline-flex; align-items:center; gap:8px; padding:10px 18px;">
+            <i class="fa-solid fa-file-csv"></i> Export Fee Report (Bifurcated)
           </button>
         </div>
 
@@ -12587,9 +17956,8 @@ function renderFeesPage(container) {
           <button class="btn btn-secondary fee-tab-btn active" id="tabAll" onclick="setFeeFilterTab('ALL')">All (${students.length})</button>
           <button class="btn btn-secondary fee-tab-btn" id="tabPaid" onclick="setFeeFilterTab('PAID')" style="border-color:#10b981; color:#10b981;">Paid Fee (${paidCount})</button>
           <button class="btn btn-secondary fee-tab-btn" id="tabDefaulters" onclick="setFeeFilterTab('DEFAULTERS')" style="border-color:#ef4444; color:#f87171;">Defaulters Only</button>
-          <button class="btn btn-secondary fee-tab-btn" id="tabTuition" onclick="setFeeFilterTab('TUITION')" style="border-color:#38bdf8; color:#38bdf8;">Tuition Due</button>
+          <button class="btn btn-secondary fee-tab-btn" id="tabTuition" onclick="setFeeFilterTab('TUITION')" style="border-color:#0284c7; color:#0284c7;">Tuition Due</button>
           <button class="btn btn-secondary fee-tab-btn" id="tabExam" onclick="setFeeFilterTab('EXAM')" style="border-color:#f59e0b; color:#f59e0b;">Exam Fee Due</button>
-          <button class="btn btn-secondary fee-tab-btn" id="tabComputer" onclick="setFeeFilterTab('COMPUTER')" style="border-color:#8b5cf6; color:#c084fc;">Computer Fee Due</button>
           <button class="btn btn-secondary fee-tab-btn" id="tabAnnual" onclick="setFeeFilterTab('ANNUAL')" style="border-color:#22c55e; color:#22c55e;">Annual Fee Due</button>
         </div>
       </div>
@@ -12599,6 +17967,7 @@ function renderFeesPage(container) {
           <thead>
             <tr>
               <th>Student</th>
+              <th>Adm No</th>
               <th>Class</th>
               <th>Paid Months</th>
               <th>Pending Months (Up to August)</th>
@@ -12613,15 +17982,13 @@ function renderFeesPage(container) {
               const fee = s.currentFeeInfo || {};
               const status = getStudentFeeCategoryStatus(s);
               const overdueMonths = status.overdueMonths;
-              const dueAmount = status.totalDue;
-              const paidAmount = (s.feeRecords?.[currentSession]?.payments || []).reduce((acc, p) => acc + (p.amount || 0), 0);
+              const dueAmount = getStudentTotalDueAmount(s);
+              const paidAmount = getUniquePaymentsView(s.feeRecords?.[currentSession]?.payments).reduce((acc, p) => acc + (p.amount || 0), 0);
 
               return `
-                <tr class="fee-row" data-name="${s.name.toLowerCase()}" data-adm="${s.admissionNo}" data-class="${s.currentClass}" data-dues="${dueAmount}" data-paid="${paidAmount}" data-tuition="${status.tuitionDue}" data-exam="${status.examDue}" data-computer="${status.computerDue}" data-annual="${status.annualDue}">
-                  <td>
-                    <strong>${s.name}</strong><br>
-                    <small style="color:var(--text-muted);">Adm: ${s.admissionNo}</small>
-                  </td>
+                <tr class="fee-row" data-name="${s.name.toLowerCase()}" data-adm="${s.admissionNo}" data-class="${s.currentClass}" data-dues="${dueAmount}" data-paid="${paidAmount}" data-tuition="${status.tuitionDue}" data-exam="${status.examDue}" data-annual="${status.annualDue}">
+                  <td><strong>${s.name}</strong></td>
+                  <td><span class="adm-no-chip">${s.admissionNo}</span></td>
                   <td><span class="badge badge-purple">${s.currentClass} - ${s.currentSection}</span></td>
                   <td><span class="badge badge-success">${fee.paidMonths?.join(', ') || 'None'}</span></td>
                   <td><span class="badge badge-danger">${overdueMonths.join(', ') || 'Zero Dues'}</span></td>
@@ -12632,9 +17999,8 @@ function renderFeesPage(container) {
                   </td>
                   <td>
                     ${status.examDue ? `<span class="badge badge-warning">Exam Rs ${status.examDue}</span>` : ''}
-                    ${status.computerDue ? `<span class="badge badge-purple">Computer Rs ${status.computerDue}</span>` : ''}
                     ${status.annualDue ? `<span class="badge badge-info">Annual Rs ${status.annualDue}</span>` : ''}
-                    ${!status.examDue && !status.computerDue && !status.annualDue ? `<span style="color:var(--text-muted);">None</span>` : ''}
+                    ${!status.examDue && !status.annualDue ? `<span style="color:var(--text-muted);">None</span>` : ''}
                   </td>
                   <td><strong style="color:${dueAmount > 0 ? 'var(--accent-danger)' : 'var(--accent-success)'}; font-size:1rem;">Rs ${dueAmount.toLocaleString('en-IN')}</strong></td>
                   <td>
@@ -12667,7 +18033,7 @@ window._currentFeeTab = 'ALL';
 
 function setFeeFilterTab(tab) {
   window._currentFeeTab = tab;
-  ['All', 'Paid', 'Defaulters', 'Tuition', 'Exam', 'Computer', 'Annual'].forEach(name => {
+  ['All', 'Paid', 'Defaulters', 'Tuition', 'Exam', 'Annual'].forEach(name => {
     document.getElementById(`tab${name}`)?.classList.toggle('active', tab === name.toUpperCase() || (name === 'All' && tab === 'ALL'));
   });
   filterFeesTable();
@@ -12682,7 +18048,7 @@ function getCurrentFeeLedgerRows() {
   return getStudentsByActiveSession().map(s => {
     const fee = s.currentFeeInfo || {};
     const status = getStudentFeeCategoryStatus(s);
-    const payments = s.feeRecords?.[currentSession]?.payments || [];
+    const payments = getUniquePaymentsView(s.feeRecords?.[currentSession]?.payments);
     const paidAmount = payments.reduce((acc, p) => acc + (p.amount || 0), 0);
     const overdueMonths = status.overdueMonths;
     return {
@@ -12692,7 +18058,7 @@ function getCurrentFeeLedgerRows() {
       payments,
       paidAmount,
       overdueMonths,
-      dueAmount: status.totalDue
+      dueAmount: getStudentTotalDueAmount(s)
     };
   }).filter(row => {
     const s = row.student;
@@ -12706,7 +18072,6 @@ function getCurrentFeeLedgerRows() {
       (tab === 'DEFAULTERS' && row.dueAmount > 0) ||
       (tab === 'TUITION' && row.status.tuitionDue > 0) ||
       (tab === 'EXAM' && row.status.examDue > 0) ||
-      (tab === 'COMPUTER' && row.status.computerDue > 0) ||
       (tab === 'ANNUAL' && row.status.annualDue > 0);
     return matchQuery && matchClass && matchTab;
   });
@@ -12726,7 +18091,6 @@ function filterFeesTable() {
     const paid = parseInt(r.getAttribute('data-paid') || '0');
     const tuition = parseInt(r.getAttribute('data-tuition') || '0');
     const exam = parseInt(r.getAttribute('data-exam') || '0');
-    const computer = parseInt(r.getAttribute('data-computer') || '0');
     const annual = parseInt(r.getAttribute('data-annual') || '0');
 
     const matchQuery = !query || name.includes(query) || adm.includes(query);
@@ -12736,7 +18100,6 @@ function filterFeesTable() {
       (tab === 'DEFAULTERS' && dues > 0) ||
       (tab === 'TUITION' && tuition > 0) ||
       (tab === 'EXAM' && exam > 0) ||
-      (tab === 'COMPUTER' && computer > 0) ||
       (tab === 'ANNUAL' && annual > 0);
 
     r.style.display = (matchQuery && matchClass && matchTab) ? '' : 'none';
@@ -12768,64 +18131,7 @@ function downloadCsvFile(fileName, rows) {
 }
 
 function exportCurrentFeeLedgerCsv() {
-  const rows = getCurrentFeeLedgerRows();
-  const currentSession = SchoolData.activeSession;
-  const tab = window._currentFeeTab || 'ALL';
-  const targetClass = document.getElementById('feeClassFilter')?.value || 'ALL';
-  const csvRows = [
-    [
-      'Admission No',
-      'Student Name',
-      'Class',
-      'Section',
-      'Father Name',
-      'Parent Phone',
-      'Paid Months',
-      'Pending Months Up To August',
-      'Paid Amount',
-      'Tuition Due',
-      'Exam Fee Due',
-      'Computer Fee Due',
-      'Annual Fee Due',
-      'Previous Session Due',
-      'Total Pending Due',
-      'Last Receipt No',
-      'Last Payment Date'
-    ].map(csvEscape).join(',')
-  ];
-
-  rows.forEach(row => {
-    const s = row.student;
-    const lastPayment = row.payments[row.payments.length - 1] || {};
-    csvRows.push([
-      s.admissionNo,
-      s.name,
-      s.currentClass || s.class || '',
-      s.currentSection || s.section || '',
-      s.parentName || '',
-      s.parentPhone || '',
-      (row.fee.paidMonths || []).join(', '),
-      row.overdueMonths.join(', '),
-      row.paidAmount,
-      row.status.tuitionDue,
-      row.status.examDue,
-      row.status.computerDue,
-      row.status.annualDue,
-      row.fee.previousSessionDue || 0,
-      row.dueAmount,
-      lastPayment.receiptNo || '',
-      lastPayment.date || ''
-    ].map(csvEscape).join(','));
-  });
-
-  const csvContent = "data:text/csv;charset=utf-8," + csvRows.join("\n");
-  const link = document.createElement("a");
-  link.setAttribute("href", encodeURI(csvContent));
-  link.setAttribute("download", `Fee_Ledger_${tab}_${targetClass.replace(/\s+/g, '_')}_${currentSession}.csv`);
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  showNotification(`Exported ${rows.length} fee ledger row(s).`, 'success');
+  exportFeeBifurcationReport();
 }
 
 function openCollectFeeModal(admissionNo) {
@@ -12839,7 +18145,8 @@ function openCollectFeeModal(admissionNo) {
 
   const currentSession = SchoolData.activeSession;
   const prevSession = "2025-26";
-  const receiptNo = "REC-" + currentSession.replace('-', '') + "-" + Math.floor(1000 + Math.random() * 9000);
+  const feeMutationId = createErpMutationId();
+  const receiptNo = `REC-${currentSession.replace(/[^0-9a-z]/gi, '').toUpperCase()}-${feeMutationId.replace(/[^0-9a-z]/gi, '').toUpperCase().slice(0, 12)}`;
 
   const currentClass = student.currentClass || student.class || 'Class 5';
   const prevClassObj = student.sessionDetails ? student.sessionDetails[prevSession] : null;
@@ -12847,10 +18154,8 @@ function openCollectFeeModal(admissionNo) {
   const currentRate = getStudentMonthlyTuitionRate(student, currentSession);
   const prevRate = (student.feeRecords && student.feeRecords[prevSession]) ? (student.feeRecords[prevSession].monthlyTuition || 1500) : 1500;
 
-  const allMonthsList = ["April", "May", "June", "July", "August", "September", "October", "November", "December", "January", "February", "March"];
-  
-  const currentMonthName = "August";
-  const currentMonthIdx = allMonthsList.indexOf(currentMonthName);
+  const allMonthsList = SCHOOL_SESSION_MONTHS;
+  const currentMonthIdx = getActiveSessionMonthIndex(currentSession);
 
   let prevDueMonths = [];
   if (student.feeRecords && student.feeRecords[prevSession] && student.feeRecords[prevSession].dueMonths) {
@@ -12870,7 +18175,7 @@ function openCollectFeeModal(admissionNo) {
   const categoryStatus = getStudentFeeCategoryStatus(student);
 
   const modalHtml = `
-    <div class="modal-overlay active" id="collectFeeModal" style="z-index:99999;">
+    <div class="modal-overlay active" id="collectFeeModal" data-fee-mutation-id="${feeMutationId}" style="z-index:99999;">
       <style>
         #collectFeeModal .modal-box {
           max-width:1040px !important;
@@ -12879,12 +18184,33 @@ function openCollectFeeModal(admissionNo) {
           border:1px solid #cbd5e1 !important;
           box-shadow:0 24px 60px rgba(15,23,42,0.28) !important;
         }
-        #collectFeeModal [style*="background:#0f172a"],
-        #collectFeeModal [style*="background:#1e293b"],
-        #collectFeeModal [style*="background:linear-gradient(135deg, #0f172a"] {
+        #collectFeeModal [style*="background:#0f172a"]:not(.fee-student-bio),
+        #collectFeeModal [style*="background:#1e293b"]:not(.fee-student-bio),
+        #collectFeeModal [style*="background:linear-gradient(135deg, #0f172a"]:not(.fee-student-bio) {
           background:#f8fafc !important;
           color:#0f172a !important;
           border-color:#cbd5e1 !important;
+        }
+        /* Student bio — light card, all text dark */
+        #collectFeeModal .fee-student-bio {
+          background:#f0fdf4 !important;
+          border:1.5px solid #6ee7b7 !important;
+          color:#0f172a !important;
+        }
+        #collectFeeModal .fee-student-bio * {
+          color:#0f172a !important;
+        }
+        #collectFeeModal .fee-student-bio .fee-bio-name {
+          color:#047857 !important;
+          font-weight:900 !important;
+        }
+        #collectFeeModal .fee-student-bio .fee-bio-parent {
+          color:#1e3a5f !important;
+          font-weight:700 !important;
+        }
+        #collectFeeModal .fee-student-bio .adm-no-chip {
+          background:#0284c7 !important;
+          color:#ffffff !important;
         }
         #collectFeeModal .session-dropdown {
           background:#ffffff !important;
@@ -12909,31 +18235,34 @@ function openCollectFeeModal(admissionNo) {
       <div class="modal-box" style="max-width:720px; background:#1e293b; color:#ffffff; padding:24px; border-radius:16px; border:2px solid #10b981; box-shadow:0 25px 50px -12px rgba(0,0,0,0.8); position:relative; max-height:92vh; overflow-y:auto;">
         <button onclick="document.getElementById('collectFeeModal').remove()" style="position:absolute; top:16px; right:20px; background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; font-size:1.1rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">X</button>
 
-        <h3 style="margin:0 0 4px 0; color:#34d399; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+        <h3 style="margin:0 0 4px 0; color:#047857; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
           <i class="fa-solid fa-calculator"></i> Multi-Session Smart Fee & Wallet Collector
         </h3>
-        <p style="margin:0 0 16px 0; font-size:0.82rem; color:#cbd5e1;">Auto-calculates session rates, carries forward partial dues, and saves excess cash to student wallet.</p>
+        <p style="margin:0 0 16px 0; font-size:0.82rem; color:#374151;">Auto-calculates session rates, carries forward partial dues, and saves excess cash to student wallet.</p>
 
         <!-- STUDENT BIO HEADER -->
-        <div style="background:#0f172a; padding:12px 16px; border-radius:10px; border:1px solid #334155; margin-bottom:16px; display:flex; justify-content:space-between; align-items:center;">
-          <div>
-            <div style="font-size:1.45rem; font-weight:900; color:#047857;">${student.name}</div>
-            <div style="font-size:1rem; color:#334155; margin-top:4px; font-weight:800;">
-              Admission No: <code style="color:#6366f1; font-weight:bold;">${student.admissionNo}</code> | 
-              Current Class: <strong style="color:#38bdf8;">${currentClass} - ${student.currentSection || 'A'}</strong>
+        <div class="fee-student-bio" style="background:#0f172a; padding:12px 16px; border-radius:10px; border:1px solid #334155; margin-bottom:16px; display:flex; justify-content:space-between; align-items:center;">
+          <div style="display:flex; align-items:center; gap:16px;">
+            ${getStudentDirectoryPhotoHtml(student, 52)}
+            <div style="display:flex; flex-direction:column; gap:2px; text-align:left;">
+              <div class="fee-bio-name" style="font-size:1.45rem; font-weight:900; color:#34d399;">${student.name}</div>
+              <div style="font-size:1rem; font-weight:800; display:flex; align-items:center; gap:10px; flex-wrap:wrap; color:#f8fafc;">
+                <span class="adm-no-chip" style="margin-top:0; background:#0284c7; color:#fff; font-weight:900;">Adm ${student.admissionNo}</span>
+                <span>Class: <strong style="color:#0284c7;">${currentClass} - ${student.currentSection || 'A'}</strong></span>
+              </div>
+              <div class="fee-bio-parent" style="font-size:0.95rem; color:#1e3a5f; font-weight:700;">Parent: ${student.parentName} &nbsp;|&nbsp; ${student.parentPhone}</div>
             </div>
-            <div style="font-size:0.95rem; color:#475569; margin-top:4px; font-weight:700;">Parent: ${student.parentName} (${student.parentPhone})</div>
           </div>
           <div style="text-align:right;">
-            <div style="font-size:0.75rem; color:#a7f3d0; font-weight:600;">Receipt No</div>
-            <code style="font-size:0.88rem; color:#34d399; font-weight:bold;">${receiptNo}</code>
+            <div style="font-size:0.75rem; color:#1e3a5f; font-weight:800; text-transform:uppercase; letter-spacing:0.05em;">Receipt No</div>
+            <code style="font-size:0.88rem; color:#0369a1; font-weight:900;">${receiptNo}</code>
           </div>
         </div>
 
         <!-- WALLET & PARTIAL ADJUSTMENT PANEL -->
         <div style="background:#0f172a; border:1px solid #3b82f6; border-radius:10px; padding:12px 16px; margin-bottom:16px;">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-            <span style="font-size:0.85rem; font-weight:700; color:#60a5fa;">
+            <span style="font-size:0.85rem; font-weight:700; color:#1d4ed8;">
               <i class="fa-solid fa-wallet"></i> Cash Received & Wallet Balance Adjustment
             </span>
             <div id="walletStatusBadge" style="font-size:0.75rem; font-weight:bold;"></div>
@@ -12941,12 +18270,12 @@ function openCollectFeeModal(admissionNo) {
 
           <div class="grid-2" style="gap:14px; align-items:center;">
             <div>
-              <label style="font-size:0.8rem; font-weight:600; color:#cbd5e1; display:block; margin-bottom:4px;">Actual Payment Received (Rs)</label>
+              <label style="font-size:0.85rem; font-weight:800; color:#0f172a !important; display:block; margin-bottom:4px;">Actual Payment Received (Rs)</label>
               <input type="number" id="actualCashInput" class="session-dropdown" value="0" style="font-weight:900; font-size:1.7rem; color:#047857; background:#ffffff; border:2px solid #10b981;" oninput="this.setAttribute('data-user-edited','true'); recalculateSmartFeeTotal();">
             </div>
-            <div style="font-size:0.78rem; color:#94a3b8; line-height:1.5;">
-              <div>- <strong>Existing Wallet Advance Credit:</strong> <span id="existingWalletText" style="color:#34d399; font-weight:bold;">Rs${getVerifiedStudentWalletBalance(student, currentSession)}</span></div>
-              <div>- <strong>Existing Partial Due Shortage:</strong> <span id="existingDueText" style="color:#f87171; font-weight:bold;">Rs${student.partialDue || 0}</span></div>
+            <div style="font-size:0.85rem; color:#0f172a !important; font-weight:700; line-height:1.5;">
+              <div>- <strong>Existing Wallet Advance Credit:</strong> <span id="existingWalletText" style="color:#047857; font-weight:bold;">Rs${getVerifiedStudentWalletBalance(student, currentSession)}</span></div>
+              <div>- <strong>Existing Partial Due Shortage:</strong> <span id="existingDueText" style="color:#b91c1c; font-weight:bold;">Rs${student.partialDue || 0}</span></div>
             </div>
           </div>
         </div>
@@ -12955,7 +18284,7 @@ function openCollectFeeModal(admissionNo) {
         ${prevDueMonths.length > 0 ? `
           <div style="background:rgba(245, 158, 11, 0.1); border:1px solid #f59e0b; border-radius:10px; padding:12px 16px; margin-bottom:16px;">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-              <span style="font-size:0.85rem; font-weight:700; color:#fbbf24;">
+              <span style="font-size:0.85rem; font-weight:700; color:#b45309;">
                 <i class="fa-solid fa-history"></i> Previous Session (${prevSession} - ${prevClassObj?.class || 'Class 4'} Rate: Rs${prevRate}/mo)
               </span>
               <span class="badge badge-warning" style="font-weight:bold;">Pending Dues</span>
@@ -12974,7 +18303,7 @@ function openCollectFeeModal(admissionNo) {
         <!-- CURRENT SESSION MONTHS (PAST DUES + CURRENT MONTH + FUTURE ADVANCE) -->
         <div style="background:#0f172a; border:1px solid #334155; border-radius:10px; padding:14px 16px; margin-bottom:16px;">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-            <span style="font-size:0.85rem; font-weight:700; color:#38bdf8;">
+            <span style="font-size:0.85rem; font-weight:700; color:#0284c7;">
               <i class="fa-solid fa-calendar-days"></i> Current Session (${currentSession} - ${currentClass} Rate: Rs${currentRate}/mo)
             </span>
             <div style="display:flex; gap:6px;">
@@ -12991,8 +18320,8 @@ function openCollectFeeModal(admissionNo) {
 
               if (isPaid) {
                 return `
-                  <div style="display:flex; align-items:center; gap:8px; background:rgba(16, 185, 129, 0.1); padding:6px 10px; border-radius:6px; border:1px solid #059669; font-size:0.78rem; color:#a7f3d0; opacity:0.7;">
-                    <i class="fa-solid fa-circle-check" style="color:#10b981;"></i>
+                  <div style="display:flex; align-items:center; gap:8px; background:#d1fae5; padding:6px 10px; border-radius:6px; border:1px solid #059669; font-size:0.78rem; color:#064e3b; font-weight:700;">
+                    <i class="fa-solid fa-circle-check" style="color:#059669;"></i>
                     <span><strong>${m}</strong> (Paid)</span>
                   </div>
                 `;
@@ -13001,7 +18330,7 @@ function openCollectFeeModal(admissionNo) {
               return `
                 <label style="display:flex; align-items:center; gap:8px; background:${isPastOrCurrent ? '#1e293b' : '#0f172a'}; padding:6px 10px; border-radius:6px; border:1px solid ${isChecked ? '#10b981' : '#475569'}; cursor:pointer; font-size:0.78rem;">
                   <input type="checkbox" class="fee-month-checkbox" data-session="${currentSession}" data-month="${m}" data-amount="${currentRate}" data-label="${m} (${currentSession})" ${isChecked ? 'checked' : ''} onchange="recalculateSmartFeeTotal()">
-                  <span><strong>${m}</strong> (Rs${currentRate}) ${!isPastOrCurrent ? '<small style="color:#fbbf24;">[Advance]</small>' : ''}</span>
+                  <span><strong>${m}</strong> (Rs${currentRate}) ${!isPastOrCurrent ? '<small style="color:#b45309;">[Advance]</small>' : ''}</span>
                 </label>
               `;
             }).join('')}
@@ -13010,32 +18339,31 @@ function openCollectFeeModal(admissionNo) {
 
         <!-- ITEMIZED EXTRA CHARGES (CLASS-ENABLED OPTIONAL FEES ONLY) -->
         <div style="background:#0f172a; border:1px solid #c084fc; border-radius:10px; padding:12px 16px; margin-bottom:16px;">
-          <div style="font-size:0.85rem; font-weight:700; color:#c084fc; margin-bottom:8px;">
+          <div style="font-size:0.85rem; font-weight:700; color:#6d28d9; margin-bottom:8px;">
             <i class="fa-solid fa-list-check"></i> Itemized Annual & Exam Extra Charges (${currentClass})
           </div>
           <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:8px;">
             ${(() => {
               const master = getStudentFeeMaster(student);
-              const annualPaid = !categoryStatus.annualDue;
-              const examPaid = !categoryStatus.examDue;
-              const computerPaid = !categoryStatus.computerDue;
+              const annualNotDue = master.annualEnabled && master.annualCharges > 0 && categoryStatus.annualChargeTotal === 0;
+              const examNotDue = master.examEnabled && master.examFee > 0 && categoryStatus.examChargeTotal === 0;
+              const annualPaid = !annualNotDue && categoryStatus.annualDue === 0;
+              const examPaid = !examNotDue && categoryStatus.examDue === 0;
+              const annualDisabled = annualNotDue || annualPaid;
+              const examDisabled = examNotDue || examPaid;
+              const annualStatus = annualNotDue ? 'Not due yet' : (annualPaid ? 'Paid' : `Due Rs ${categoryStatus.annualDue}`);
+              const examStatus = examNotDue ? 'Not due yet' : (examPaid ? 'Paid' : `Due Rs ${categoryStatus.examDue}`);
               return `
                 ${master.annualEnabled && master.annualCharges > 0 ? `
-                  <label style="display:flex; align-items:center; gap:8px; background:${annualPaid ? 'rgba(16,185,129,0.1)' : '#1e293b'}; padding:6px 10px; border-radius:6px; border:1px solid ${annualPaid ? '#10b981' : '#475569'}; cursor:${annualPaid ? 'not-allowed' : 'pointer'}; font-size:0.78rem; opacity:${annualPaid ? '0.65' : '1'};">
-                    <input type="checkbox" id="chk_annualFee" class="fee-extra-checkbox" data-label="Annual Charges" data-amount="${master.annualCharges}" ${annualPaid ? 'disabled data-paid="true"' : ''} onchange="this.setAttribute('data-user-edited','true'); recalculateSmartFeeTotal()">
-                    <span>Annual Charges (Rs ${master.annualCharges}) ${annualPaid ? '<small style="color:#34d399;">Paid</small>' : ''}</span>
+                  <label style="display:flex; align-items:center; gap:8px; background:${annualDisabled ? '#d1fae5' : '#1e293b'}; padding:6px 10px; border-radius:6px; border:1px solid ${annualDisabled ? '#059669' : '#475569'}; cursor:${annualDisabled ? 'not-allowed' : 'pointer'}; font-size:0.78rem; color:${annualDisabled ? '#064e3b' : 'inherit'}; font-weight:${annualDisabled ? '700' : 'normal'};">
+                    <input type="checkbox" id="chk_annualFee" class="fee-extra-checkbox" data-label="Annual Charges" data-amount="${categoryStatus.annualDue || master.annualCharges}" ${annualDisabled ? 'disabled' : ''} onchange="this.setAttribute('data-user-edited','true'); recalculateSmartFeeTotal()">
+                    <span>Annual Charges (Rs ${master.annualCharges}) <small style="color:${annualNotDue ? '#0369a1' : '#059669'}; font-weight:800;">${annualStatus}</small></span>
                   </label>
                 ` : ''}
                 ${master.examEnabled && master.examFee > 0 ? `
-                  <label style="display:flex; align-items:center; gap:8px; background:${examPaid ? 'rgba(16,185,129,0.1)' : '#1e293b'}; padding:6px 10px; border-radius:6px; border:1px solid ${examPaid ? '#10b981' : '#475569'}; cursor:${examPaid ? 'not-allowed' : 'pointer'}; font-size:0.78rem; opacity:${examPaid ? '0.65' : '1'};">
-                    <input type="checkbox" id="chk_examFee" class="fee-extra-checkbox" data-label="Exam Fee" data-amount="${master.examFee}" ${examPaid ? 'disabled data-paid="true"' : ''} onchange="this.setAttribute('data-user-edited','true'); recalculateSmartFeeTotal()">
-                    <span>Exam Fee (Rs ${master.examFee}) ${examPaid ? '<small style="color:#34d399;">Paid</small>' : ''}</span>
-                  </label>
-                ` : ''}
-                ${master.computerEnabled && master.computerFee > 0 ? `
-                  <label style="display:flex; align-items:center; gap:8px; background:${computerPaid ? 'rgba(16,185,129,0.1)' : '#1e293b'}; padding:6px 10px; border-radius:6px; border:1px solid ${computerPaid ? '#10b981' : '#475569'}; cursor:${computerPaid ? 'not-allowed' : 'pointer'}; font-size:0.78rem; opacity:${computerPaid ? '0.65' : '1'};">
-                    <input type="checkbox" id="chk_computerFee" class="fee-extra-checkbox" data-label="Computer Lab Fee" data-amount="${master.computerFee}" ${computerPaid ? 'disabled data-paid="true"' : ''} onchange="recalculateSmartFeeTotal()">
-                    <span>Computer Lab Fee (Rs ${master.computerFee}) ${computerPaid ? '<small style="color:#34d399;">Paid</small>' : ''}</span>
+                  <label style="display:flex; align-items:center; gap:8px; background:${examDisabled ? '#d1fae5' : '#1e293b'}; padding:6px 10px; border-radius:6px; border:1px solid ${examDisabled ? '#059669' : '#475569'}; cursor:${examDisabled ? 'not-allowed' : 'pointer'}; font-size:0.78rem; color:${examDisabled ? '#064e3b' : 'inherit'}; font-weight:${examDisabled ? '700' : 'normal'};">
+                    <input type="checkbox" id="chk_examFee" class="fee-extra-checkbox" data-label="Exam Fee" data-amount="${categoryStatus.examDue || master.examFee}" ${examDisabled ? 'disabled' : ''} onchange="this.setAttribute('data-user-edited','true'); recalculateSmartFeeTotal()">
+                    <span>Exam Fee (Rs ${master.examFee} each term) <small style="color:${examNotDue ? '#0369a1' : '#059669'}; font-weight:800;">${examStatus}</small></span>
                   </label>
                 ` : ''}
               `;
@@ -13046,8 +18374,8 @@ function openCollectFeeModal(admissionNo) {
         <!-- DYNAMIC SUMMARY BREAKDOWN -->
         <div style="background:linear-gradient(135deg, #0f172a 0%, #1e293b 100%); border:1px solid #10b981; border-radius:10px; padding:12px 16px; margin-bottom:18px; display:flex; justify-content:space-between; align-items:center;">
           <div>
-            <div id="feeBreakdownText" style="font-size:0.78rem; color:#cbd5e1; font-weight:600;">Calculating selected months...</div>
-            <div style="font-size:0.72rem; color:#94a3b8; margin-top:2px;">Adjust payment amount above to handle excess cash or partial dues.</div>
+            <div id="feeBreakdownText" style="font-size:0.78rem; color:#0f172a; font-weight:800;">Calculating selected months...</div>
+            <div style="font-size:0.72rem; color:#1e293b; margin-top:2px; font-weight:700;">Adjust payment amount above to handle excess cash or partial dues.</div>
           </div>
           <div style="text-align:right;">
             <div style="font-size:0.75rem; color:#34d399; font-weight:700;">TOTAL PAYABLE</div>
@@ -13058,7 +18386,7 @@ function openCollectFeeModal(admissionNo) {
         <!-- PAYMENT MODE & CONFIRM BUTTON -->
         <div style="display:flex; justify-content:space-between; align-items:center;">
           <div style="display:flex; align-items:center; gap:10px;">
-            <label style="font-size:0.8rem; font-weight:600; color:#cbd5e1;">Payment Mode:</label>
+            <label style="font-size:0.8rem; font-weight:600; color:#374151;">Payment Mode:</label>
             <select id="feePaymentModeSelect" class="session-dropdown" style="width:150px; padding:6px 10px; background:#0f172a; color:#fff; border-color:#334155;">
               <option value="Cash" selected>Cash</option>
               <option value="UPI / GPay">UPI / GPay</option>
@@ -13106,17 +18434,20 @@ function recalculateSmartFeeTotal() {
     }
   });
 
-  // AUTO-TICK EXAM FEE WHEN AUGUST OR FEBRUARY IS SELECTED
+  // Auto-tick extras only in their configured target months.
   const chkExam = document.getElementById('chk_examFee');
   const chkAnnual = document.getElementById('chk_annualFee');
+  const feeRules = getFeeSettingsForSession(SchoolData.activeSession).feeScheduleRules;
+  const examTargetMonths = feeRules.examFee?.targetMonths || ['August', 'February'];
+  const annualTargetMonths = feeRules.annualCharges?.targetMonths || ['April'];
 
-  if (currentSessionMonths.includes("August") || currentSessionMonths.includes("February")) {
+  if (currentSessionMonths.some(month => examTargetMonths.includes(month))) {
     if (chkExam && !chkExam.disabled && !chkExam.hasAttribute('data-user-edited')) {
       chkExam.checked = true;
     }
   }
 
-  if (currentSessionMonths.includes("April")) {
+  if (currentSessionMonths.some(month => annualTargetMonths.includes(month))) {
     if (chkAnnual && !chkAnnual.disabled && !chkAnnual.hasAttribute('data-user-edited')) {
       chkAnnual.checked = true;
     }
@@ -13163,11 +18494,11 @@ function recalculateSmartFeeTotal() {
 
   if (walletBadge) {
     if (diff > 0) {
-      walletBadge.innerHTML = `<span style="color:#34d399; background:rgba(16,185,129,0.15); padding:4px 10px; border-radius:12px; border:1px solid #10b981;">+Rs${diff} Excess Cash  Saved to Wallet for Next Month!</span>`;
+      walletBadge.innerHTML = `<span style="color:#064e3b; background:#d1fae5; padding:4px 10px; border-radius:12px; border:1px solid #059669; font-weight:700;">+Rs${diff} Excess Cash  Saved to Wallet for Next Month!</span>`;
     } else if (diff < 0) {
-      walletBadge.innerHTML = `<span style="color:#f87171; background:rgba(239,68,68,0.15); padding:4px 10px; border-radius:12px; border:1px solid #ef4444;">-Rs${Math.abs(diff)} Shortage  Carried Forward as Partial Due!</span>`;
+      walletBadge.innerHTML = `<span style="color:#7f1d1d; background:#fee2e2; padding:4px 10px; border-radius:12px; border:1px solid #b91c1c; font-weight:700;">-Rs${Math.abs(diff)} Shortage  Carried Forward as Partial Due!</span>`;
     } else {
-      walletBadge.innerHTML = `<span style="color:#60a5fa; background:rgba(59,130,246,0.15); padding:4px 10px; border-radius:12px; border:1px solid #3b82f6;">Exact Payment Matched</span>`;
+      walletBadge.innerHTML = `<span style="color:#1e3a5f; background:#dbeafe; padding:4px 10px; border-radius:12px; border:1px solid #1e3a5f; font-weight:700;">Exact Payment Matched</span>`;
     }
   }
 }
@@ -13182,7 +18513,7 @@ function selectFeeMonthsGroup(type) {
       if (session === "2025-26") {
         cb.checked = true;
       } else {
-        cb.checked = (idx <= 4);
+        cb.checked = (idx <= getActiveSessionMonthIndex(SchoolData.activeSession));
       }
     }
   });
@@ -13191,7 +18522,7 @@ function selectFeeMonthsGroup(type) {
   recalculateSmartFeeTotal();
 }
 
-function confirmSmartFeePayment(admissionNo, receiptNo) {
+async function confirmSmartFeePayment(admissionNo, receiptNo) {
   const student = SchoolData.students.find(s => s.admissionNo === admissionNo);
   if (!student) return;
   const beforeFeeSnapshot = JSON.parse(JSON.stringify({
@@ -13243,9 +18574,6 @@ function confirmSmartFeePayment(admissionNo, receiptNo) {
   if (categoryStatus.examDue > 0 && !Array.from(extraCheckboxes).some(cb => cb.checked && (cb.getAttribute('data-label') || '').toLowerCase().includes('exam'))) {
     missingRequiredExtras.push(`Exam Fee Rs ${categoryStatus.examDue}`);
   }
-  if (categoryStatus.computerDue > 0 && !Array.from(extraCheckboxes).some(cb => cb.checked && (cb.getAttribute('data-label') || '').toLowerCase().includes('computer'))) {
-    missingRequiredExtras.push(`Computer Fee Rs ${categoryStatus.computerDue}`);
-  }
   if (categoryStatus.annualDue > 0 && !Array.from(extraCheckboxes).some(cb => cb.checked && (cb.getAttribute('data-label') || '').toLowerCase().includes('annual'))) {
     missingRequiredExtras.push(`Annual Charges Rs ${categoryStatus.annualDue}`);
   }
@@ -13254,7 +18582,7 @@ function confirmSmartFeePayment(admissionNo, receiptNo) {
     const modal = document.getElementById('collectFeeModal');
     const warningId = 'feeMissingExtrasInlineWarning';
     const warningHtml = `
-      <div id="${warningId}" style="margin:10px 0; padding:10px 12px; border-radius:10px; background:rgba(245,158,11,0.14); border:1px solid #f59e0b; color:#fbbf24; font-size:0.82rem; font-weight:800;">
+      <div id="${warningId}" style="margin:10px 0; padding:10px 12px; border-radius:10px; background:rgba(245,158,11,0.14); border:1px solid #f59e0b; color:#b45309; font-size:0.82rem; font-weight:800;">
         Pending optional/extra fee not collected now: ${missingRequiredExtras.join(', ')}.
       </div>
     `;
@@ -13276,6 +18604,15 @@ function confirmSmartFeePayment(admissionNo, receiptNo) {
   if (actualReceived === 0 && totalItemizedBill > 0) {
     showNotification(`Warning: Please enter the payment amount received!`, 'warning');
     return;
+  }
+
+  const feeModal = document.getElementById('collectFeeModal');
+  if (feeModal?.getAttribute('data-fee-saving') === '1') return;
+  feeModal?.setAttribute('data-fee-saving', '1');
+  const confirmButton = feeModal?.querySelector('button[onclick^="confirmSmartFeePayment"]');
+  if (confirmButton) {
+    confirmButton.disabled = true;
+    confirmButton.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Confirming in Cloud...';
   }
 
   const diff = actualReceived - netRequired;
@@ -13336,11 +18673,18 @@ function confirmSmartFeePayment(admissionNo, receiptNo) {
   if (paidCurrentMonths.length > 0) descriptionParts.push(`Session ${currentSession}: ${paidCurrentMonths.map(p => p.month).join(', ')}`);
   if (paidExtraItems.length > 0) descriptionParts.push(paidExtraItems.map(e => `${e.label} (Rs${e.amount})`).join(', '));
 
-  student.feeRecords[currentSession].payments.push({
+  const curUser = (typeof getCurrentActiveUser === 'function' && getCurrentActiveUser()) || { name: 'Daya Chauhan', role: 'Accountant', username: 'daya' };
+  const nowStamp = new Date();
+  const timeFormatted = nowStamp.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
+
+  const pendingPayment = {
     receiptNo: receiptNo,
-    date: new Date().toISOString().split('T')[0],
-    time: getNowReceiptTime(),
-    paidAt: new Date().toISOString(),
+    date: nowStamp.toISOString().split('T')[0],
+    time: timeFormatted,
+    paidAt: nowStamp.toISOString(),
+    collectedBy: curUser.name || curUser.username || 'Daya Chauhan',
+    collectedByRole: curUser.role || 'Accountant',
+    collectedByUsername: curUser.username || 'daya',
     amount: actualReceived,
     selectedMonthsTotal: selectedMonthsTotal,
     extraChargesTotal: extraChargesTotal,
@@ -13354,32 +18698,49 @@ function confirmSmartFeePayment(admissionNo, receiptNo) {
     mode: mode,
     studentName: student.name,
     admissionNo: student.admissionNo
-  });
+  };
+  student.feeRecords[currentSession].payments.push(pendingPayment);
 
   normalizeFeeRecordFromReceipts(student, currentSession);
-  if (!saveSchoolDataToStorage()) {
+  let confirmedReceiptNo = receiptNo;
+  try {
+    const mutationId = document.getElementById('collectFeeModal')?.getAttribute('data-fee-mutation-id') || createErpMutationId();
+    const result = await callErpSecurityApi('saveFeePayment', {
+      body: {
+        mutationId,
+        admissionNo: student.admissionNo,
+        sessionName: currentSession,
+        previousSessionName: prevSession,
+        payment: pendingPayment
+      }
+    });
+    confirmedReceiptNo = result.receiptNo || pendingPayment.receiptNo;
+    Object.assign(pendingPayment, result.payment || {}, { receiptNo: confirmedReceiptNo });
+    if (result?.savedAt && typeof window.recordCloudMutationRevision === 'function') {
+      window.recordCloudMutationRevision(result.savedAt);
+    }
+  } catch (error) {
     student.feeRecords = beforeFeeSnapshot.feeRecords;
     student.currentFeeInfo = beforeFeeSnapshot.currentFeeInfo;
     student.walletBalance = beforeFeeSnapshot.walletBalance;
     student.partialDue = beforeFeeSnapshot.partialDue;
-    showNotification(`Fee receipt #${receiptNo} was not saved. Payment was not finalized.`, 'error');
+    feeModal?.removeAttribute('data-fee-saving');
+    if (confirmButton) {
+      confirmButton.disabled = false;
+      confirmButton.innerHTML = '<i class="fa-solid fa-check-circle"></i> Confirm & Generate Receipt';
+    }
+    showNotification(`Fee receipt #${receiptNo} was not finalized because cloud did not confirm it.`, 'error');
     return;
-  }
-
-  // Push immediately so PC1 / PC2 / laptop see this slip within seconds
-  if (typeof flushCloudPushNow === 'function') flushCloudPushNow();
-  else if (typeof pushSchoolDataToCloud === 'function') {
-    pushSchoolDataToCloud().catch((err) => console.warn('Fee cloud sync failed:', err));
   }
 
   const modal = document.getElementById('collectFeeModal');
   if (modal) modal.remove();
 
-  showNotification(`Fee Payment Rs ${actualReceived.toLocaleString('en-IN')} Received! Receipt #${receiptNo} created.`, 'success');
-  triggerSingleFeeReminder(admissionNo, `Fee Payment Received Rs ${actualReceived} for ${student.name}. Receipt #${receiptNo}`);
+  showNotification(`Cloud confirmed: Fee Payment Rs ${actualReceived.toLocaleString('en-IN')} Received! Receipt #${confirmedReceiptNo} created.`, 'success');
+  triggerSingleFeeReminder(admissionNo, `Fee Payment Received Rs ${actualReceived} for ${student.name}. Receipt #${confirmedReceiptNo}`);
 
   renderFeesPage(document.getElementById('contentBody'));
-  viewFeeReceiptModal(admissionNo, receiptNo);
+  viewFeeReceiptModal(admissionNo, confirmedReceiptNo);
 }
 
 function loadThermalCanvasImage(src) {
@@ -13486,7 +18847,7 @@ async function createThermalReceiptRasterDataUrl(receipt) {
 
     let y = 10;
     if (logoImg) {
-      const logoSize = width >= 500 ? 180 : 140;
+      const logoSize = width >= 500 ? 168 : 128;
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = 'high';
       ctx.drawImage(logoImg, (width - logoSize) / 2, y, logoSize, logoSize);
@@ -13500,7 +18861,7 @@ async function createThermalReceiptRasterDataUrl(receipt) {
     ctx.fillText('JUNIOR HIGH SCHOOL', width / 2, y);
     y += 30;
     ctx.font = '18px Arial, sans-serif';
-    y = drawThermalWrappedText(ctx, `${receipt.address} - Session ${receipt.session}`, margin, y, contentWidth, 21);
+    y = drawThermalWrappedText(ctx, `${receipt.address} - Session ${receipt.session}`, width / 2, y, contentWidth, 21);
     y += 8;
 
     const divider = (strong = false) => {
@@ -13523,9 +18884,14 @@ async function createThermalReceiptRasterDataUrl(receipt) {
     const field = (label, value) => {
       ctx.textAlign = 'left';
       ctx.font = '700 20px Arial, sans-serif';
-      ctx.fillText(`${label}:`, margin, y);
+      const labelText = `${label}:`;
+      ctx.fillText(labelText, margin, y);
+      const valueX = Math.min(
+        margin + Math.max(140, Math.ceil(ctx.measureText(labelText).width) + 12),
+        width - margin - 90
+      );
       ctx.font = '20px Arial, sans-serif';
-      y = drawThermalWrappedText(ctx, value, margin + 140, y, contentWidth - 140, 23);
+      y = drawThermalWrappedText(ctx, value, valueX, y, width - margin - valueX, 23);
       y += 4;
     };
 
@@ -13533,6 +18899,7 @@ async function createThermalReceiptRasterDataUrl(receipt) {
     field('DATE', receipt.date);
     field('TIME', receipt.time);
     field('MODE', receipt.mode);
+    field('COLLECTED BY', receipt.collectedBy || 'Not recorded');
     divider(false);
     field('ADM NO', receipt.admissionNo);
     field('STUDENT', receipt.studentName);
@@ -13541,21 +18908,67 @@ async function createThermalReceiptRasterDataUrl(receipt) {
     divider(false);
 
     if (settings.printParticulars !== false) {
-      ctx.font = '700 20px Arial, sans-serif';
-      ctx.fillText('PARTICULARS PAID:', margin, y);
-      y += 26;
-      ctx.font = '20px Arial, sans-serif';
-      y = drawThermalWrappedText(ctx, receipt.particulars, margin + 8, y, contentWidth - 8, 23);
-      y += 8;
+      const currentMonths = Array.isArray(receipt.paidCurrentMonths) ? receipt.paidCurrentMonths : [];
+      const previousMonths = Array.isArray(receipt.paidPrevMonths) ? receipt.paidPrevMonths : [];
+      const extraItems = Array.isArray(receipt.paidExtraItems) ? receipt.paidExtraItems : [];
+      const feeItems = [];
+
+      previousMonths.forEach(item => feeItems.push({
+        label: `${item.month || item.label || 'Tuition'} Tuition Fee${receipt.prevSession ? ` (${receipt.prevSession})` : ''}`.replace(/Tuition\s+Tuition Fee/i, 'Tuition Fee'),
+        amount: Number(item.amount || 0),
+        session: receipt.prevSession
+      }));
+      currentMonths.forEach(item => feeItems.push({
+        label: `${item.month || item.label || 'Tuition'} Tuition Fee`.replace(/Tuition\s+Tuition Fee/i, 'Tuition Fee'),
+        amount: Number(item.amount || 0),
+        session: receipt.session
+      }));
+      extraItems.forEach(item => feeItems.push({
+        label: item.label || item.month || 'Extra Fee',
+        amount: Number(item.amount || 0),
+        session: ''
+      }));
+
+      ctx.textAlign = 'left';
+      ctx.font = '700 19px Arial, sans-serif';
+      ctx.fillText('FEE PARTICULARS', margin, y);
+      ctx.textAlign = 'right';
+      ctx.fillText('AMOUNT (Rs)', width - margin, y);
+      y += 27;
+      divider(false);
+
+      const drawFeeItemRow = (label, amount) => {
+        const amountText = Number(amount || 0).toLocaleString('en-IN');
+        ctx.font = '700 20px Arial, sans-serif';
+        const amountWidth = ctx.measureText(amountText).width;
+        const labelWidth = Math.max(100, contentWidth - amountWidth - 18);
+        const rowY = y;
+        ctx.textAlign = 'left';
+        ctx.font = '20px Arial, sans-serif';
+        const labelBottom = drawThermalWrappedText(ctx, label, margin, rowY, labelWidth, 23);
+        ctx.textAlign = 'right';
+        ctx.font = '700 20px Arial, sans-serif';
+        ctx.fillText(amountText, width - margin, rowY);
+        y = Math.max(labelBottom, rowY + 23) + 5;
+      };
+
+      if (feeItems.length > 0) {
+        feeItems.forEach(item => {
+          drawFeeItemRow(item.label, item.amount);
+        });
+      } else {
+        drawFeeItemRow(receipt.particulars || 'Tuition Fee', Number(String(receipt.amount || '0').replace(/,/g, '')));
+      }
+      y += 3;
     }
 
     divider(true);
     ctx.textAlign = 'left';
     ctx.font = '700 26px Arial, sans-serif';
-    ctx.fillText('TOTAL PAID:', margin, y);
+    ctx.fillText('TOTAL', margin, y);
     ctx.textAlign = 'right';
-    ctx.fillText(`Rs. ${receipt.amount}`, width - margin, y);
-    y += 34;
+    ctx.fillText(receipt.amount, width - margin, y);
+    y += 35;
     divider(true);
 
     if (qrImg) {
@@ -13612,23 +19025,15 @@ async function createThermalReceiptRasterDataUrl(receipt) {
     const cropped = document.createElement('canvas');
     cropped.width = width;
     cropped.height = Math.min(Math.max(y, 520), canvas.height);
-    const croppedCtx = cropped.getContext('2d', { willReadFrequently: true });
+    const croppedCtx = cropped.getContext('2d');
     croppedCtx.fillStyle = '#ffffff';
     croppedCtx.fillRect(0, 0, cropped.width, cropped.height);
+    croppedCtx.imageSmoothingEnabled = true;
+    croppedCtx.imageSmoothingQuality = 'high';
     croppedCtx.drawImage(canvas, 0, 0);
-
-    // Send the Windows thermal driver a strict one-bit-style bitmap. This
-    // avoids faint antialiasing and driver-dependent background rendering.
-    const receiptPixels = croppedCtx.getImageData(0, 0, cropped.width, cropped.height);
-    for (let i = 0; i < receiptPixels.data.length; i += 4) {
-      const luminance = (receiptPixels.data[i] * 0.299) + (receiptPixels.data[i + 1] * 0.587) + (receiptPixels.data[i + 2] * 0.114);
-      const value = luminance < 205 ? 0 : 255;
-      receiptPixels.data[i] = value;
-      receiptPixels.data[i + 1] = value;
-      receiptPixels.data[i + 2] = value;
-      receiptPixels.data[i + 3] = 255;
-    }
-    croppedCtx.putImageData(receiptPixels, 0, 0);
+    // Keep the original colour emblem for standard-driver printing. Text is
+    // drawn directly in solid black for crisp output; USB thermal hardware is
+    // converted to monochrome later by createThermalEscPosRasterChunks().
     return cropped.toDataURL('image/png');
   } catch (error) {
     console.warn('Thermal raster receipt failed; falling back to HTML print.', error);
@@ -13663,32 +19068,12 @@ function buildThermalTextReceipt(receipt) {
     return lines;
   };
   const field = (label, value) => `${label.padEnd(10, ' ')}: ${String(value || '')}`;
-  const amountLine = (label, amount) => {
-    const left = String(label || '').trim();
-    const right = `Rs${String(amount || '').trim()}`;
-    const gap = Math.max(1, width - left.length - right.length);
-    return `${left}${' '.repeat(gap)}${right}`;
-  };
   const money = value => `Rs${Number(value || 0).toLocaleString('en-IN')}`;
   const itemLine = (label, amount) => {
     const amountText = money(amount);
-    const labelWidth = Math.max(12, width - amountText.length - 1);
-    const labelLines = wrap(label).flatMap(row => {
-      if (row.length <= labelWidth) return [row];
-      const chunks = [];
-      let current = row;
-      while (current.length > labelWidth) {
-        chunks.push(current.slice(0, labelWidth).trim());
-        current = current.slice(labelWidth).trim();
-      }
-      if (current) chunks.push(current);
-      return chunks;
-    });
-    if (labelLines.length === 0) return [amountText.padStart(width, ' ')];
-    return labelLines.map((row, index) => {
-      if (index === 0) return row.padEnd(width - amountText.length, ' ') + amountText;
-      return row;
-    });
+    const labelWidth = Math.max(1, width - amountText.length - 1);
+    const labelText = String(label || '').trim().slice(0, labelWidth);
+    return [`${labelText.padEnd(width - amountText.length, ' ')}${amountText}`];
   };
   const particulars = String(receipt.particulars || 'Tuition Fee')
     .replace(/\s*\|\s*/g, ', ')
@@ -13703,10 +19088,11 @@ function buildThermalTextReceipt(receipt) {
     if (!months.length) return;
     feeRows.push(center(`Session ${sessionLabel}`));
     months.forEach(item => {
-      feeRows.push(...itemLine(item.month, item.amount));
+      const tuitionLabel = /tuition\s*fee/i.test(String(item.month || ''))
+        ? String(item.month)
+        : `${item.month || 'Tuition'} Tuition Fee`;
+      feeRows.push(...itemLine(tuitionLabel, item.amount));
     });
-    const tuitionTotal = months.reduce((sum, item) => sum + Number(item.amount || 0), 0);
-    feeRows.push(amountLine('Tuition Total', tuitionTotal.toLocaleString('en-IN')));
   };
 
   addMonthSection(receipt.prevSession, prevMonths);
@@ -13715,14 +19101,7 @@ function buildThermalTextReceipt(receipt) {
     feeRows.push(...itemLine(item.label || 'Extra Fee', item.amount));
   });
   if (feeRows.length === 0) {
-    feeRows.push(...wrap(particulars).map((row, index) => {
-      if (index === 0) {
-        const amount = `Rs${receipt.amount}`;
-        const space = Math.max(1, width - row.length - amount.length);
-        return `${row}${' '.repeat(space)}${amount}`;
-      }
-      return row;
-    }));
+    feeRows.push(...wrap(particulars), `Amount: Rs${receipt.amount}`);
   }
 
   const lines = [
@@ -13737,18 +19116,18 @@ function buildThermalTextReceipt(receipt) {
     field('Date', receipt.date),
     field('Time', receipt.time),
     field('Mode', receipt.mode),
+    field('Collected', receipt.collectedBy || 'Not recorded'),
     line,
     field('Adm No', receipt.admissionNo),
     field('Student', receipt.studentName),
     field('Class', receipt.className),
     field('Father', receipt.fatherName),
     line,
-    'PARTICULARS'.padEnd(22, ' ') + 'AMOUNT',
-    ''.padEnd(27, ' ') + '(Rs)',
+    'FEE PARTICULARS / AMOUNT',
     heavyLine,
     ...feeRows,
     heavyLine,
-    amountLine('TOTAL PAID:', receipt.amount),
+    `${'TOTAL'.padEnd(Math.max(1, width - String(receipt.amount).length - 2), ' ')}Rs${receipt.amount}`,
     heavyLine,
     center('Thank You!'),
     center('Computer Generated Receipt'),
@@ -13808,6 +19187,12 @@ async function createThermalEscPosRasterChunks(receiptDataUrl) {
   const widthBytes = Math.ceil(rasterWidth / 8);
   const rowBlockSize = 128;
   const chunks = [];
+  const bayer4 = [
+    0, 8, 2, 10,
+    12, 4, 14, 6,
+    3, 11, 1, 9,
+    15, 7, 13, 5
+  ];
 
   for (let startRow = 0; startRow < rasterHeight; startRow += rowBlockSize) {
     const rows = Math.min(rowBlockSize, rasterHeight - startRow);
@@ -13830,7 +19215,16 @@ async function createThermalEscPosRasterChunks(receiptDataUrl) {
           const luminance = (pixels[pixelIndex] * 0.299) +
             (pixels[pixelIndex + 1] * 0.587) +
             (pixels[pixelIndex + 2] * 0.114);
-          if (pixels[pixelIndex + 3] > 20 && luminance < 205) {
+          const red = pixels[pixelIndex];
+          const green = pixels[pixelIndex + 1];
+          const blue = pixels[pixelIndex + 2];
+          const chroma = Math.max(red, green, blue) - Math.min(red, green, blue);
+          // Solid black text stays sharp. Saturated colour-emblem pixels use
+          // ordered dithering so a monochrome ESC/POS head retains crest detail.
+          const threshold = chroma > 14
+            ? 158 + (bayer4[((sourceRow & 3) * 4) + (x & 3)] * 6)
+            : 205;
+          if (pixels[pixelIndex + 3] > 20 && luminance < threshold) {
             outputByte |= (0x80 >> bit);
           }
         }
@@ -14132,6 +19526,21 @@ async function printThermalReceipt(admissionNo, receiptNo, studentIndex) {
   const thermalReceiptLogoSrc = await loadImageDataUrlForPdf(thermalReceiptLogoUrl) || thermalReceiptLogoUrl;
   const thermalReceiptQrUrl = getSchoolPaymentQrSource(payment.receiptNo);
   const thermalReceiptQrSrc = await loadImageDataUrlForPdf(thermalReceiptQrUrl) || thermalReceiptQrUrl;
+  const paidAmount = Number(payment.amount || 0);
+  const previousSessionMatch = String(currentSession || '').match(/^(\d{4})-(\d{2,4})$/);
+  const previousSession = previousSessionMatch
+    ? `${Number(previousSessionMatch[1]) - 1}-${String(Number(previousSessionMatch[1]) % 100).padStart(2, '0')}`
+    : '';
+  const collectorName = payment.collectedBy || payment.collectedByUsername || payment.savedBy || payment.enteredBy || 'Not recorded';
+  const thermalReceiptData = {
+    paidCurrentMonths: Array.isArray(payment.paidCurrentMonths) ? payment.paidCurrentMonths : [],
+    paidPrevMonths: Array.isArray(payment.paidPrevMonths) ? payment.paidPrevMonths : [],
+    paidExtraItems: Array.isArray(payment.paidExtraItems) ? payment.paidExtraItems : [],
+    prevSession: previousSession,
+    collectedBy: collectorName,
+    collectedByRole: payment.collectedByRole || '',
+    amountNumber: paidAmount
+  };
   const thermalRasterReceiptSrc = await createThermalReceiptRasterDataUrl({
     logoSrc: thermalReceiptLogoSrc,
     qrSrc: thermalReceiptQrSrc,
@@ -14144,9 +19553,10 @@ async function printThermalReceipt(admissionNo, receiptNo, studentIndex) {
     className: `${cls} - ${sec}`,
     fatherName: student.parentName,
     particulars: payment.month || 'Tuition Fee',
-    amount: payment.amount.toLocaleString('en-IN'),
+    amount: paidAmount.toLocaleString('en-IN'),
     address: getSchoolProfile().address,
-    session: currentSession
+    session: currentSession,
+    ...thermalReceiptData
   });
 
   if (thermalRasterReceiptSrc) {
@@ -14173,7 +19583,7 @@ async function printThermalReceipt(admissionNo, receiptNo, studentIndex) {
           }
           * { box-sizing: border-box; }
           body {
-            font-family: 'Courier New', Courier, monospace, sans-serif;
+            font-family: Arial, Helvetica, sans-serif;
             width: 48mm;
             margin: 0;
             padding: 2mm 1.5mm 4mm;
@@ -14195,10 +19605,12 @@ async function printThermalReceipt(admissionNo, receiptNo, studentIndex) {
             width: 96px;
             height: 96px;
             object-fit: contain;
-            filter: grayscale(1) contrast(1.45);
             -webkit-print-color-adjust: exact !important;
             print-color-adjust: exact !important;
           }
+          .fee-item { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; padding:3px 0 5px; text-align:left; }
+          .fee-item-name { font-weight:400; font-size:10.5px; line-height:1.25; }
+          .fee-item-amount { flex:0 0 auto; margin-top:1px; font-weight:800; font-size:10.5px; line-height:1.25; text-align:right; white-space:nowrap; }
           .thermal-qr {
             width: 44mm;
             height: 44mm;
@@ -14237,6 +19649,7 @@ async function printThermalReceipt(admissionNo, receiptNo, studentIndex) {
         <div><strong>DATE:</strong> ${formatReceiptDateDisplay(payment.date)}</div>
         <div><strong>TIME:</strong> ${formatReceiptTimeDisplay(payment)}</div>
         <div><strong>MODE:</strong> ${payment.mode || 'Cash'}</div>
+        <div><strong>COLLECTED BY:</strong> ${escapeHtml(collectorName)}${thermalReceiptData.collectedByRole ? ` (${escapeHtml(thermalReceiptData.collectedByRole)})` : ''}</div>
         
         <div class="divider"></div>
         <div><strong>ADM NO:</strong> ${student.admissionNo}</div>
@@ -14245,25 +19658,27 @@ async function printThermalReceipt(admissionNo, receiptNo, studentIndex) {
         <div><strong>FATHER:</strong> ${student.parentName}</div>
 
         <div class="divider"></div>
-        <table>
-          <thead>
-            <tr style="border-bottom:1px solid #000;">
-              <th style="text-align:left;">PARTICULARS</th>
-              <th style="text-align:right;">AMOUNT (Rs)</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>${payment.month || 'Tuition Fee'}</td>
-              <td class="text-right bold">Rs${payment.amount.toLocaleString('en-IN')}</td>
-            </tr>
-          </tbody>
-        </table>
+        <div class="bold" style="display:flex; justify-content:space-between; gap:8px; font-size:10.5px;"><span>FEE PARTICULARS</span><span>AMOUNT (Rs)</span></div>
+        ${[
+          ...thermalReceiptData.paidPrevMonths.map(item => ({ ...item, month: `${item.month || 'Tuition'} Tuition Fee (${previousSession})`.replace(/Tuition\s+Tuition Fee/i, 'Tuition Fee') })),
+          ...thermalReceiptData.paidCurrentMonths.map(item => ({ ...item, month: `${item.month || 'Tuition'} Tuition Fee`.replace(/Tuition\s+Tuition Fee/i, 'Tuition Fee') })),
+          ...thermalReceiptData.paidExtraItems.map(item => ({ ...item, month: item.label || item.month, session: '' }))
+        ].map((item, index, allItems) => `
+          <div class="fee-item">
+            <div class="fee-item-name">${escapeHtml(item.month || item.label || 'Tuition Fee')}</div>
+            <div class="fee-item-amount">${Number(item.amount || 0).toLocaleString('en-IN')}</div>
+          </div>
+        `).join('') || `
+          <div class="fee-item">
+            <div class="fee-item-name">${escapeHtml(payment.month || 'Tuition Fee')}</div>
+            <div class="fee-item-amount">${paidAmount.toLocaleString('en-IN')}</div>
+          </div>
+        `}
 
         <div class="double-divider"></div>
-        <div style="display:flex; justify-content:space-between; font-size:13px;" class="bold">
-          <span>TOTAL PAID:</span>
-          <span>Rs${payment.amount.toLocaleString('en-IN')}</span>
+        <div style="display:flex; justify-content:space-between; gap:8px; font-size:13px;" class="bold">
+          <span>TOTAL</span>
+          <span>${paidAmount.toLocaleString('en-IN')}</span>
         </div>
         <div class="double-divider"></div>
 
@@ -14327,23 +19742,28 @@ function viewFeeReceiptModal(admissionNo, receiptNo, studentIndex) {
       mode: "Online UPI / Cash"
     };
   }
+  const receiptLogoSource = getSchoolReceiptLogoSource();
 
   const modalHtml = `
     <div class="modal-overlay active" id="feeReceiptModal" style="z-index:99999;">
       <div class="modal-box" style="max-width:680px; background:#ffffff; color:#0f172a; padding:0; border-radius:14px; box-shadow:0 25px 50px -12px rgba(0, 0, 0, 0.5); position:relative;">
         <button class="no-print" onclick="document.getElementById('feeReceiptModal').remove()" style="position:absolute; top:14px; right:16px; background:#e2e8f0; color:#0f172a; border:none; width:34px; height:34px; border-radius:50%; font-size:1.1rem; cursor:pointer; display:flex; align-items:center; justify-content:center; font-weight:bold; z-index:1000;" title="Close Receipt">X</button>
 
-        <div id="printableFeeReceiptArea" style="padding:24px; font-family:'Inter', sans-serif;">
+        <div id="printableFeeReceiptArea" style="padding:28px; font-family:'Inter', sans-serif; position:relative; overflow:hidden; border:3px solid #0f766e; border-radius:10px; box-shadow:inset 0 0 0 5px #ca8a04, inset 0 0 0 8px #ffffff; background:#ffffff;">
+          <div aria-hidden="true" style="position:absolute; left:50%; top:58%; transform:translate(-50%,-50%); width:250px; height:250px; opacity:0.045; pointer-events:none; z-index:0;">
+            <img src="${receiptLogoSource}" style="width:100%; height:100%; object-fit:contain; border-radius:50%; display:block;">
+          </div>
+          <div style="position:relative; z-index:1; padding:8px;">
           <!-- OFFICIAL SCHOOL HEADER -->
-          <div style="display:flex; align-items:center; justify-content:space-between; border-bottom:2px solid #0f172a; padding-bottom:12px; margin-bottom:16px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; border-bottom:3px solid #0f766e; padding-bottom:12px; margin-bottom:14px;">
             <div style="display:flex; align-items:center; gap:16px; min-width:0;">
-              <div style="width:78px; height:78px; flex:0 0 78px; display:flex; align-items:center; justify-content:center;">
-                ${getTransferCertificateLogoHtml(76)}
+              <div style="width:82px; height:82px; flex:0 0 82px; display:flex; align-items:center; justify-content:center;">
+                <img src="${receiptLogoSource}" alt="School emblem" style="width:80px; height:80px; object-fit:contain; border-radius:50%; display:block; background:#ffffff;">
               </div>
               <div>
-                <h2 style="font-family:'Playfair Display', serif; font-size:1.18rem; line-height:1.15; margin:0; color:#0f172a; text-transform:uppercase;">MADAN MOHAN MALVIYA JUNIOR HIGH SCHOOL</h2>
+                <h2 style="font-family:'Playfair Display', serif; font-size:1.22rem; line-height:1.15; margin:0; color:#0f766e; text-transform:uppercase;">MADAN MOHAN MALVIYA JUNIOR HIGH SCHOOL</h2>
                 <p style="margin:2px 0 0 0; font-size:0.75rem; color:#475569; font-weight:600;">${getSchoolProfile().address} - Session ${currentSession}</p>
-                <div style="margin-top:3px; font-size:0.75rem; color:#d97706; font-weight:800;">OFFICIAL FEE PAYMENT RECEIPT</div>
+                <div style="display:inline-block; margin-top:5px; padding:3px 10px; border-radius:999px; background:#fef3c7; color:#92400e; font-size:0.75rem; font-weight:900; letter-spacing:.35px;">OFFICIAL FEE PAYMENT RECEIPT</div>
               </div>
             </div>
             <div style="text-align:right; margin-right:40px;">
@@ -14352,14 +19772,14 @@ function viewFeeReceiptModal(admissionNo, receiptNo, studentIndex) {
           </div>
 
           <!-- RECEIPT NO & DATE META -->
-          <div style="display:flex; justify-content:space-between; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px 14px; margin-bottom:16px; font-size:0.8rem;">
-            <div><strong>Receipt No:</strong> <code style="color:#4f46e5; font-weight:800; font-size:0.9rem;">${payment.receiptNo}</code></div>
+          <div style="display:flex; justify-content:space-between; gap:10px; background:#ecfdf5; border:1px solid #99f6e4; border-top:3px solid #ca8a04; border-radius:8px; padding:10px 14px; margin-bottom:14px; font-size:0.8rem;">
+            <div><strong>Receipt No:</strong> <code style="color:#0f766e; font-weight:900; font-size:0.9rem;">${payment.receiptNo}</code></div>
             <div><strong>Payment Date:</strong> <span style="font-weight:700; color:#0f172a;">${formatReceiptDateDisplay(payment.date)}</span></div>
             <div><strong>Payment Mode:</strong> <span style="padding:2px 8px; background:#e0e7ff; color:#3730a3; border-radius:10px; font-weight:700;">${payment.mode || 'Cash'}</span></div>
           </div>
 
           <!-- STUDENT BIO BANNER -->
-          <div style="background:#ffffff; border:1px solid #cbd5e1; border-radius:8px; padding:12px 16px; margin-bottom:16px; font-size:0.82rem; line-height:1.6;">
+          <div style="background:rgba(248,250,252,.92); border:1px solid #94a3b8; border-left:5px solid #0f766e; border-radius:8px; padding:12px 16px; margin-bottom:14px; font-size:0.84rem; line-height:1.6;">
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
               <div><strong>Student Name:</strong> <span style="color:#0f172a; font-weight:700;">${student.name}</span></div>
               <div><strong>Admission No:</strong> <code>${student.admissionNo}</code></div>
@@ -14369,9 +19789,9 @@ function viewFeeReceiptModal(admissionNo, receiptNo, studentIndex) {
           </div>
 
           <!-- PAYMENT TABLE -->
-          <table style="width:100%; border-collapse:collapse; text-align:left; font-size:0.82rem; margin-bottom:18px; border:1px solid #0f172a;">
+          <table style="width:100%; border-collapse:collapse; text-align:left; font-size:0.84rem; margin-bottom:18px; border:1px solid #0f766e; background:rgba(255,255,255,.90);">
             <thead>
-              <tr style="background:#0f172a; color:#ffffff;">
+              <tr style="background:#0f766e; color:#ffffff;">
                 <th style="padding:8px 12px;">S.No</th>
                 <th style="padding:8px 12px;">Fee Particulars / Months Paid</th>
                 <th style="padding:8px 12px; text-align:right;">Amount Paid (Rs)</th>
@@ -14411,15 +19831,15 @@ function viewFeeReceiptModal(admissionNo, receiptNo, studentIndex) {
                   <td style="padding:6px 12px; text-align:right; font-weight:700;">Rs${payment.partialDueCarried.toLocaleString('en-IN')} Pending</td>
                 </tr>
               ` : ''}
-              <tr style="background:#f8fafc; font-weight:800;">
+              <tr style="background:#fef3c7; font-weight:900; border-top:2px solid #ca8a04;">
                 <td colspan="2" style="padding:10px 12px; text-align:right; text-transform:uppercase;">Total Payment Received:</td>
-                <td style="padding:10px 12px; text-align:right; color:#15803d; font-size:1rem;">Rs${payment.amount.toLocaleString('en-IN')}</td>
+                <td style="padding:10px 12px; text-align:right; color:#0f766e; font-size:1.05rem;">Rs${payment.amount.toLocaleString('en-IN')}</td>
               </tr>
             </tbody>
           </table>
 
           <!-- STAMP & SIGNATURE FOOTER -->
-          <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-top:24px; border-top:1px solid #cbd5e1; padding-top:12px; font-size:0.75rem;">
+          <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-top:24px; border-top:2px solid #ca8a04; padding-top:12px; font-size:0.75rem;">
             <div style="text-align:center;">
               <div style="height:40px; display:flex; align-items:flex-end; justify-content:center;">
                 ${sigs.teacherSig ? `<img src="${sigs.teacherSig}" style="max-height:40px; max-width:110px; object-fit:contain;">` : `<span style="font-family:'Caveat', cursive; font-size:1.1rem; color:#4f46e5; font-weight:bold;">${sigs.teacherName || 'Accounts Office'}</span>`}
@@ -14433,6 +19853,7 @@ function viewFeeReceiptModal(admissionNo, receiptNo, studentIndex) {
               </div>
               <div style="border-top:1px solid #94a3b8; padding-top:3px; font-weight:600; color:#475569;">Official School Stamp</div>
             </div>
+          </div>
           </div>
         </div>
 
@@ -14485,7 +19906,7 @@ function openTelegramReceiptDispatchModal(admissionNo, receiptNo, studentIndex) 
     <div class="modal-overlay active" id="telegramReceiptModal" style="z-index:999999; backdrop-filter:blur(8px); align-items:center; padding:16px;">
       <div class="modal-box" style="max-width:540px; width:95%; max-height:92vh; overflow:hidden; display:flex; flex-direction:column; background:#0f172a; color:#ffffff; padding:0; border-radius:20px; border:2px solid #0088cc; box-shadow:0 25px 50px -12px rgba(0, 136, 204, 0.35);">
         <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; padding:16px 20px; flex-shrink:0; background:#0f172a; position:sticky; top:0; z-index:2;">
-          <h3 style="margin:0; color:#38bdf8; font-size:1.15rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+          <h3 style="margin:0; color:#0284c7; font-size:1.15rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
             <i class="fa-brands fa-telegram" style="color:#0088cc;"></i> Dispatch Fee Receipt via Telegram
           </h3>
           <button onclick="document.getElementById('telegramReceiptModal').remove()" style="background:#334155; color:#ffffff; border:none; width:36px; height:36px; border-radius:50%; cursor:pointer; font-size:1.05rem; display:flex; align-items:center; justify-content:center; flex-shrink:0;">X</button>
@@ -14493,7 +19914,7 @@ function openTelegramReceiptDispatchModal(admissionNo, receiptNo, studentIndex) 
 
         <div style="padding:20px; overflow-y:auto; flex:1;">
         <div style="background:#1e293b; border-radius:12px; padding:14px; margin-bottom:14px; border-left:4px solid #0088cc;">
-          <div style="font-size:0.9rem; font-weight:800; color:#38bdf8;">Receipt #${payment.receiptNo}</div>
+          <div style="font-size:0.9rem; font-weight:800; color:#0284c7;">Receipt #${payment.receiptNo}</div>
           <div style="font-size:0.85rem; color:#cbd5e1; margin-top:4px;">
             Student: <strong>${student.name}</strong> (${cls} - ${sec})<br>
             Parent: <strong>${student.parentName || 'Parent'}</strong> (${student.parentPhone || 'No Phone'})<br>
@@ -14507,7 +19928,7 @@ function openTelegramReceiptDispatchModal(admissionNo, receiptNo, studentIndex) 
             <span style="font-size:0.85rem; font-weight:800; color:${isLinked ? '#34d399' : '#fbbf24'};">
               ${isLinked ? 'Done: Linked Telegram Chat ID:' : 'Warning: Telegram Chat ID Unlinked:'}
             </span>
-            <span style="font-size:0.75rem; color:#cbd5e1;">(Parents can send <code>/link ${student.admissionNo}</code> to @MMMJHSchoolBOT)</span>
+            <span style="font-size:0.75rem; color:#374151;">(Parents can send <code>/link ${student.admissionNo}</code> to @MMMJHSchoolBOT)</span>
           </div>
           <div style="display:flex; gap:8px;">
             <input type="text" id="modalTelegramChatIdInput" class="session-dropdown" value="${getStudentSchoolChatId(student)}" placeholder="Enter school bot parent Telegram Chat ID" style="font-size:0.85rem; padding:6px 10px; flex:1; background:#0f172a; color:#fff; border-color:#334155;">
@@ -14518,12 +19939,12 @@ function openTelegramReceiptDispatchModal(admissionNo, receiptNo, studentIndex) 
         </div>
 
         <div style="display:flex; flex-direction:column; gap:12px; margin-bottom:20px;">
-          <label style="font-size:0.85rem; font-weight:700; color:#cbd5e1;">Select Telegram Dispatch Format:</label>
+          <label style="font-size:0.85rem; font-weight:700; color:#374151;">Select Telegram Dispatch Format:</label>
 
           <!-- OPTION 1: INSTANT TEXT MESSAGE -->
           <div style="background:#0f172a; border:1px solid #334155; border-radius:12px; padding:14px; cursor:pointer; transition:all 0.2s;" onclick="dispatchTelegramInstantTextReceipt('${student.admissionNo}', '${payment.receiptNo}', '${studentIndex ?? ''}')">
             <div style="display:flex; align-items:center; gap:12px;">
-              <i class="fa-solid fa-comment-dots" style="font-size:1.6rem; color:#38bdf8;"></i>
+              <i class="fa-solid fa-comment-dots" style="font-size:1.6rem; color:#0284c7;"></i>
               <div>
                 <strong style="color:#ffffff; font-size:0.95rem;">1-Click Instant Text Notification</strong><br>
                 <small style="color:#94a3b8;">Sends formatted text summary with receipt breakdown & payment notice directly to Telegram chat.</small>
@@ -14565,19 +19986,24 @@ function openTelegramReceiptDispatchModal(admissionNo, receiptNo, studentIndex) 
   document.body.insertAdjacentHTML('beforeend', modalHtml);
 }
 
-function saveModalTelegramChatId(admissionNo, receiptNo, studentIndex) {
+async function saveModalTelegramChatId(admissionNo, receiptNo, studentIndex) {
   const student = findReceiptContext(admissionNo, receiptNo, studentIndex).student || findStudentByAdmissionNo(admissionNo);
   if (!student) return;
 
+  const before = JSON.parse(JSON.stringify(student));
   const val = document.getElementById('modalTelegramChatIdInput')?.value.trim();
   setStudentSchoolChatId(student, val || "");
-  saveSchoolDataToStorage();
-
-  showNotification(`School bot Chat ID updated for ${student.name}: ${getStudentSchoolChatId(student) || 'blank'}`, 'success');
+  try {
+    await persistStudentMasterDelta([buildStudentMasterRecord(student, { intent: 'contact_link', originalAdmissionNo: admissionNo })], `School bot Chat ID updated for ${student.name}: ${getStudentSchoolChatId(student) || 'blank'}.`);
+  } catch (error) {
+    Object.keys(student).forEach(key => { delete student[key]; });
+    Object.assign(student, before);
+    throw error;
+  }
   openTelegramReceiptDispatchModal(admissionNo, receiptNo, studentIndex);
 }
 
-function dispatchTelegramInstantTextReceipt(admissionNo, receiptNo, studentIndex) {
+async function dispatchTelegramInstantTextReceipt(admissionNo, receiptNo, studentIndex) {
   const receiptContext = findReceiptContext(admissionNo, receiptNo, studentIndex);
   const student = receiptContext.student || findStudentByAdmissionNo(admissionNo);
   if (!student) return;
@@ -14588,8 +20014,14 @@ function dispatchTelegramInstantTextReceipt(admissionNo, receiptNo, studentIndex
     if (!chatId) return;
   }
 
+  const priorChatId = getStudentSchoolChatId(student);
   setStudentSchoolChatId(student, chatId.trim());
-  saveSchoolDataToStorage();
+  try {
+    await persistStudentMasterDelta([buildStudentMasterRecord(student, { intent: 'contact_link', originalAdmissionNo: admissionNo })], `School bot Chat ID saved for ${student.name}.`);
+  } catch (error) {
+    setStudentSchoolChatId(student, priorChatId);
+    throw error;
+  }
 
   const currentSession = SchoolData.activeSession;
   const cls = student.currentClass || student.class || 'Class 5';
@@ -14606,7 +20038,7 @@ function dispatchTelegramInstantTextReceipt(admissionNo, receiptNo, studentIndex
 
   const msgText = `Receipt *OFFICIAL FEE RECEIPT NOTICE*\n\n- *Receipt No:* \`${payment.receiptNo}\`\n- *Student Name:* *${student.name}*\n- *Class & Section:* ${cls} - ${sec}\n- *Parent Name:* ${student.parentName || 'Parent'}\n- *Payment Date:* ${payment.date}\n- *Particulars:* ${payment.month || 'Tuition Fee'}\n- *Payment Mode:* ${payment.mode || 'Cash'}\n\n*AMOUNT PAID:* *Rs${payment.amount.toLocaleString('en-IN')}*\n\nThank you for prompt fee payment!`;
 
-  sendRawTelegramReply(chatId, msgText);
+  await sendRawTelegramReply(chatId, msgText);
 
   SchoolData.telegramLogs.unshift({
     id: Date.now(),
@@ -14618,15 +20050,16 @@ function dispatchTelegramInstantTextReceipt(admissionNo, receiptNo, studentIndex
     status: "Delivered (Live Bot @MMMJHSchoolBOT)"
   });
   recordMmmjhsBotSheetLog('fee_receipt', buildFeeReceiptSheetPayload(student, payment, chatId, 'Instant Text', 'Sent'));
-  saveSchoolDataToStorage();
+  saveSchoolDataToStorage({ skipCloudPush: true });
 
   showNotification(`Fee receipt notification dispatched to Telegram Chat ID ${chatId}!`, 'success');
   document.getElementById('telegramReceiptModal')?.remove();
 }
 
 function getSchoolReceiptLogoSource() {
-  const profile = getSchoolProfile();
-  return profile.logoDataUrl || 'assets/school_logo_tc.png' || 'assets/school_logo.png';
+  // Keep printed receipts consistent and prevent legacy checkerboard uploads
+  // from appearing behind the official circular school emblem.
+  return getPrintLogoSource();
 }
 
 function getSchoolPaymentQrSource(receiptNo) {
@@ -14731,7 +20164,7 @@ function drawFeeReceiptTableRows(doc, payment, startY) {
     yPos += 8;
   }
 
-  doc.setFillColor(241, 245, 249);
+  doc.setFillColor(254, 243, 199);
   doc.rect(15, yPos, 180, 12, 'F');
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(11);
@@ -14748,12 +20181,19 @@ function drawA4FeeReceiptPdf(doc, opts) {
   doc.setFillColor(255, 255, 255);
   doc.rect(0, 0, 210, 297, 'F');
 
+  doc.setDrawColor(15, 118, 110);
+  doc.setLineWidth(1.05);
+  doc.roundedRect(6, 6, 198, 285, 2, 2, 'S');
+  doc.setDrawColor(202, 138, 4);
+  doc.setLineWidth(1.75);
+  doc.roundedRect(9, 9, 192, 279, 2, 2, 'S');
+
   doc.setDrawColor(212, 175, 55);
   doc.setLineWidth(0.6);
   doc.circle(29, 29, 12.5, 'S');
   addPdfImageSafe(doc, logoDataUrl, 18, 18, 22, 22);
 
-  doc.setTextColor(15, 23, 42);
+  doc.setTextColor(15, 118, 110);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(13);
   doc.text('MADAN MOHAN MALVIYA JUNIOR HIGH SCHOOL', 105, 24, { align: 'center', maxWidth: 118 });
@@ -14768,12 +20208,12 @@ function drawA4FeeReceiptPdf(doc, opts) {
 
   addPdfImageSafe(doc, qrDataUrl, 172, 16, 20, 20);
 
-  doc.setDrawColor(15, 23, 42);
-  doc.setLineWidth(0.4);
+  doc.setDrawColor(15, 118, 110);
+  doc.setLineWidth(0.8);
   doc.line(15, 42, 195, 42);
 
-  doc.setDrawColor(203, 213, 225);
-  doc.setFillColor(248, 250, 252);
+  doc.setDrawColor(153, 246, 228);
+  doc.setFillColor(236, 253, 245);
   doc.roundedRect(15, 46, 180, 14, 2, 2, 'FD');
   doc.setTextColor(15, 23, 42);
   doc.setFont('helvetica', 'normal');
@@ -14782,14 +20222,15 @@ function drawA4FeeReceiptPdf(doc, opts) {
   doc.text(`Payment Date: ${formatReceiptDateDisplay(payment.date)}`, 88, 54);
   doc.text(`Payment Mode: ${payment.mode || 'Cash'}`, 150, 54);
 
-  doc.setDrawColor(203, 213, 225);
-  doc.roundedRect(15, 64, 180, 22, 2, 2, 'S');
+  doc.setDrawColor(148, 163, 184);
+  doc.setFillColor(248, 250, 252);
+  doc.roundedRect(15, 64, 180, 22, 2, 2, 'FD');
   doc.text(`Student Name: ${student.name}`, 20, 72);
   doc.text(`Admission No: ${student.admissionNo}`, 110, 72);
   doc.text(`Class & Section: ${cls} - ${sec}`, 20, 80);
   doc.text(`Father Name: ${student.parentName || 'Parent'}`, 110, 80);
 
-  doc.setFillColor(15, 23, 42);
+  doc.setFillColor(15, 118, 110);
   doc.rect(15, 92, 180, 10, 'F');
   doc.setTextColor(255, 255, 255);
   doc.setFont('helvetica', 'bold');
@@ -14932,8 +20373,14 @@ async function generateAndSendTelegramPDFReceipt(admissionNo, receiptNo, pdfForm
     chatId = prompt(`Enter Parent Telegram Chat ID for ${student.name} (Adm: ${admissionNo}):`, '');
     if (!chatId) return;
   }
+  const priorChatId = getStudentSchoolChatId(student);
   setStudentSchoolChatId(student, chatId.trim());
-  saveSchoolDataToStorage();
+  try {
+    await persistStudentMasterDelta([buildStudentMasterRecord(student, { intent: 'contact_link', originalAdmissionNo: admissionNo })], `School bot Chat ID saved for ${student.name}.`);
+  } catch (error) {
+    setStudentSchoolChatId(student, priorChatId);
+    throw error;
+  }
 
   const currentSession = SchoolData.activeSession;
   const cls = student.currentClass || student.class || 'Class 5';
@@ -15027,6 +20474,7 @@ function renderReceiptsLedgerPage(container) {
   const allReceipts = getAllFeeReceipts();
   const totalCollected = allReceipts.reduce((acc, r) => acc + (r.amount || 0), 0);
   const canSeeRevenue = canUserViewSchoolTotalRevenue();
+  const canDeleteReceipts = canCurrentUserDeleteFeeReceipts();
 
   container.innerHTML = `
     <div class="page-header">
@@ -15063,33 +20511,40 @@ function renderReceiptsLedgerPage(container) {
     <!-- SEARCH & FILTER BAR -->
     <div class="glass-card">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:12px;">
-        <div style="display:flex; gap:10px; align-items:center;">
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
           <input type="text" id="receiptSearchInput" placeholder="Search receipt #, student, or adm no..." class="session-dropdown" style="width:300px;" onkeyup="filterReceiptsLedgerTable()">
+          <input type="month" id="receiptMonthFilter" class="session-dropdown date-filter-input" title="Filter by month" style="width:150px;" onchange="filterReceiptsLedgerTable()">
+          <input type="date" id="receiptFromDate" class="session-dropdown date-filter-input" title="From date" style="width:150px;" onchange="filterReceiptsLedgerTable()">
+          <input type="date" id="receiptToDate" class="session-dropdown date-filter-input" title="To date" style="width:150px;" onchange="filterReceiptsLedgerTable()">
           <select id="receiptModeFilter" class="session-dropdown" onchange="filterReceiptsLedgerTable()">
             <option value="ALL">All Payment Modes</option>
             <option value="UPI">Online UPI</option>
             <option value="Cash">Cash</option>
           </select>
+          <button class="btn btn-secondary" onclick="clearReceiptDateFilters()" style="background:#334155; color:#fff; border:none; font-weight:700; padding:6px 12px; font-size:0.82rem;">
+            Clear Dates
+          </button>
         </div>
       </div>
 
       <div class="data-table-container">
         <table class="data-table" id="receiptsLedgerTable">
           <thead>
-            <tr>
-              <th>Receipt No</th>
-              <th>Date</th>
-              <th>Student Name</th>
-              <th>Class</th>
+            <tr style="user-select:none;">
+              <th onclick="sortHtmlTable('receiptsLedgerTable', 0, 'string')" style="cursor:pointer;">Receipt No <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
+              <th onclick="sortHtmlTable('receiptsLedgerTable', 1, 'date')" style="cursor:pointer;">Date & Time <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
+              <th onclick="sortHtmlTable('receiptsLedgerTable', 2, 'string')" style="cursor:pointer;">Student Name <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
+              <th onclick="sortHtmlTable('receiptsLedgerTable', 3, 'string')" style="cursor:pointer;">Class <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
+              <th style="color:#38bdf8;"><i class="fa-solid fa-user-check"></i> Collected By (Staff)</th>
+              <th onclick="sortHtmlTable('receiptsLedgerTable', 5, 'number')" style="cursor:pointer;">Amount Paid <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
+              <th onclick="sortHtmlTable('receiptsLedgerTable', 6, 'string')" style="cursor:pointer;">Mode <i class="fa-solid fa-sort" style="margin-left:4px; font-size:0.75rem; opacity:0.5;"></i></th>
               <th>Fee Description</th>
-              <th>Amount Paid</th>
-              <th>Payment Mode</th>
               <th>Actions</th>
             </tr>
           </thead>
           <tbody>
             ${allReceipts.length > 0 ? allReceipts.map(r => `
-              <tr class="receipt-row" data-no="${r.receiptNo.toLowerCase()}" data-name="${r.studentName.toLowerCase()}" data-adm="${r.admissionNo}" data-mode="${r.mode}">
+              <tr class="receipt-row" data-no="${r.receiptNo.toLowerCase()}" data-name="${r.studentName.toLowerCase()}" data-adm="${r.admissionNo}" data-mode="${r.mode}" data-date="${r.date || ''}">
                 <td><code style="color:var(--accent-primary); font-weight:700;">${r.receiptNo}</code></td>
                 <td>${r.date}</td>
                 <td>
@@ -15097,9 +20552,13 @@ function renderReceiptsLedgerPage(container) {
                   <small style="color:var(--text-muted);">Adm: ${r.admissionNo}</small>
                 </td>
                 <td><span class="badge badge-purple">${r.class || r.className || 'Class 5'} - ${r.section || 'A'}</span></td>
-                <td>${r.month}</td>
+                <td>
+                  <strong style="color:#f59e0b; font-size:0.86rem;"><i class="fa-solid fa-user-check"></i> ${escapeHtml(r.collectedBy || 'Not recorded')}</strong><br>
+                  <small style="color:#94a3b8; font-weight:600;">${escapeHtml(r.collectedByRole || 'Role not recorded')}</small>
+                </td>
                 <td><strong style="color:var(--accent-success); font-size:1.05rem;">Rs${r.amount.toLocaleString('en-IN')}</strong></td>
                 <td><span class="badge badge-success">${r.mode}</span></td>
+                <td style="color:#cbd5e1; max-width:260px;">${escapeHtml(r.month || 'Tuition Fee Payment')}</td>
                 <td>
                   <div style="display:flex; gap:6px; flex-wrap:wrap;">
                     <button class="btn btn-primary" style="padding:4px 10px; font-size:0.75rem; background:linear-gradient(135deg, #10b981 0%, #059669 100%); border:none;" onclick="viewFeeReceiptModal('${r.admissionNo}', '${r.receiptNo}', '${r.studentIndex}')">
@@ -15111,9 +20570,11 @@ function renderReceiptsLedgerPage(container) {
                     <button class="btn btn-telegram" style="padding:4px 10px; font-size:0.75rem; font-weight:800; background:#0088cc; color:#ffffff; border:none; border-radius:4px; cursor:pointer;" onclick="openTelegramReceiptDispatchModal('${r.admissionNo}', '${r.receiptNo}', '${r.studentIndex}')" title="Send A4 Voucher / Thermal PDF / Text Receipt to Parent via Telegram">
                       <i class="fa-brands fa-telegram"></i> Telegram PDF
                     </button>
+                    ${canDeleteReceipts ? `
                     <button class="btn btn-secondary" style="padding:4px 8px; font-size:0.75rem; background:#dc2626; color:#ffffff; border:none; font-weight:700;" onclick="deleteAndCancelFeeReceipt('${r.admissionNo}', '${r.receiptNo}', '${r.studentIndex}')" title="Delete Receipt & Reverse Revenue Collection">
                       <i class="fa-solid fa-trash"></i> Cancel / Delete
                     </button>
+                    ` : ''}
                   </div>
                 </td>
               </tr>
@@ -15131,9 +20592,19 @@ function renderReceiptsLedgerPage(container) {
   `;
 }
 
+function clearReceiptDateFilters() {
+  ['receiptMonthFilter', 'receiptFromDate', 'receiptToDate', 'recentReceiptMonthFilter', 'recentReceiptFromDate', 'recentReceiptToDate'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+  filterReceiptsLedgerTable();
+  filterRecentReceiptsTable();
+}
+
 function filterReceiptsLedgerTable() {
   const query = (document.getElementById('receiptSearchInput')?.value || '').toLowerCase();
   const targetMode = document.getElementById('receiptModeFilter')?.value || 'ALL';
+  const dateRange = getReceiptDateFilterRange();
 
   const rows = document.querySelectorAll('#receiptsLedgerTable .receipt-row');
   rows.forEach(r => {
@@ -15141,47 +20612,45 @@ function filterReceiptsLedgerTable() {
     const name = r.getAttribute('data-name') || '';
     const adm = r.getAttribute('data-adm') || '';
     const mode = r.getAttribute('data-mode') || '';
+    const receiptDate = r.getAttribute('data-date') || '';
 
     const matchQuery = !query || no.includes(query) || name.includes(query) || adm.includes(query);
     const matchMode = targetMode === 'ALL' || mode.toLowerCase().includes(targetMode.toLowerCase());
+    const matchDate = receiptMatchesDateFilter({ date: receiptDate }, dateRange);
 
-    r.style.display = (matchQuery && matchMode) ? '' : 'none';
+    r.style.display = (matchQuery && matchMode && matchDate) ? '' : 'none';
   });
 }
 
 function exportReceiptsCSV() {
-  const students = getStudentsByActiveSession();
   const currentSession = SchoolData.activeSession;
-
-  let csvRows = ["Receipt No,Date,Admission No,Student Name,Class,Father Name,Amount Paid (INR),Fee Description,Payment Mode"];
-  
-  students.forEach(s => {
-    const feeRec = s.feeRecords ? s.feeRecords[currentSession] : null;
-    if (feeRec && feeRec.payments) {
-      feeRec.payments.forEach(p => {
-        csvRows.push(`"${p.receiptNo}","${p.date}","${s.admissionNo}","${s.name}","${s.currentClass} - ${s.currentSection}","${s.parentName}","${p.amount}","${p.month || 'Tuition Fee'}","${p.mode || 'Cash/UPI'}"`);
-      });
-    }
-  });
-
-  const csvContent = "data:text/csv;charset=utf-8," + csvRows.join("\n");
-  const encodedUri = encodeURI(csvContent);
-  const link = document.createElement("a");
-  link.setAttribute("href", encodedUri);
-  link.setAttribute("download", `MMM_School_Fee_Receipts_Register_${currentSession}.csv`);
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  showNotification(`Exported Official Fee Receipts Register CSV!`, 'success');
+  const receipts = getFilteredFeeReceipts();
+  const dateRange = getReceiptDateFilterRange();
+  const periodLabel = dateRange.label
+    ? dateRange.label.replace('-', '_')
+    : (dateRange.from || dateRange.to ? 'Filtered' : 'All');
+  downloadCsvFile(`MMM_Fee_Receipts_${periodLabel}_${currentSession}.csv`, buildReceiptRegisterCsvRows(receipts));
+  showNotification(`Exported ${receipts.length} receipt row(s) with fee bifurcation totals.`, 'success');
 }
 
 async function deleteAndCancelFeeReceipt(admissionNo, receiptNo, studentIndex) {
+  if (!canCurrentUserDeleteFeeReceipts()) {
+    showNotification('Access denied: fee receipt deletion is restricted to admin / accountant.', 'warning');
+    return;
+  }
   const receiptContext = findReceiptContext(admissionNo, receiptNo, studentIndex);
   const student = receiptContext.student;
   if (!student) {
     showNotification(`Receipt ${receiptNo} not found for deletion.`, 'error');
     return;
   }
+  const beforeCancellation = JSON.parse(JSON.stringify({
+    feeRecords: student.feeRecords || {},
+    currentFeeInfo: student.currentFeeInfo || null,
+    walletBalance: student.walletBalance || 0,
+    partialDue: student.partialDue || 0,
+    cancelledReceipts: SchoolData.cancelledReceipts || []
+  }));
 
   const currentSession = receiptContext.session || SchoolData.activeSession;
   const feeRec = receiptContext.feeRec;
@@ -15208,6 +20677,11 @@ async function deleteAndCancelFeeReceipt(admissionNo, receiptNo, studentIndex) {
     `Are you sure you want to delete this receipt? This will deduct Rs${amountToDeduct} from Total Collected Revenue and restore the student's pending due.`;
 
   if (!confirm(confirmMsg)) return;
+  const cancellationReason = String(prompt('Enter the cancellation reason for the audit record:', 'Cancelled by Accounts Office') || '').trim();
+  if (!cancellationReason) {
+    showNotification('Receipt was not cancelled because a reason is required.', 'warning');
+    return;
+  }
 
   // 1. Record a cloud-safe cancellation marker, then remove every local copy
   // of this receipt (feeRecords and currentFeeInfo can both contain it).
@@ -15227,26 +20701,37 @@ async function deleteAndCancelFeeReceipt(admissionNo, receiptNo, studentIndex) {
   // 4. Save locally (cancelled markers are also stored in a tiny key so
   // phone quota errors cannot resurrect this receipt on refresh).
   persistCancelledReceiptsToLocalStorage();
-  saveSchoolDataToStorage();
-
-  // 5. Push deletion to cloud before the user can refresh
-  if (typeof pushSchoolDataToCloud === 'function') {
-    try {
-      await pushSchoolDataToCloud({ skipMergePull: true });
-    } catch (err) {
-      console.warn('Receipt cancel cloud push failed:', err);
-      if (typeof flushCloudPushNow === 'function') flushCloudPushNow();
+  try {
+    const result = await callErpSecurityApi('cancelFeePayment', {
+      body: {
+        mutationId: `cancel:${getReceiptCancellationKey(receiptNo)}`,
+        receiptNo,
+        previousSessionName: '2025-26',
+        reason: cancellationReason
+      }
+    });
+    const marker = (SchoolData.cancelledReceipts || []).find(item => getReceiptCancellationKey(item?.receiptNo || item) === getReceiptCancellationKey(receiptNo));
+    if (marker && result?.cancellation) Object.assign(marker, result.cancellation);
+    if (result?.savedAt && typeof window.recordCloudMutationRevision === 'function') {
+      window.recordCloudMutationRevision(result.savedAt);
     }
-  } else if (typeof flushCloudPushNow === 'function') {
-    flushCloudPushNow();
+  } catch (error) {
+    student.feeRecords = beforeCancellation.feeRecords;
+    student.currentFeeInfo = beforeCancellation.currentFeeInfo;
+    student.walletBalance = beforeCancellation.walletBalance;
+    student.partialDue = beforeCancellation.partialDue;
+    SchoolData.cancelledReceipts = beforeCancellation.cancelledReceipts;
+    persistCancelledReceiptsToLocalStorage();
+    showNotification(`Receipt #${receiptNo} was not cancelled because cloud did not confirm it.`, 'error');
+    return;
   }
 
-  // 6. Send Telegram alert notice
+  // 5. Send Telegram alert notice only after cloud confirmation
   triggerSingleFeeReminder(student.admissionNo, `RECEIPT CANCELLED NOTICE:\nReceipt #${receiptNo} of Rs ${amountToDeduct} has been cancelled and reversed by School Accounts Office.`);
 
-  showNotification(`Receipt #${receiptNo} cancelled! Rs ${amountToDeduct.toLocaleString('en-IN')} reversed from Total Revenue.`, 'success');
+  showNotification(`Cloud confirmed: Receipt #${receiptNo} cancelled and Rs ${amountToDeduct.toLocaleString('en-IN')} reversed from Total Revenue.`, 'success');
 
-  // 7. Refresh page
+  // 6. Refresh page
   if (window.location.hash.includes('receipts')) {
     renderReceiptsLedgerPage(document.getElementById('contentBody'));
   } else {
@@ -15331,7 +20816,7 @@ function renderTelegramSheetLogPage(container, category) {
     <div class="glass-card" style="border:2px solid #38bdf8; padding:20px;">
       <div style="display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:14px;">
         <div>
-          <h3 style="margin:0; color:#38bdf8;">Google Sheet Tab: ${meta.sheet}</h3>
+          <h3 style="margin:0; color:#0284c7;">Google Sheet Tab: ${meta.sheet}</h3>
           <small style="color:var(--text-muted);">When the backend/VPS is connected, these same rows should be appended to this Google Sheet tab.</small>
         </div>
         <span class="badge badge-info">${rows.length} ERP log row(s)</span>
@@ -15380,11 +20865,19 @@ function exportTelegramLogCsv(category) {
 }
 
 function renderClassTeacherAssignmentsPage(container) {
+  const assignmentRows = (SchoolData.classes || []).flatMap((cls) =>
+    (cls.sections || ['A']).map((section) => {
+      const map = getClassSectionTeachers(cls);
+      const teacher = map[normalizeClassSectionKey(section)] || '';
+      return { cls, section, teacher };
+    })
+  );
+
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-chalkboard-user" style="color:#38bdf8"></i> Class Teacher Assignments</h2>
-        <p class="page-subtitle">Assign one unique class teacher per class. Teacher names come from Teachers Directory.</p>
+        <p class="page-subtitle">Assign one class teacher per <strong>class + section</strong>. Upload each teacher's signature in Teachers Directory — it prints on report cards automatically.</p>
       </div>
       <button class="btn btn-secondary" onclick="window.location.hash='teachers'"><i class="fa-solid fa-user-tie"></i> Teachers Directory</button>
     </div>
@@ -15395,56 +20888,132 @@ function renderClassTeacherAssignmentsPage(container) {
           <thead>
             <tr>
               <th>Class</th>
-              <th>Sections</th>
+              <th>Section</th>
               <th>Assigned Class Teacher</th>
+              <th>Signature on Report Card</th>
               <th>Room</th>
             </tr>
           </thead>
           <tbody>
-            ${(SchoolData.classes || []).map(c => `
+            ${assignmentRows.map(({ cls, section, teacher }) => {
+              const sig = getTeacherSignatureByName(teacher);
+              return `
               <tr>
-                <td><strong style="color:#38bdf8;">${c.name}</strong></td>
-                <td>${(c.sections || []).join(', ')}</td>
+                <td><strong style="color:#0284c7;">${cls.name}</strong></td>
+                <td><span class="badge badge-purple">${section}</span></td>
                 <td>
-                  <select class="session-dropdown class-teacher-assign-select" data-class-id="${c.id}" style="max-width:320px;">
+                  <select class="session-dropdown class-teacher-assign-select" data-class-id="${cls.id}" data-section="${section}" style="max-width:320px;">
                     <option value="">Select class teacher</option>
-                    ${getClassTeacherOptionsHtml(c.teacher || '', c.id)}
+                    ${getClassTeacherOptionsHtml(teacher, cls.id, section)}
                   </select>
                 </td>
-                <td>${c.room || 'Room 101'}</td>
+                <td>${teacher ? (sig ? '<span style="color:#34d399; font-weight:700;">Uploaded</span>' : '<span style="color:#b45309;">Add in Teachers Directory</span>') : '—'}</td>
+                <td>${cls.room || 'Room 101'}</td>
               </tr>
-            `).join('')}
+            `;
+            }).join('')}
           </tbody>
         </table>
       </div>
       <div style="text-align:right; margin-top:18px;">
-        <button class="btn btn-primary" onclick="saveClassTeacherAssignments()"><i class="fa-solid fa-floppy-disk"></i> Save Class Teacher Assignments</button>
+        <button id="btnSaveClassTeacherAssign" class="btn btn-primary" onclick="saveClassTeacherAssignmentsClick(this)"><i class="fa-solid fa-floppy-disk"></i> Save Class Teacher Assignments</button>
       </div>
     </div>
   `;
 }
 
-function saveClassTeacherAssignments() {
-  const selects = Array.from(document.querySelectorAll('.class-teacher-assign-select'));
-  const seen = new Map();
-  for (const sel of selects) {
-    const teacher = sel.value.trim();
-    if (!teacher) continue;
-    if (seen.has(teacher.toLowerCase())) {
-      showNotification(`${teacher} is selected for more than one class. Please choose one class only.`, 'error');
-      return;
-    }
-    seen.set(teacher.toLowerCase(), sel.getAttribute('data-class-id'));
+async function saveClassTeacherAssignmentsClick(btn) {
+  const originalHtml = btn ? btn.innerHTML : '';
+  if (btn) {
+    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving to Cloud...';
+    btn.disabled = true;
   }
 
-  selects.forEach(sel => {
-    const cls = SchoolData.classes.find(c => c.id === sel.getAttribute('data-class-id'));
-    if (cls) cls.teacher = sel.value.trim();
-  });
-  saveSchoolDataToStorage();
-  showNotification('Class teacher assignments saved.', 'success');
-  renderClassTeacherAssignmentsPage(document.getElementById('contentBody'));
+  try {
+    await saveClassTeacherAssignments({ silent: false });
+    if (btn) {
+      btn.innerHTML = '<i class="fa-solid fa-circle-check" style="color:#34d399;"></i> Saved Successfully!';
+      setTimeout(() => {
+        if (btn) {
+          btn.innerHTML = originalHtml || '<i class="fa-solid fa-floppy-disk"></i> Save Class Teacher Assignments';
+          btn.disabled = false;
+        }
+      }, 2500);
+    }
+  } catch (err) {
+    showNotification('Error saving assignments: ' + (err.message || err), 'error');
+    if (btn) {
+      btn.innerHTML = originalHtml || '<i class="fa-solid fa-floppy-disk"></i> Save Class Teacher Assignments';
+      btn.disabled = false;
+    }
+  }
 }
+
+async function saveClassTeacherAssignments(options) {
+  const silent = options && options.silent;
+  const selects = Array.from(document.querySelectorAll('.class-teacher-assign-select'));
+  const classesSnapshot = JSON.stringify(SchoolData.classes || []);
+  const staffSnapshot = JSON.stringify(SchoolData.staffUsers || []);
+  const classesBefore = new Map((SchoolData.classes || []).map(cls => [cls.id, JSON.stringify(cls)]));
+  const staffBefore = new Map((SchoolData.staffUsers || []).map(user => [user.id, JSON.stringify(user)]));
+
+  selects.forEach((sel) => {
+    const cls = (SchoolData.classes || []).find(c => c.id === sel.getAttribute('data-class-id'));
+    if (!cls) return;
+    const section = normalizeClassSectionKey(sel.getAttribute('data-section') || 'A');
+    const teacherName = sel.value.trim();
+    setClassSectionTeacher(cls, section, teacherName);
+
+    // Also link to staff user record if matched
+    if (teacherName) {
+      const staffUser = (SchoolData.staffUsers || []).find(u =>
+        String(u.name || '').trim().toLowerCase() === teacherName.toLowerCase()
+      );
+      if (staffUser) {
+        staffUser.assignedClass = cls.name;
+        if (!Array.isArray(staffUser.assignedClasses)) staffUser.assignedClasses = [];
+        if (!staffUser.assignedClasses.includes(cls.name)) staffUser.assignedClasses.push(cls.name);
+      }
+    }
+  });
+
+  const changedClasses = (SchoolData.classes || []).filter(cls => classesBefore.get(cls.id) !== JSON.stringify(cls));
+  const changedStaff = (SchoolData.staffUsers || []).filter(user => staffBefore.get(user.id) !== JSON.stringify(user));
+  if (changedClasses.length || changedStaff.length) {
+    try {
+      await persistDirectoryDelta({
+        scope: 'classTeachers',
+        classUpserts: changedClasses,
+        staffUpserts: changedStaff
+      }, silent ? '' : 'Class teacher assignments saved.', { allowQueue: false });
+    } catch (error) {
+      SchoolData.classes = JSON.parse(classesSnapshot);
+      SchoolData.staffUsers = JSON.parse(staffSnapshot);
+      saveSchoolDataToStorage({ skipCloudPush: true });
+      throw error;
+    }
+  }
+
+  // Update signature status cells directly in the table
+  selects.forEach((sel) => {
+    const teacher = sel.value.trim();
+    const tdSig = sel.closest('tr')?.children[3];
+    if (tdSig) {
+      if (teacher) {
+        const sig = getTeacherSignatureByName(teacher);
+        tdSig.innerHTML = sig 
+          ? '<span style="color:#34d399; font-weight:700;">Uploaded</span>' 
+          : '<span style="color:#b45309;">Add in Teachers Directory</span>';
+      } else {
+        tdSig.innerHTML = '';
+      }
+    }
+  });
+
+  if (!silent && !changedClasses.length && !changedStaff.length) showNotification('No class teacher assignment changed.', 'info');
+  return true;
+}
+
 
 function renderTelegramLinksPage(container, options) {
   const skipAutoSyncRestart = options && options.skipAutoSyncRestart;
@@ -15482,7 +21051,7 @@ function renderTelegramLinksPage(container, options) {
     <div class="glass-card" style="border:2px solid #38bdf8; padding:22px;">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:12px;">
         <div>
-          <h3 style="font-family:var(--font-heading); color:#38bdf8; margin:0;">Chat ID & Telegram User Name Directory</h3>
+          <h3 style="font-family:var(--font-heading); color:#0284c7; margin:0;">Chat ID & Telegram User Name Directory</h3>
           <small style="color:var(--text-muted);">Edits here update existing students only. No student is deleted or recreated.${window._telegramLinksLastSync ? ` Last sync: ${window._telegramLinksLastSync}` : ''}</small>
         </div>
         <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
@@ -15518,7 +21087,7 @@ function renderTelegramLinksPage(container, options) {
               const search = `${s.admissionNo} ${s.name} ${s.parentPhone || ''} ${schoolChatId} ${s.telegramUserName || ''}`.toLowerCase();
               return `
                 <tr class="telegram-link-row" data-search="${search}">
-                  <td><code style="color:#38bdf8; font-weight:800;">${s.admissionNo}</code></td>
+                  <td><code style="color:#0284c7; font-weight:800;">${s.admissionNo}</code></td>
                   <td><strong>${s.name}</strong><br><small style="color:#94a3b8;">${s.parentPhone || ''}</small></td>
                   <td><span class="badge badge-purple">${s.currentClass || 'Class 5'} - ${s.currentSection || 'A'}</span></td>
                   <td><input id="linkSchoolChat_${studentIndex}" class="session-dropdown" value="${schoolChatId}" placeholder="@mmmjhschoolbot Chat ID" style="min-width:160px;"></td>
@@ -15612,7 +21181,63 @@ function applyWebsiteAppearance() {
   }
 }
 
+/**
+ * The exam sub-directory links are static markup in index.html, and deployments
+ * shipped before admit cards existed have no Admit Card entry. Clone a sibling
+ * link so the injected one inherits that deployment's own classes and styling.
+ */
+function ensureExamsAdmitCardNavLink() {
+  const examsNav = document.querySelector(
+    'a.nav-item[data-page="exams"], a.nav-item[data-page="exams-entry"], a.nav-item[href="#exams"], a.nav-item[href="#exams-entry"]'
+  );
+  let subdir = document.querySelector('.nav-sub-directory[data-parent="exams"]');
+
+  if (!subdir && examsNav) {
+    subdir = document.createElement('div');
+    subdir.className = examsNav.nextElementSibling?.classList?.contains('nav-sub-directory')
+      ? examsNav.nextElementSibling.className
+      : 'nav-sub-directory';
+    subdir.setAttribute('data-parent', 'exams');
+    subdir.style.display = 'none';
+    examsNav.insertAdjacentElement('afterend', subdir);
+  }
+
+  if (!subdir) return null;
+
+  const examLinks = [
+    { page: 'exams-entry', icon: 'fa-table-cells', label: 'Marks Entry' },
+    { page: 'exams-weightage', icon: 'fa-sliders', label: 'Subject Marks & Weightage' },
+    { page: 'exams-report-cards', icon: 'fa-award', label: 'Report Cards' },
+    { page: 'exams-schedule', icon: 'fa-calendar-days', label: 'Exam Schedule' },
+    { page: 'exams-admit-card', icon: 'fa-id-card', label: 'Admit Card' }
+  ];
+
+  examLinks.forEach((item) => {
+    const existing = subdir.querySelector(`a[data-page="${item.page}"], a[href="#${item.page}"]`);
+    if (existing) return;
+    const template = subdir.querySelector('a');
+    const link = template ? template.cloneNode(true) : document.createElement('a');
+    link.setAttribute('href', `#${item.page}`);
+    link.setAttribute('data-page', item.page);
+    link.classList.remove('active');
+    const icon = link.querySelector('i');
+    if (icon) icon.className = `fa-solid ${item.icon}`;
+    const labelHost = link.querySelector('span');
+    if (labelHost) {
+      labelHost.textContent = item.label;
+    } else {
+      Array.from(link.childNodes).filter((node) => node.nodeType === 3).forEach((node) => node.remove());
+      link.appendChild(document.createTextNode(` ${item.label}`));
+    }
+    subdir.appendChild(link);
+  });
+
+  return subdir.querySelector('a[data-page="exams-admit-card"], a[href="#exams-admit-card"]');
+}
+
 function updateSidebarSubdirectoryState(hash) {
+  ensureExamsAdmitCardNavLink();
+
   const activeParent =
     hash.startsWith('telegram') ? 'telegram-bot' :
     hash.startsWith('exams') ? 'exams' :
@@ -15644,7 +21269,7 @@ function renderAppearancePage(container) {
 
     <div class="grid-2" style="align-items:start; gap:20px;">
       <div class="glass-card" style="border:2px solid #38bdf8; padding:22px;">
-        <h3 style="margin-top:0; color:#38bdf8;">Theme</h3>
+        <h3 style="margin-top:0; color:#0284c7;">Theme</h3>
         <label style="font-weight:700; color:var(--text-main);">Base Theme</label>
         <select id="appearanceThemeSelect" class="session-dropdown" style="width:100%; margin:6px 0 16px 0;">
           <option value="dark" ${(settings.theme || 'dark') === 'dark' ? 'selected' : ''}>Dark ERP</option>
@@ -15660,14 +21285,14 @@ function renderAppearancePage(container) {
       </div>
 
       <div class="glass-card" style="border:2px solid #8b5cf6; padding:22px;">
-        <h3 style="margin-top:0; color:#c084fc;">Directory Order</h3>
+        <h3 style="margin-top:0; color:#6d28d9;">Directory Order</h3>
         <div id="navOrderEditor" style="display:flex; flex-direction:column; gap:8px;">
           ${order.map((page, idx) => {
             const item = linkMap.get(page) || { label: page, icon: 'fa-solid fa-circle' };
             return `
               <div class="nav-order-row" data-page="${page}" style="display:flex; align-items:center; gap:10px; background:#0f172a; border:1px solid #334155; border-radius:8px; padding:10px;">
                 <span style="width:28px; color:#cbd5e1; font-weight:800;">${idx + 1}</span>
-                <i class="${item.icon}" style="color:#38bdf8; width:20px;"></i>
+                <i class="${item.icon}" style="color:#0284c7; width:20px;"></i>
                 <strong style="flex:1; color:#ffffff;">${item.label}</strong>
                 <button class="btn btn-secondary" style="padding:5px 9px;" onclick="moveNavOrderRow(this, -1)"><i class="fa-solid fa-arrow-up"></i></button>
                 <button class="btn btn-secondary" style="padding:5px 9px;" onclick="moveNavOrderRow(this, 1)"><i class="fa-solid fa-arrow-down"></i></button>
@@ -15683,6 +21308,65 @@ function renderAppearancePage(container) {
   `;
 }
 
+function clearUploadedSignature(key) {
+  if (!confirm(`Are you sure you want to clear this uploaded signature?`)) return;
+  if (!SchoolData.signatures) SchoolData.signatures = {};
+  delete SchoolData.signatures[key];
+  
+  if (key === 'principalSig') {
+    if (!SchoolData.schoolProfile) SchoolData.schoolProfile = {};
+    SchoolData.schoolProfile.principalSignatureDataUrl = '';
+  }
+  
+  showNotification('Signature image cleared successfully! Click Save to apply to cloud.', 'info');
+  document.getElementById('uploadSigModal')?.remove();
+  openUploadSignaturesModal();
+}
+
+function clearSchoolProfileImage(key) {
+  if (!confirm(`Are you sure you want to clear this school profile image?`)) return;
+  if (!SchoolData.schoolProfile) SchoolData.schoolProfile = {};
+  
+  if (key === 'logoDataUrl') {
+    SchoolData.schoolProfile.logoDataUrl = '';
+  } else if (key === 'paymentQrDataUrl') {
+    SchoolData.schoolProfile.paymentQrDataUrl = '';
+  } else if (key === 'principalSignatureDataUrl') {
+    SchoolData.schoolProfile.principalSignatureDataUrl = '';
+    if (SchoolData.signatures) {
+      delete SchoolData.signatures.principalSig;
+    }
+  }
+  
+  saveSchoolDataToStorage({ skipCloudPush: true });
+  applySchoolProfileToShell();
+  showNotification('Image cleared successfully! Click Save Images to apply.', 'info');
+  renderSchoolProfilePage(document.getElementById('contentBody'));
+}
+
+function clearStudentPhoto(admissionNo) {
+  if (!confirm(`Are you sure you want to clear this student's photo?`)) return;
+  const student = SchoolData.students.find(s => s.admissionNo === admissionNo);
+  if (!student) return;
+  
+  student.photo = '';
+  student.photoDataUrl = '';
+  
+  // Update preview
+  const prevBox = document.getElementById('editStudPhotoPreview');
+  if (prevBox) {
+    prevBox.innerHTML = getStudentDirectoryPhotoHtml(student, 58);
+  }
+  
+  const photoInput = document.getElementById('editStudPhoto');
+  if (photoInput) photoInput.value = '';
+  
+  showNotification('Student photo cleared from preview. Save changes to commit.', 'info');
+  
+  // Refresh modal to update clear button visibility
+  openEditStudentModal(admissionNo);
+}
+
 function renderSchoolProfilePage(container) {
   if (!canCurrentUserManageSchoolProfile()) {
     showNotification('Access Denied: School Profile is restricted to Admin and Super Admin only.', 'warning');
@@ -15691,6 +21375,12 @@ function renderSchoolProfilePage(container) {
     return;
   }
   const profile = getSchoolProfile();
+  if (!window._schoolProfileAssetsBaseline) {
+    window._schoolProfileAssetsBaseline = {
+      profile: JSON.parse(JSON.stringify(profile)),
+      signatures: JSON.parse(JSON.stringify(SchoolData.signatures || {}))
+    };
+  }
   container.innerHTML = `
     <div class="page-header">
       <div>
@@ -15702,7 +21392,7 @@ function renderSchoolProfilePage(container) {
 
     <div class="grid-2" style="align-items:start; gap:20px;">
       <div class="glass-card" style="border:2px solid #38bdf8; padding:22px;">
-        <h3 style="margin-top:0; color:#38bdf8;">Official Details</h3>
+        <h3 style="margin-top:0; color:#0284c7;">Official Details</h3>
         <label style="font-weight:800; color:var(--text-main); display:block; margin-bottom:6px;">School Name</label>
         <input id="schoolProfileName" class="session-dropdown" style="width:100%; margin-bottom:14px;" value="${profile.name}">
 
@@ -15722,9 +21412,10 @@ function renderSchoolProfilePage(container) {
             ${getSchoolLogoHtml(86)}
             <div style="font-size:0.78rem; color:var(--text-muted); margin-top:8px;">Current Logo</div>
           </div>
-          <div style="flex:1; min-width:240px;">
+          <div style="flex:1; min-width:240px; display:flex; flex-direction:column; gap:6px;">
             <label style="font-weight:800; color:var(--text-main); display:block; margin-bottom:6px;">Upload School Logo</label>
-            <input type="file" id="schoolLogoUpload" accept="image/*" class="session-dropdown" style="width:100%; margin-bottom:12px;">
+            <input type="file" id="schoolLogoUpload" accept="image/*" class="session-dropdown" style="width:100%;">
+            ${profile.logoDataUrl ? `<button onclick="clearSchoolProfileImage('logoDataUrl')" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem; color:#ef4444; border-color:#ef4444; background:none; cursor:pointer; width:fit-content;">❌ Clear Logo</button>` : ''}
           </div>
         </div>
 
@@ -15732,9 +21423,10 @@ function renderSchoolProfilePage(container) {
           <div style="min-width:96px; min-height:96px; border:1px dashed #64748b; border-radius:10px; display:flex; align-items:center; justify-content:center; padding:8px; background:#ffffff;">
             ${profile.paymentQrDataUrl ? `<img src="${profile.paymentQrDataUrl}" style="max-width:88px; max-height:88px; object-fit:contain;">` : `<span style="color:#64748b; font-weight:800; text-align:center; font-size:0.78rem;">No payment QR</span>`}
           </div>
-          <div style="flex:1; min-width:240px;">
+          <div style="flex:1; min-width:240px; display:flex; flex-direction:column; gap:6px;">
             <label style="font-weight:800; color:var(--text-main); display:block; margin-bottom:6px;">Upload Payment QR for Fee Receipts</label>
-            <input type="file" id="paymentQrUpload" accept="image/*" class="session-dropdown" style="width:100%; margin-bottom:8px;">
+            <input type="file" id="paymentQrUpload" accept="image/*" class="session-dropdown" style="width:100%;">
+            ${profile.paymentQrDataUrl ? `<button onclick="clearSchoolProfileImage('paymentQrDataUrl')" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem; color:#ef4444; border-color:#ef4444; background:none; cursor:pointer; width:fit-content;">❌ Clear QR Code</button>` : ''}
             <div style="font-size:0.78rem; color:var(--text-muted);">This QR appears on A4 receipts and thermal receipts.</div>
           </div>
         </div>
@@ -15743,9 +21435,10 @@ function renderSchoolProfilePage(container) {
           <div style="min-width:160px; min-height:60px; border:1px dashed #64748b; border-radius:8px; display:flex; align-items:center; justify-content:center; padding:8px;">
             ${profile.principalSignatureDataUrl ? `<img src="${profile.principalSignatureDataUrl}" style="max-width:150px; max-height:55px; object-fit:contain;">` : `<span style="color:var(--text-muted); font-weight:700;">No signature</span>`}
           </div>
-          <div style="flex:1; min-width:240px;">
+          <div style="flex:1; min-width:240px; display:flex; flex-direction:column; gap:6px;">
             <label style="font-weight:800; color:var(--text-main); display:block; margin-bottom:6px;">Upload Principal Signature</label>
-            <input type="file" id="principalSignatureUpload" accept="image/*" class="session-dropdown" style="width:100%; margin-bottom:12px;">
+            <input type="file" id="principalSignatureUpload" accept="image/*" class="session-dropdown" style="width:100%;">
+            ${profile.principalSignatureDataUrl ? `<button onclick="clearSchoolProfileImage('principalSignatureDataUrl')" class="btn btn-secondary" style="padding:2px 8px; font-size:0.7rem; color:#ef4444; border-color:#ef4444; background:none; cursor:pointer; width:fit-content;">❌ Clear Signature</button>` : ''}
           </div>
         </div>
 
@@ -15755,16 +21448,29 @@ function renderSchoolProfilePage(container) {
   `;
 }
 
-function saveSchoolProfileDetails() {
-  SchoolData.schoolProfile = {
+async function saveSchoolProfileDetails() {
+  const candidateProfile = {
     ...getSchoolProfile(),
     name: document.getElementById('schoolProfileName')?.value.trim() || 'Madan Mohan Malviya Junior High School',
     shortName: document.getElementById('schoolProfileShortName')?.value.trim() || 'MMM Jr High',
     address: document.getElementById('schoolProfileAddress')?.value.trim() || 'Sector 53, Noida'
   };
-  saveSchoolDataToStorage();
+  try {
+    await persistConfigurationDelta('schoolProfileDetails', 'school', {
+      name: candidateProfile.name,
+      shortName: candidateProfile.shortName,
+      address: candidateProfile.address
+    }, 'School profile details saved.');
+  } catch (error) {
+    showNotification(`School profile was not saved: ${error?.message || 'cloud rejected the change.'}`, 'error');
+    return;
+  }
+  SchoolData.schoolProfile = candidateProfile;
+  if (window._schoolProfileAssetsBaseline) {
+    window._schoolProfileAssetsBaseline.profile = JSON.parse(JSON.stringify(candidateProfile));
+    window._schoolProfileAssetsBaseline.signatures = JSON.parse(JSON.stringify(SchoolData.signatures || {}));
+  }
   applySchoolProfileToShell();
-  showNotification('School profile details saved.', 'success');
   renderSchoolProfilePage(document.getElementById('contentBody'));
 }
 
@@ -15772,13 +21478,40 @@ async function saveSchoolProfileImages() {
   const logoFile = document.getElementById('schoolLogoUpload')?.files?.[0];
   const paymentQrFile = document.getElementById('paymentQrUpload')?.files?.[0];
   const principalFile = document.getElementById('principalSignatureUpload')?.files?.[0];
-  SchoolData.schoolProfile = { ...getSchoolProfile() };
-  if (logoFile) SchoolData.schoolProfile.logoDataUrl = await fileToDataUrl(logoFile);
-  if (paymentQrFile) SchoolData.schoolProfile.paymentQrDataUrl = await fileToDataUrl(paymentQrFile);
-  if (principalFile) SchoolData.schoolProfile.principalSignatureDataUrl = await fileToDataUrl(principalFile);
-  saveSchoolDataToStorage();
+  const candidateProfile = { ...getSchoolProfile() };
+  const candidateSignatures = { ...(SchoolData.signatures || {}) };
+  if (logoFile) candidateProfile.logoDataUrl = await compressImageToDataUrl(logoFile, 200, 200);
+  if (paymentQrFile) candidateProfile.paymentQrDataUrl = await compressImageToDataUrl(paymentQrFile, 250, 250);
+  if (principalFile) {
+    const url = await compressImageToDataUrl(principalFile, 250, 100);
+    candidateProfile.principalSignatureDataUrl = url;
+    candidateSignatures.principalSig = url;
+  }
+  try {
+    await persistConfigurationDelta('schoolAssets', 'school', {
+      profileAssets: {
+        logoDataUrl: candidateProfile.logoDataUrl || '',
+        paymentQrDataUrl: candidateProfile.paymentQrDataUrl || '',
+        principalSignatureDataUrl: candidateProfile.principalSignatureDataUrl || ''
+      },
+      signatures: candidateSignatures
+    }, 'School logo, payment QR, and signature saved.');
+  } catch (error) {
+    const baseline = window._schoolProfileAssetsBaseline;
+    if (baseline) {
+      SchoolData.schoolProfile = baseline.profile;
+      SchoolData.signatures = baseline.signatures;
+    }
+    showNotification(`School images were not saved: ${error?.message || 'cloud rejected the change.'}`, 'error');
+    renderSchoolProfilePage(document.getElementById('contentBody'));
+    return;
+  }
+  SchoolData.schoolProfile = candidateProfile;
+  SchoolData.signatures = candidateSignatures;
+  try { localStorage.setItem('school_signatures', JSON.stringify(candidateSignatures)); } catch (e) {}
+  saveSchoolDataToStorage({ skipCloudPush: true });
+  delete window._schoolProfileAssetsBaseline;
   applySchoolProfileToShell();
-  showNotification('School logo, payment QR, and signature saved.', 'success');
   renderSchoolProfilePage(document.getElementById('contentBody'));
 }
 
@@ -15818,7 +21551,7 @@ function resetAppearanceSettings() {
   window.location.reload();
 }
 
-function saveStudentTelegramUidLink(admissionNo) {
+async function saveStudentTelegramUidLink(admissionNo) {
   const lookup = getSingleStudentByAdmissionForTelegram(admissionNo, 'Save Telegram link');
   const student = lookup.student;
   if (!student) {
@@ -15826,27 +21559,39 @@ function saveStudentTelegramUidLink(admissionNo) {
     return;
   }
 
+  const before = JSON.parse(JSON.stringify(student));
   ensureStudentTelegramFields(student);
   student.nfcUid = document.getElementById(`linkUid_${admissionNo}`)?.value.trim() || '';
   setStudentSchoolChatId(student, document.getElementById(`linkChat_${admissionNo}`)?.value.trim() || '');
   student.telegramUserName = document.getElementById(`linkUser_${admissionNo}`)?.value.trim() || '';
-  saveSchoolDataToStorage();
-  showNotification(`Saved Chat ID and NFC UID for ${student.name}.`, 'success');
+  try {
+    await persistStudentMasterDelta([buildStudentMasterRecord(student, { intent: 'contact_link', originalAdmissionNo: admissionNo })], `Saved Chat ID and NFC UID for ${student.name}.`);
+  } catch (error) {
+    Object.keys(student).forEach(key => { delete student[key]; });
+    Object.assign(student, before);
+    throw error;
+  }
   renderTelegramLinksPage(document.getElementById('contentBody'));
 }
 
-function saveStudentTelegramUidLinkByIndex(studentIndex) {
+async function saveStudentTelegramUidLinkByIndex(studentIndex) {
   const index = Number(studentIndex);
   const student = Number.isInteger(index) ? SchoolData.students[index] : null;
   if (!student) {
     showNotification('Student row not found. Refresh and try again.', 'error');
     return;
   }
+  const before = JSON.parse(JSON.stringify(student));
   ensureStudentTelegramFields(student);
   setStudentSchoolChatId(student, document.getElementById(`linkSchoolChat_${index}`)?.value.trim() || '');
   student.telegramUserName = document.getElementById(`linkUser_${index}`)?.value.trim() || '';
-  saveSchoolDataToStorage();
-  showNotification(`Saved school bot Chat ID for ${student.name} (Adm: ${student.admissionNo}).`, 'success');
+  try {
+    await persistStudentMasterDelta([buildStudentMasterRecord(student, { intent: 'contact_link', originalAdmissionNo: student.admissionNo })], `Saved school bot Chat ID for ${student.name} (Adm: ${student.admissionNo}).`);
+  } catch (error) {
+    Object.keys(student).forEach(key => { delete student[key]; });
+    Object.assign(student, before);
+    throw error;
+  }
   renderTelegramLinksPage(document.getElementById('contentBody'));
 }
 
@@ -15903,6 +21648,7 @@ async function fetchTelegramNamesForLinkedStudents() {
 
   showNotification(`Fetching Telegram names for ${linkedStudents.length} linked student record(s)...`, 'info');
   let updated = 0;
+  const tracker = captureStudentMasterChangeSet();
   const seenChatNames = new Map();
 
   for (const student of linkedStudents) {
@@ -15919,9 +21665,16 @@ async function fetchTelegramNamesForLinkedStudents() {
     }
   }
 
-  saveSchoolDataToStorage();
+  if (updated) {
+    try {
+      await persistStudentMasterDelta(buildChangedStudentMasterRecords(tracker, { intent: 'contact_link' }), `Fetched and saved ${updated} Telegram user name(s).`);
+    } catch (error) {
+      applySchoolDataStoragePayload(tracker.payload, { allowEmpty: true });
+      throw error;
+    }
+  }
   renderTelegramLinksPage(document.getElementById('contentBody'));
-  showNotification(updated ? `Fetched and saved ${updated} Telegram user name(s).` : 'Telegram names could not be fetched. Parent must start the bot, or add names by CSV.', updated ? 'success' : 'warning');
+  if (!updated) showNotification('Telegram names could not be fetched. Parent must start the bot, or add names by CSV.', 'warning');
 }
 
 function downloadContactUidCsvTemplate() {
@@ -15989,7 +21742,7 @@ function openContactUidCsvUpdateModal() {
     <div class="modal-overlay active" id="contactUidCsvModal" style="z-index:99999;">
       <div class="modal-box" style="max-width:720px; background:#0f172a; color:#ffffff; border:2px solid #38bdf8; border-radius:16px; padding:22px; position:relative;">
         <button onclick="document.getElementById('contactUidCsvModal').remove()" style="position:absolute; top:12px; right:14px; background:#334155; color:#fff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer;">X</button>
-        <h3 style="margin-top:0; color:#38bdf8; font-family:var(--font-heading);"><i class="fa-solid fa-file-csv"></i> Import Parent Chat IDs from CSV</h3>
+        <h3 style="margin-top:0; color:#0284c7; font-family:var(--font-heading);"><i class="fa-solid fa-file-csv"></i> Import Parent Chat IDs from CSV</h3>
         <p style="color:#cbd5e1; font-size:0.9rem;">This update matches student rows by AdmissionNo. It will not delete students and will not create duplicate student records.</p>
         <div style="background:#111827; border:1px solid #334155; border-radius:10px; padding:14px; margin:14px 0;">
           Student rows: <code>RecordType=student</code>, <code>AdmissionNo</code>, <code>TelegramChatId</code>, <code>TelegramUserName</code><br>
@@ -16014,7 +21767,7 @@ function importContactUidCsvUpdate() {
   }
 
   const reader = new FileReader();
-  reader.onload = function(e) {
+  reader.onload = async function(e) {
     const rows = parseSimpleCsvRows(e.target.result);
     if (rows.length < 2) {
       showNotification('CSV must include a header row and at least one data row.', 'error');
@@ -16028,13 +21781,28 @@ function importContactUidCsvUpdate() {
       return obj;
     });
 
+    const tracker = captureStudentMasterChangeSet();
+    ensureStaffUserIds();
+    const staffBefore = new Map((SchoolData.staffUsers || []).map(user => [String(user.id || ''), JSON.stringify(user)]));
     const result = applyContactUidRowsToStudents(dataRows, { updateAttendance: false });
     const staffResult = applyStaffContactRowsFromCsv(dataRows);
-    repairDuplicateNfcUidAssignments();
+    try {
+      const staffUpserts = (SchoolData.staffUsers || []).filter(user => staffBefore.get(String(user.id || '')) !== JSON.stringify(user));
+      if (staffUpserts.length) {
+        await persistDirectoryDelta({ scope: 'staff', staffUpserts }, null, { allowQueue: false });
+      }
+      const studentRecords = buildChangedStudentMasterRecords(tracker, { intent: 'contact_link' });
+      if (studentRecords.length) await persistStudentMasterDelta(studentRecords, null);
+    } catch (error) {
+      applySchoolDataStoragePayload(tracker.payload, { allowEmpty: true });
+      if (typeof pullSchoolDataFromCloud === 'function') {
+        try { await pullSchoolDataFromCloud({ force: true }); } catch (pullError) {}
+      }
+      return;
+    }
     document.getElementById('contactUidCsvModal')?.remove();
-    saveSchoolDataToStorage();
     const staffNote = staffResult.updated ? ` ${staffResult.updated} old-format staff row(s) also updated.` : '';
-    showNotification(`CSV import complete: ${result.updated} student parent Chat ID record(s) updated.${staffNote}`, 'success');
+    showNotification(`CSV import saved to cloud: ${result.updated} student parent Chat ID record(s) updated.${staffNote}`, 'success');
     renderTelegramLinksPage(document.getElementById('contentBody'));
   };
   reader.readAsText(file);
@@ -16042,6 +21810,7 @@ function importContactUidCsvUpdate() {
 
 async function syncTelegramRegistrationsNow(options) {
   const silent = options && options.silent;
+  const tracker = captureStudentMasterChangeSet();
   if (!silent) {
     showNotification('Syncing @mmmjhschoolbot registrations from Google Sheet...', 'info');
   }
@@ -16081,6 +21850,8 @@ async function syncTelegramRegistrationsNow(options) {
     }
 
     const result = applyContactUidRowsToStudents(rows, { updateAttendance: false });
+    const records = buildChangedStudentMasterRecords(tracker, { intent: 'contact_link' });
+    if (records.length) await persistStudentMasterDelta(records, null);
     if (!silent || result.updated > 0) {
       renderTelegramLinksPage(document.getElementById('contentBody'), { skipAutoSyncRestart: true });
     }
@@ -16089,10 +21860,11 @@ async function syncTelegramRegistrationsNow(options) {
       showNotification(`Synced ${result.updated} school bot registration record(s) from Google Sheet.`, result.updated ? 'success' : 'info');
     }
   } catch (err) {
+    applySchoolDataStoragePayload(tracker.payload, { allowEmpty: true });
     console.log('School bot registration sync failed:', err);
     if (!silent) {
       setTimeout(() => {
-        showNotification('Backend sheet sync unavailable. Check Render bot service and Google Apps Script.', 'warning');
+        showNotification('Backend sheet sync unavailable. Check the Vercel bot API and Google Apps Script.', 'warning');
         if (window.location.hash === '#telegram-links') renderTelegramLinksPage(document.getElementById('contentBody'));
       }, 1400);
     }
@@ -16130,7 +21902,7 @@ function renderTelegramBotPage(container) {
           <strong>Purpose:</strong> Sends <strong>Fee Receipts (PDFs), Fee Dues Reminders, Holiday Circulars & School SMS Notices</strong>.
         </p>
         <div style="padding:10px; background:#0f172a; border-radius:8px; border:1px solid #334155; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-          <span style="font-size:0.78rem; color:#94a3b8; font-weight:700;">Token: <code style="color:#fbbf24;">8753514044:AAED...</code></span>
+          <span style="font-size:0.78rem; color:#94a3b8; font-weight:700;">Token: <code style="color:#b45309;">8753514044:AAED...</code></span>
           <button class="btn btn-primary" onclick="sendTelegramNoticeTest()" style="padding:5px 12px; font-size:0.8rem; background:#16a34a; border:none; font-weight:800;">
             Test Fee Notice (@mmmjhschoolbot)
           </button>
@@ -16148,13 +21920,13 @@ function renderTelegramBotPage(container) {
       </p>
 
       <div style="padding:14px; background:#0f172a; border-radius:10px; border:1px solid #334155; font-size:0.92rem; color:#ffffff; margin-bottom:18px;">
-          <strong>Instruction for Parents:</strong> Open Telegram, search <strong style="color:#38bdf8;">@mmmjhschoolbot</strong>, then send <code style="color:#22c55e; font-size:1.05rem; font-weight:800;">/link 1898</code> or <code style="color:#22c55e; font-size:1.05rem; font-weight:800;">/register 1898</code> <span style="color:#cbd5e1; font-size:0.85rem;">(Replace 1898 with child's Admission No)</span>
+          <strong>Instruction for Parents:</strong> Open Telegram, search <strong style="color:#0284c7;">@mmmjhschoolbot</strong>, then send <code style="color:#22c55e; font-size:1.05rem; font-weight:800;">/link 1898</code> or <code style="color:#22c55e; font-size:1.05rem; font-weight:800;">/register 1898</code> <span style="color:#cbd5e1; font-size:0.85rem;">(Replace 1898 with child's Admission No)</span>
       </div>
 
       <!-- TEST /LINK SIMULATOR BOX -->
       <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
         <div style="flex:1; min-width:260px;">
-          <label style="font-size:0.8rem; font-weight:700; color:#cbd5e1;">Test Parent Command (<code>/link</code> or <code>/register</code>):</label>
+          <label style="font-size:0.8rem; font-weight:700; color:#374151;">Test Parent Command (<code>/link</code> or <code>/register</code>):</label>
           <input type="text" id="simLinkInput" class="session-dropdown" style="width:100%; margin-top:4px; font-weight:700; color:#22c55e; border:1.5px solid #22c55e;" value="/link 1658" placeholder="e.g. /link 1658">
         </div>
         <div style="margin-top:18px;">
@@ -16206,7 +21978,7 @@ function renderTelegramBotPage(container) {
         <button class="btn btn-secondary" style="background:rgba(245, 158, 11, 0.15); color:#f59e0b; border:1px solid #f59e0b; font-weight:800;" onclick="loadBroadcastTemplate('holiday')">
           Holiday Notice
         </button>
-        <button class="btn btn-secondary" style="background:rgba(56, 189, 248, 0.15); color:#38bdf8; border:1px solid #38bdf8; font-weight:800;" onclick="loadBroadcastTemplate('exam')">
+        <button class="btn btn-secondary" style="background:rgba(56, 189, 248, 0.15); color:#0284c7; border:1px solid #38bdf8; font-weight:800;" onclick="loadBroadcastTemplate('exam')">
           Exam Schedule Alert
         </button>
         <button class="btn btn-secondary" style="background:rgba(16, 185, 129, 0.15); color:#34d399; border:1px solid #10b981; font-weight:800;" onclick="loadBroadcastTemplate('fee')">
@@ -16216,7 +21988,7 @@ function renderTelegramBotPage(container) {
 
       <div class="grid-2" style="gap:16px; margin-bottom:16px;">
         <div>
-          <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Target Audience / Recipient:</label>
+          <label style="font-size:0.82rem; font-weight:700; color:#374151;">Target Audience / Recipient:</label>
           <select id="broadcastTarget" class="session-dropdown" style="width:100%; margin-top:4px; font-weight:700;">
             <option value="ALL">All Parents (Whole School)</option>
             <option value="ADMISSION">Individual Admission No(s)</option>
@@ -16237,7 +22009,7 @@ function renderTelegramBotPage(container) {
         </div>
 
         <div>
-          <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Broadcast Category:</label>
+          <label style="font-size:0.82rem; font-weight:700; color:#374151;">Broadcast Category:</label>
           <select id="broadcastCategory" class="session-dropdown" style="width:100%; margin-top:4px; font-weight:700;">
             <option value="Emergency SOS">Emergency SOS</option>
             <option value="School Holiday">School Holiday Notice</option>
@@ -16248,13 +22020,13 @@ function renderTelegramBotPage(container) {
       </div>
 
       <div style="margin-bottom:16px;">
-        <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Admission No(s) for Individual Message:</label>
+        <label style="font-size:0.82rem; font-weight:700; color:#374151;">Admission No(s) for Individual Message:</label>
         <input type="text" id="broadcastAdmissionNos" class="session-dropdown" style="width:100%; margin-top:4px; font-weight:700;" placeholder="Example: 1898 or 1898, 1740, 1239" oninput="if(this.value.trim()){document.getElementById('broadcastTarget').value='ADMISSION';}">
         <small style="color:#94a3b8;">Typing here automatically sends only to these admission number(s).</small>
       </div>
 
       <div style="margin-bottom:16px;">
-        <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Message Text Content:</label>
+        <label style="font-size:0.82rem; font-weight:700; color:#374151;">Message Text Content:</label>
         <textarea id="broadcastMessageText" class="session-dropdown" rows="4" style="width:100%; padding:12px; margin-top:4px; font-size:0.95rem; font-family:sans-serif;" placeholder="Type custom announcement message here..."></textarea>
       </div>
 
@@ -16267,7 +22039,7 @@ function renderTelegramBotPage(container) {
 
     <!-- STAFF / TEACHER TELEGRAM MESSAGE CONSOLE -->
     <div class="glass-card" style="margin-bottom:24px; border:2px solid #0ea5e9; padding:22px;">
-      <h3 style="margin-top:0; color:#38bdf8; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+      <h3 style="margin-top:0; color:#0284c7; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
         <i class="fa-solid fa-chalkboard-user"></i> Teacher & Staff Telegram Message
       </h3>
       <p style="font-size:0.85rem; color:#cbd5e1; margin-bottom:14px;">
@@ -16275,7 +22047,7 @@ function renderTelegramBotPage(container) {
       </p>
       <div class="grid-2" style="gap:14px; margin-bottom:12px;">
         <div>
-          <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Select Staff / Teacher:</label>
+          <label style="font-size:0.82rem; font-weight:700; color:#374151;">Select Staff / Teacher:</label>
           <select id="staffTelegramRecipient" class="session-dropdown" style="width:100%; margin-top:4px; font-weight:700;">
             ${(() => {
               ensureStaffUserIds();
@@ -16284,7 +22056,7 @@ function renderTelegramBotPage(container) {
           </select>
         </div>
         <div>
-          <label style="font-size:0.82rem; font-weight:700; color:#cbd5e1;">Quick Message Type:</label>
+          <label style="font-size:0.82rem; font-weight:700; color:#374151;">Quick Message Type:</label>
           <select id="staffTelegramCategory" class="session-dropdown" style="width:100%; margin-top:4px; font-weight:700;">
             <option value="General Staff Notice">General Staff Notice</option>
             <option value="Timetable Notice">Timetable Notice</option>
@@ -16305,7 +22077,7 @@ function renderTelegramBotPage(container) {
     <div class="glass-card" style="margin-bottom:24px; border:2px solid #38bdf8; padding:22px;">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:12px;">
         <div>
-          <h3 style="font-family:var(--font-heading); color:#38bdf8; margin:0; display:flex; align-items:center; gap:10px;">
+          <h3 style="font-family:var(--font-heading); color:#0284c7; margin:0; display:flex; align-items:center; gap:10px;">
             <i class="fa-solid fa-address-book"></i> Parent Telegram Chat ID Directory per Student
           </h3>
           <small style="color:var(--text-muted);">View exact numeric Telegram Chat IDs linked per student. Admin can manually link or update any parent Chat ID.</small>
@@ -16333,13 +22105,13 @@ function renderTelegramBotPage(container) {
               const isLinked = !!schoolChatId;
               return `
                 <tr class="tg-student-row" data-search="${s.admissionNo} ${s.name.toLowerCase()} ${(s.parentPhone || '').toLowerCase()}">
-                  <td><code style="color:#38bdf8; font-weight:bold;">${s.admissionNo}</code></td>
+                  <td><code style="color:#0284c7; font-weight:bold;">${s.admissionNo}</code></td>
                   <td><strong>${s.name}</strong></td>
                   <td><span class="badge badge-purple">${s.currentClass || 'Class 5'} - ${s.currentSection || 'A'}</span></td>
                   <td>${s.parentName || 'Parent'}</td>
                   <td>${s.parentPhone || 'N/A'}</td>
                   <td>
-                    ${isLinked ? `<code style="color:#34d399; font-weight:bold;">${schoolChatId}</code>` : `<span style="color:#94a3b8; font-style:italic;">Not Linked</span>`}
+                    ${isLinked ? `<code style="color:#047857; font-weight:bold;">${schoolChatId}</code>` : `<span style="color:#94a3b8; font-style:italic;">Not Linked</span>`}
                   </td>
                   <td>
                     ${isLinked ? `<span class="badge badge-success"><i class="fa-solid fa-check"></i> Linked</span>` : `<span class="badge badge-warning">Unlinked</span>`}
@@ -16489,7 +22261,7 @@ function filterTelegramStudentDirectoryTable() {
   });
 }
 
-function editParentTelegramChatId(admissionNo) {
+async function editParentTelegramChatId(admissionNo) {
   const student = SchoolData.students.find(s => s.admissionNo === admissionNo);
   if (!student) return;
 
@@ -16498,14 +22270,19 @@ function editParentTelegramChatId(admissionNo) {
 
   if (newChatId !== null) {
     setStudentSchoolChatId(student, newChatId.trim());
-    saveSchoolDataToStorage();
+    try {
+      await persistStudentMasterDelta([buildStudentMasterRecord(student, { intent: 'contact_link', originalAdmissionNo: admissionNo })], null);
+    } catch (error) {
+      setStudentSchoolChatId(student, currentId);
+      return;
+    }
 
     if (getStudentSchoolChatId(student)) {
-      showNotification(`School bot Chat ID linked to ${student.name}: ${getStudentSchoolChatId(student)}`, 'success');
+      showNotification(`School bot Chat ID linked to ${student.name} and confirmed in cloud: ${getStudentSchoolChatId(student)}`, 'success');
       // Send confirmation to parent's telegram
-      sendRawTelegramReply(getStudentSchoolChatId(student), `*Telegram Alert Notifications Active*\n\nDear *${getTelegramDisplayName(student)}*, your phone has been linked to *${student.name}* (${student.currentClass} - ${student.currentSection}) for school notices and fee messages.`);
+      await sendRawTelegramReply(getStudentSchoolChatId(student), `*Telegram Alert Notifications Active*\n\nDear *${getTelegramDisplayName(student)}*, your phone has been linked to *${student.name}* (${student.currentClass} - ${student.currentSection}) for school notices and fee messages.`);
     } else {
-      showNotification(`Telegram Chat ID unlinked for ${student.name}`, 'info');
+      showNotification(`Telegram Chat ID unlinked for ${student.name} and confirmed in cloud.`, 'info');
     }
 
     renderTelegramBotPage(document.getElementById('contentBody'));
@@ -16586,7 +22363,6 @@ function buildSchoolBotFeesMessage(student) {
   if (status.tuitionDue > 0) lines.push(`Tuition Fee: Rs ${status.tuitionDue}${months.length ? ` (${months.join(', ')})` : ''}`);
   if (status.annualDue > 0) lines.push(`Annual Charges: Rs ${status.annualDue}`);
   if (status.examDue > 0) lines.push(`Exam Fee: Rs ${status.examDue}`);
-  if (status.computerDue > 0) lines.push(`Computer/Lab Fee: Rs ${status.computerDue}`);
 
   const dueText = status.totalDue > 0
     ? `${lines.join('\n')}\n\nTotal Pending: *Rs ${status.totalDue}*`
@@ -16633,7 +22409,7 @@ For safety, this bot will not link or send private student details until the dup
   sendRawTelegramReply(chatId, reply);
 }
 
-function processIncomingTelegramBotCommand(chatId, text, senderName) {
+async function processIncomingTelegramBotCommand(chatId, text, senderName) {
   if (!text) return;
   const parts = text.trim().split(/\s+/);
   const firstRaw = parts[0] || '';
@@ -16706,18 +22482,16 @@ function processIncomingTelegramBotCommand(chatId, text, senderName) {
     }
 
     if (student) {
+      const priorChatId = getStudentSchoolChatId(student);
+      const priorTelegramName = student.telegramUserName || '';
       setStudentSchoolChatId(student, chatId);
       student.telegramUserName = senderName || student.telegramUserName || '';
-      saveSchoolDataToStorage();
 
       const pName = getTelegramDisplayName(student, senderName);
       const sName = student.name;
       const clsSec = getSchoolBotClassSection(student);
 
-      const successReply = `*Successfully Linked!*\n\nDear ${pName}, your ward *${sName}* (${clsSec}) has been successfully connected to @mmmjhschoolbot.\n\nYou will now receive fee receipts, fee reminders, school notices, and exam report cards directly on this phone.`;
-      sendRawTelegramReply(chatId, successReply);
-
-      SchoolData.telegramLogs.unshift({
+      const logRow = {
         id: Date.now(),
         time: new Date().toLocaleString(),
         recipient: `${pName} (Ward: ${sName})`,
@@ -16725,10 +22499,22 @@ function processIncomingTelegramBotCommand(chatId, text, senderName) {
         type: "School Chat ID Auto-Linked",
         text: `Parent linked via @mmmjhschoolbot command '/${cmd} ${admNo}' for ward ${sName}${lookup.duplicateCount > 1 ? ` (ERP had ${lookup.duplicateCount} matching admission records; first active match used)` : ''}`,
         status: "Linked to School Notice Bot"
-      });
-      saveSchoolDataToStorage();
+      };
+      SchoolData.telegramLogs.unshift(logRow);
+      try {
+        await persistStudentMasterDelta([buildStudentMasterRecord(student, { intent: 'contact_link', originalAdmissionNo: admNo })], null);
+        saveSchoolDataToStorage({ skipCloudPush: true });
+      } catch (error) {
+        setStudentSchoolChatId(student, priorChatId);
+        student.telegramUserName = priorTelegramName;
+        SchoolData.telegramLogs = (SchoolData.telegramLogs || []).filter((row) => row !== logRow);
+        await sendRawTelegramReply(chatId, '*Link Not Saved*\n\nThe ERP cloud could not confirm this link. Please ask the school office to retry after refreshing the ERP.');
+        return;
+      }
 
-      showNotification(`@mmmjhschoolbot Chat ID ${chatId} linked to ${pName} (Ward: ${sName}).`, 'success');
+      const successReply = `*Successfully Linked!*\n\nDear ${pName}, your ward *${sName}* (${clsSec}) has been successfully connected to @mmmjhschoolbot.\n\nYou will now receive fee receipts, fee reminders, school notices, and exam report cards directly on this phone.`;
+      await sendRawTelegramReply(chatId, successReply);
+      showNotification(`@mmmjhschoolbot Chat ID ${chatId} linked to ${pName} (Ward: ${sName}) and confirmed in cloud.`, 'success');
       renderTelegramBotPage(document.getElementById('contentBody'));
     } else {
       const notFoundReply = `*Student Not Found*\n\nNo student registered with Admission No *${admNo}*. Please check the admission number on your school ID card or fee receipt.`;
@@ -16774,26 +22560,42 @@ async function refreshStudentTelegramRegistrationForSend(student) {
       return { ok: false, error: `Registration ${admissionNo} has no Telegram Chat ID.` };
     }
 
+    const before = JSON.parse(JSON.stringify(student));
     setStudentSchoolChatId(student, registration.telegramChatId);
     if (registration.telegramUserName) student.telegramUserName = registration.telegramUserName;
-    saveSchoolDataToStorage();
+    try {
+      await persistStudentMasterDelta([buildStudentMasterRecord(student, { intent: 'contact_link', originalAdmissionNo: admissionNo })], null);
+    } catch (error) {
+      Object.keys(student).forEach(key => { delete student[key]; });
+      Object.assign(student, before);
+      throw error;
+    }
     return { ok: true, chatId: registration.telegramChatId };
   } catch (err) {
     return { ok: false, error: err?.message || 'Telegram registration refresh failed.' };
   }
 }
 
-const MMMJHS_BOT_API_URL = 'https://mmmjhschoolbot.onrender.com/api/mmmjhs-bot';
+function isLiveSchoolWebsiteHost() {
+  const h = String(window.location.hostname || '').replace(/^www\./, '').toLowerCase();
+  return h === 'mmmjhschool.com'
+    || h.endsWith('.vercel.app')
+    || h === 'madanmohanmalviyaschool.com'
+    || h.includes('mmmjhschool');
+}
 
 function getMmmjhsBotApiBase() {
   const override = String(window.MMMJHS_BOT_API_URL || '').trim();
   if (override) return override.replace(/\?.*$/, '').replace(/\/$/, '');
   const host = window.location.hostname;
   if (host === 'localhost' || host === '127.0.0.1') {
-    const botPort = String(window.MMMJHS_BOT_LOCAL_PORT || '8080').trim();
+    // A local ERP preview serves both the website and API from the same port.
+    // Prefer that actual browser port over the historical separate-bot default.
+    const botPort = String(window.MMMJHS_BOT_LOCAL_PORT || window.location.port || '8080').trim();
     return `${window.location.protocol}//${host}:${botPort}/api/mmmjhs-bot`;
   }
-  return MMMJHS_BOT_API_URL;
+  // Every deployed site uses its same-origin Vercel serverless API.
+  return '/api/mmmjhs-bot';
 }
 
 function mmmjhsBotEndpoint(action) {
@@ -16828,7 +22630,7 @@ function sendRawTelegramReply(chatId, textMsg) {
   return postMmmjhsBotAction('sendMessage', {
     chatId,
     text: sanitizeTelegramText(textMsg)
-  }).catch(err => console.log("@mmmjhschoolbot Render send error:", err));
+  }).catch(err => console.log("@mmmjhschoolbot send error:", err));
 }
 
 async function recordMmmjhsBotSheetLog(type, payload) {
@@ -16854,9 +22656,8 @@ function buildFeeDueSheetPayload(student, chatId, statusText = 'Sent') {
     SchoolBotChatId: chatId || getStudentSchoolChatId(student),
     DueMonths: (feeInfo?.overdueMonths || []).join(', '),
     TuitionDue: feeInfo?.tuitionDue || '',
-    ExamFeeDue: feeInfo?.examFeeDue || '',
-    ComputerFeeDue: feeInfo?.computerFeeDue || '',
-    AnnualFeeDue: feeInfo?.annualFeeDue || '',
+    ExamFeeDue: feeInfo?.examDue || '',
+    AnnualFeeDue: feeInfo?.annualDue || '',
     PreviousSessionDue: student.currentFeeInfo?.previousSessionDue || '',
     TotalDue: feeInfo?.totalDue || '',
     SentBy: getErpLogUserName(),
@@ -16875,7 +22676,6 @@ function buildStudentFeeSheetSyncPayload(student) {
     DueMonths: (status.overdueMonths || []).join(', '),
     TuitionDue: fmt(monthlyTuition),
     ExamFeeDue: fmt(status.examDue),
-    ComputerFeeDue: fmt(status.computerDue),
     AnnualFeeDue: fmt(status.annualDue),
     PreviousSessionDue: fmt(fee.previousSessionDue),
     TotalDue: fmt(status.totalDue)
@@ -16890,7 +22690,7 @@ async function syncStudentFeesToGoogleSheet(options) {
     return;
   }
   const payloads = students.map(buildStudentFeeSheetSyncPayload);
-  const batchSize = 200;
+  const batchSize = 75;
   const batches = [];
   for (let i = 0; i < payloads.length; i += batchSize) {
     batches.push(payloads.slice(i, i + batchSize));
@@ -16915,7 +22715,7 @@ async function syncStudentFeesToGoogleSheet(options) {
       if (Array.isArray(data.results)) allResults.push(...data.results);
     }
     const base = getMmmjhsBotApiBase();
-    const localHint = /localhost|127\.0\.0\.1/.test(base) ? ' (local bot)' : '';
+    const localHint = /localhost|127\.0\.0\.1/.test(base) ? ' (local bot)' : (base.startsWith('/') ? ' (Vercel)' : '');
     const summary = { ok: true, dryRun, updated, missing, results: allResults, batches: batches.length };
     if (dryRun) {
       console.log('Fee sync preview:', summary);
@@ -16933,7 +22733,7 @@ async function syncStudentFeesToGoogleSheet(options) {
   } catch (err) {
     console.error('Fee sync error:', err);
     showNotification(
-      `Fee sync failed: ${err.message}. For local test: run "npm start" in mmm-school-erp with GOOGLE_SCRIPT_URL set.`,
+      `Fee sync failed: ${err.message}. In Vercel, add GOOGLE_SCRIPT_URL in Project → Settings → Environment Variables. Cloud sync uses /api on this site.`,
       'error'
     );
     return { ok: false, error: err.message };
@@ -16991,7 +22791,7 @@ async function triggerSingleFeeReminder(admissionNo, customMsg) {
 
   const fullMsg = `Dear ${parentName}, your ward *${studentName}* (${clsSec}):\n\n${bodyText}`;
 
-  // Send through the Render bot backend so Telegram token stays server-side.
+  // Send through the Vercel bot backend so the Telegram token stays server-side.
   // Telegram delivery and Google Sheet logging are separate operations: a log
   // failure must never be reported as a Telegram delivery failure.
   let sendData;
@@ -17035,7 +22835,7 @@ async function triggerSingleFeeReminder(admissionNo, customMsg) {
       const feeDueData = buildFeeDueSheetPayload(student, chatId, 'Sent');
       // The live workbook uses the original seven-column Fee_Due_Messages
       // layout: Timestamp, AdmissionNo, StudentName, SchoolBotChat, TotalDue,
-      // MessageText, Status. Render appends by position, so align the values to
+      // MessageText, Status. The Apps Script endpoint appends by position, so align the values to
       // that established layout until the backend schema migration is deployed.
       await recordMmmjhsBotSheetLog('fee_due', {
         AdmissionNo: feeDueData.AdmissionNo,
@@ -17046,7 +22846,6 @@ async function triggerSingleFeeReminder(admissionNo, customMsg) {
         DueMonths: 'Sent',
         TuitionDue: '',
         ExamFeeDue: '',
-        ComputerFeeDue: '',
         AnnualFeeDue: '',
         PreviousSessionDue: '',
         TotalDue: '',
@@ -17086,7 +22885,7 @@ function triggerBulkFeeReminder() {
   const students = getStudentsByActiveSession();
   let count = 0;
   students.forEach(s => {
-    if (s.currentFeeInfo && s.currentFeeInfo.dueMonths.length > 0) {
+    if (getStudentTotalDueAmount(s) > 0) {
       triggerSingleFeeReminder(s.admissionNo);
       count++;
     }
@@ -17242,7 +23041,7 @@ function openNfcHardwareConfigModal() {
     <div class="modal-overlay active" id="nfcHwModal" style="z-index:999999; backdrop-filter:blur(8px);">
       <div class="modal-box" style="max-width:680px; width:95%; background:#0f172a; color:#ffffff; padding:24px; border-radius:20px; border:2px solid #38bdf8; box-shadow:0 25px 50px -12px rgba(0,0,0,0.85);">
         <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; padding-bottom:14px; margin-bottom:16px;">
-          <h3 style="margin:0; color:#38bdf8; font-size:1.2rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
+          <h3 style="margin:0; color:#0284c7; font-size:1.2rem; font-weight:800; font-family:var(--font-heading); display:flex; align-items:center; gap:10px;">
             <i class="fa-solid fa-microchip"></i> Hardware ESP8266 + PN532 Connection Setup
           </h3>
           <button onclick="document.getElementById('nfcHwModal').remove()" style="background:#334155; color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer; font-size:1rem;">X</button>
@@ -17260,23 +23059,23 @@ function openNfcHardwareConfigModal() {
           </button>
         </div>
 
-        <div style="display:flex; flex-direction:column; gap:14px; max-height:400px; overflow-y:auto; font-size:0.88rem; color:#cbd5e1;">
+        <div style="display:flex; flex-direction:column; gap:14px; max-height:400px; overflow-y:auto; font-size:0.88rem; color:#374151;">
           <div style="background:rgba(56,189,248,0.1); border:1px solid #38bdf8; padding:12px; border-radius:10px;">
-            <h4 style="margin:0 0 6px 0; color:#38bdf8;"><i class="fa-solid fa-usb"></i> Method 1: Web Serial USB Connection (Plug & Play)</h4>
+            <h4 style="margin:0 0 6px 0; color:#0284c7;"><i class="fa-solid fa-usb"></i> Method 1: Web Serial USB Connection (Plug & Play)</h4>
             <p style="margin:0 0 8px 0;">Plug your ESP8266 into your PC's USB port. Click <strong>"1-Click Connect USB"</strong> above and select your ESP8266 COM Port (e.g. CH340 / CP2102). Any tapped card will instantly mark attendance!</p>
           </div>
 
           <div style="background:rgba(16,185,129,0.1); border:1px solid #10b981; padding:12px; border-radius:10px;">
             <h4 style="margin:0 0 6px 0; color:#34d399;"><i class="fa-solid fa-wifi"></i> Method 2: Wireless Wi-Fi Webhook (Battery Mode)</h4>
             <p style="margin:0 0 6px 0;">If your ESP8266 is running on battery via Wi-Fi, program your ESP8266 HTTP POST code to send JSON taps to:</p>
-            <code style="background:#0f172a; color:#38bdf8; padding:6px 10px; border-radius:6px; display:block; word-break:break-all; font-weight:bold; margin-top:4px;">
+            <code style="background:#0f172a; color:#0284c7; padding:6px 10px; border-radius:6px; display:block; word-break:break-all; font-weight:bold; margin-top:4px;">
               POST https://mmmjhschool.com/api/nfc-tap
             </code>
             <small style="color:#94a3b8; display:block; margin-top:4px;">JSON Payload: <code>{"uid": "53:14:17:E0", "battery": 85, "reader": "gate"}</code></small>
           </div>
 
           <div style="background:rgba(245,158,11,0.1); border:1px solid #f59e0b; padding:12px; border-radius:10px;">
-            <h4 style="margin:0 0 6px 0; color:#fbbf24;"><i class="fa-solid fa-keyboard"></i> Method 3: USB Keyboard Emulation (HID Mode)</h4>
+            <h4 style="margin:0 0 6px 0; color:#b45309;"><i class="fa-solid fa-keyboard"></i> Method 3: USB Keyboard Emulation (HID Mode)</h4>
             <p style="margin:0;">If your ESP8266 acts as a USB Keyboard device, simply tap any card anywhere inside the ERP web app. The global listener catches the UID automatically!</p>
           </div>
         </div>
@@ -17397,7 +23196,10 @@ function simulateNfcTap(rawUid) {
     inTime: existingLog.inTime && existingLog.inTime !== '--:--' ? existingLog.inTime : timeStr,
     outTime: isDepartureTap ? timeStr : (existingLog.outTime || '--:--'),
     time: existingLog.time || timeStr,
-    lastTapTime: timeStr
+    lastTapTime: timeStr,
+    source: 'erp-nfc-simulator',
+    markedAt: now.toISOString(),
+    _attendanceClientUpdatedAt: now.toISOString()
   };
 
   // LIVE REALTIME DOM UPDATES ACROSS ALL OPEN ERP TABLES:
@@ -17418,7 +23220,7 @@ function simulateNfcTap(rawUid) {
   }
   if (outTimeElem) {
     const outValue = student.attendanceLogs[dateStr].outTime || '--:--';
-    outTimeElem.innerHTML = outValue !== '--:--' ? `<i class="fa-solid fa-right-from-bracket" style="color:#c084fc;"></i> ${outValue}` : '--:--';
+    outTimeElem.innerHTML = outValue !== '--:--' ? `<i class="fa-solid fa-right-from-bracket" style="color:#6d28d9;"></i> ${outValue}` : '--:--';
     outTimeElem.style.color = outValue !== '--:--' ? '#c084fc' : '#64748b';
     outTimeElem.style.fontWeight = 'bold';
   }
@@ -17430,7 +23232,14 @@ function simulateNfcTap(rawUid) {
   const tapMode = isDepartureTap ? 'OUT / Departure' : 'IN / Arrival';
   showNotification(`NFC Tap Success: ${student.name} ${tapMode} recorded at ${timeStr}.`, 'success');
 
-  saveSchoolDataToStorage();
+  void queueAttendanceCloudSave([buildAttendanceDeltaRecord(student, dateStr)], { flushNow: true }).then(() => {
+    const status = getAttendanceCloudStatus();
+    if (status.failed || status.pending) {
+      showNotification(`Gate tap for ${student.name} remains safely queued for cloud retry.`, 'warning');
+    }
+  }).catch(error => {
+    showNotification(`Gate tap remains on this device but cloud queue failed: ${error.message}`, 'warning');
+  });
 
   // 3. ACTIVE FORM PROTECTION: If accountant is currently busy collecting fee in a modal, do NOT interrupt!
   const activeModal = document.querySelector('.modal-overlay.active');
@@ -17464,11 +23273,11 @@ function openNfcTapSuccessModal(student, timeStr) {
         </div>
 
         <div style="display:flex; align-items:center; justify-content:center; gap:16px; background:#1e293b; padding:14px; border-radius:12px; border:1px solid #334155; margin-bottom:18px; text-align:left;">
-          <img src="${student.photo}" style="width:60px; height:60px; border-radius:50%; border:2px solid #10b981; object-fit:cover;">
+          ${getStudentDirectoryPhotoHtml(student, 60)}
           <div>
             <h3 style="margin:0 0 2px 0; color:#ffffff; font-size:1.15rem; font-weight:700;">${student.name}</h3>
             <div style="font-size:0.8rem; color:#94a3b8;">
-              Adm No: <code style="color:#6366f1;">${student.admissionNo}</code> | Class: <strong style="color:#38bdf8;">${cls} - ${sec}</strong>
+              Adm No: <code style="color:#6366f1;">${student.admissionNo}</code> | Class: <strong style="color:#0284c7;">${cls} - ${sec}</strong>
             </div>
             <div style="font-size:0.75rem; color:#cbd5e1; margin-top:2px;">Parent: ${student.parentName} (${student.parentPhone})</div>
           </div>
@@ -17508,7 +23317,7 @@ function openFeeCounterNfcScanner() {
             <i class="fa-solid fa-receipt"></i>
           </div>
           <h3 style="margin:0 0 4px 0; color:#22d3ee; font-family:var(--font-heading);">Dedicated Fee Counter NFC Reader</h3>
-          <p style="margin:0; font-size:0.83rem; color:#cbd5e1;">Tap student ID card on counter reader to open Fee Collector instantly.</p>
+          <p style="margin:0; font-size:0.83rem; color:#374151;">Tap student ID card on counter reader to open Fee Collector instantly.</p>
         </div>
 
         <div style="background:#1e293b; padding:14px; border-radius:12px; border:1px solid #334155; margin-bottom:18px;">
@@ -17527,7 +23336,7 @@ function openFeeCounterNfcScanner() {
             <div style="display:flex; justify-content:space-between; align-items:center; background:#1e293b; padding:10px 14px; border-radius:8px; border:1px solid #334155;">
               <div>
                 <strong style="color:#ffffff;">${s.name}</strong> <small style="color:#94a3b8;">(${s.currentClass})</small><br>
-                <code style="font-size:0.78rem; color:#38bdf8;">UID: ${s.nfcUid}</code> | <small style="color:#a7f3d0;">Adm: ${s.admissionNo}</small>
+                <code style="font-size:0.78rem; color:#0284c7;">UID: ${s.nfcUid}</code> | <small style="color:#a7f3d0;">Adm: ${s.admissionNo}</small>
               </div>
               <button class="btn btn-secondary" style="padding:6px 12px; font-size:0.78rem; background:#0891b2; color:#fff; border:none; font-weight:bold;" onclick="triggerFeeCounterNfcTap('${s.nfcUid}')">
                 <i class="fa-solid fa-receipt"></i> Tap Fee Reader
@@ -17563,6 +23372,7 @@ function triggerFeeCounterNfcTap(rawUid) {
 
 function renderPromotionPage(container) {
   const currentSession = SchoolData.activeSession;
+  const nextSession = getNextAcademicSessionName(currentSession);
 
   container.innerHTML = `
     <div class="page-header">
@@ -17574,7 +23384,7 @@ function renderPromotionPage(container) {
 
     <div class="glass-card" style="max-width:700px; margin:0 auto; text-align:center;">
       <i class="fa-solid fa-graduation-cap" style="font-size:3.5rem; color:var(--accent-primary); margin-bottom:16px;"></i>
-      <h3 style="font-family:var(--font-heading); margin-bottom:10px;">Promote School to Session 2027-28</h3>
+      <h3 style="font-family:var(--font-heading); margin-bottom:10px;">Promote School to Session ${nextSession}</h3>
       <p style="color:var(--text-muted); font-size:0.9rem; margin-bottom:20px;">
         Clicking promote will automatically move all students to their next respective class (e.g. LKG  UKG, Class 9  Class 10), archive Session 2026-27 as read-only, and generate new roll numbers.
       </p>
@@ -17605,8 +23415,16 @@ function getPromotionBlockedStudents(session) {
     .filter(item => item.dueAmount > 0);
 }
 
-function executeBatchPromotion() {
+function getNextAcademicSessionName(session) {
+  const match = String(session || '').match(/^(\d{4})-(\d{2})$/);
+  if (!match) return 'Next Session';
+  const start = Number(match[1]) + 1;
+  return `${start}-${String((start + 1) % 100).padStart(2, '0')}`;
+}
+
+async function executeBatchPromotion() {
   const currentSession = SchoolData.activeSession;
+  const nextSession = getNextAcademicSessionName(currentSession);
   const blockedStudents = getPromotionBlockedStudents(currentSession);
   if (blockedStudents.length > 0) {
     const sample = blockedStudents.slice(0, 8)
@@ -17616,13 +23434,99 @@ function executeBatchPromotion() {
     showNotification(`Promotion blocked: ${blockedStudents.length} student(s) have uncleared dues.`, 'warning');
     return;
   }
+  const activeStudents = getStudentsByActiveSession();
+  if (!window.confirm(`Promote ${activeStudents.length} active student(s) from ${currentSession} to ${nextSession}?\n\nNursery through Class 9 will move to the next class. Class 10 will be marked Graduated. This saves only after cloud confirmation.`)) return;
 
-  showNotification('Batch Promotion Executed! Session 2027-28 is now live.', 'success');
-  SchoolData.activeSession = '2027-28';
-  document.getElementById('sessionSelect').value = '2027-28';
-  handleRouting();
+  const before = JSON.parse(JSON.stringify(buildSchoolDataStoragePayload()));
+  const nextClass = {
+    'Nursery': 'LKG', 'LKG': 'UKG', 'UKG': 'Class 1',
+    'Class 1': 'Class 2', 'Class 2': 'Class 3', 'Class 3': 'Class 4',
+    'Class 4': 'Class 5', 'Class 5': 'Class 6', 'Class 6': 'Class 7',
+    'Class 7': 'Class 8', 'Class 8': 'Class 9', 'Class 9': 'Class 10'
+  };
+  try {
+    (SchoolData.sessions || []).forEach((session) => {
+      if (session.name === currentSession || session.id === currentSession) session.status = 'Closed';
+    });
+    if (!(SchoolData.sessions || []).some(s => s.name === nextSession || s.id === nextSession)) {
+      const startYear = Number(nextSession.slice(0, 4));
+      SchoolData.sessions.push({
+        id: `sess_${nextSession.replace('-', '')}`,
+        name: nextSession,
+        status: 'Active',
+        startDate: `${startYear}-04-01`,
+        endDate: `${startYear + 1}-03-31`
+      });
+    } else {
+      (SchoolData.sessions || []).forEach((session) => {
+        if (session.name === nextSession || session.id === nextSession) session.status = 'Active';
+      });
+    }
 
-  saveSchoolDataToStorage();
+    activeStudents.forEach((student) => {
+      const oldClass = normalizeClassName(student.currentClass || student.class || '');
+      if (!student.sessionDetails) student.sessionDetails = {};
+      if (oldClass === 'Class 10') {
+        student.status = 'Graduated';
+        student.sessionDetails[nextSession] = { class: 'Graduated', section: '', rollNo: '', status: 'Graduated' };
+        return;
+      }
+      const promotedClass = nextClass[oldClass];
+      if (!promotedClass) return;
+      student.currentClass = promotedClass;
+      student.class = promotedClass;
+      student.status = 'Active';
+      const section = student.currentSection || student.section || 'A';
+      student.sessionDetails[nextSession] = { class: promotedClass, section, rollNo: '', status: 'Active' };
+      if (!student.feeRecords) student.feeRecords = {};
+      if (!student.feeRecords[nextSession]) {
+        student.feeRecords[nextSession] = {
+          monthlyTuition: getStudentMonthlyTuitionRate(student, nextSession),
+          paidMonths: [], dueMonths: [...SCHOOL_SESSION_MONTHS], payments: [], previousSessionDue: 0
+        };
+      }
+      student.currentFeeInfo = student.feeRecords[nextSession];
+    });
+
+    const groups = new Map();
+    activeStudents.filter(s => s.status === 'Active').forEach((student) => {
+      const key = `${student.currentClass}|${student.currentSection || student.section || 'A'}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(student);
+    });
+    groups.forEach((students) => {
+      students.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+      students.forEach((student, index) => {
+        const roll = String(index + 1);
+        student.currentRollNo = roll;
+        student.rollNo = roll;
+        student.sessionDetails[nextSession].rollNo = roll;
+      });
+    });
+
+    SchoolData.activeSession = nextSession;
+    const promotionRecords = activeStudents.map(student => buildStudentMasterRecord(student, {
+      originalAdmissionNo: student.admissionNo,
+      sessionPatches: { [nextSession]: student.sessionDetails?.[nextSession] || {} },
+      feeSessionInitializers: student.status === 'Active' && student.feeRecords?.[nextSession]
+        ? { [nextSession]: student.feeRecords[nextSession] }
+        : {}
+    }));
+    const changedSessions = (SchoolData.sessions || []).filter(session => (
+      session.name === currentSession || session.id === currentSession ||
+      session.name === nextSession || session.id === nextSession
+    ));
+    await persistStudentMasterDelta(promotionRecords, `Batch promotion completed. Session ${nextSession} is now live.`, {
+      promotion: true,
+      activeSession: nextSession,
+      sessionUpserts: changedSessions
+    });
+    const select = document.getElementById('sessionSelect');
+    if (select) select.value = nextSession;
+    handleRouting();
+  } catch (error) {
+    applySchoolDataStoragePayload(before, { allowEmpty: true });
+  }
 }
 
 function renderCertificatesPage(container) {
@@ -17821,8 +23725,8 @@ function getTransferCertificateDetailsHtml(student, issuedCertificate = null) {
     ['Mother Name', student.motherName || '________________'],
     ['Class / Section', `${classLabel} - ${sec}`],
     ['Address', address],
-    ['Date of Birth', formatDobToDDMMYYYY(student.dob) || 'As per record'],
-    ['Date of Birth in Words', dateOfBirthInWords(student.dob)],
+    ['Date of Birth', formatStudentDob(student) || 'As per record'],
+    ['Date of Birth in Words', dateOfBirthInWords(studentDobRaw(student))],
     ['Date of Leaving', leavingDate],
     ['Reason for Leaving', leavingReason],
     ['Conduct & Character', 'Good'],
@@ -17845,7 +23749,7 @@ function getTransferCertificateDetailsHtml(student, issuedCertificate = null) {
 }
 
 function getCertificatePhotoHtml(student) {
-  const photo = student.photo || student.photoDataUrl || '';
+  const photo = resolveStudentPhotoSrc(student);
   if (photo) return `<img src="${photo}" alt="Student Photo" style="width:92px; height:112px; object-fit:cover; border:3px solid #d4af37; border-radius:8px;">`;
   return `<div style="width:92px; height:112px; border:3px solid #d4af37; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#64748b; font-size:0.75rem; text-align:center; background:#f8fafc;">Student<br>Photo</div>`;
 }
@@ -17934,8 +23838,8 @@ function generateCertificate(admissionNo, certType, issuedCertificate = null) {
   const issueMeta = isIssuedTransferCertificate
     ? `Certificate No: ${certNo} • Issued: ${formatErpDateTime(issuedAt)}`
     : `Certificate No: ${certNo} • DRAFT PREVIEW — NOT ISSUED`;
-  const watermarkLogoSrc = isTransferCertificate ? 'assets/school_logo_tc.png' : (profile.logoDataUrl || 'assets/school_logo.png');
-  const watermarkHtml = `<img src="${watermarkLogoSrc}" style="width:${isTransferCertificate ? '360px' : '290px'}; height:${isTransferCertificate ? '360px' : '290px'}; border-radius:50%; object-fit:cover;">`;
+  const watermarkLogoSrc = isTransferCertificate ? 'assets/school_logo_clean.png' : (profile.logoDataUrl || 'assets/school_logo_clean.png');
+  const watermarkHtml = `<img src="${watermarkLogoSrc}" style="width:${isTransferCertificate ? '360px' : '290px'}; height:${isTransferCertificate ? '360px' : '290px'}; border-radius:50%; object-fit:contain;">`;
   const certificateBodyHtml = isTransferCertificate
     ? getTransferCertificateDetailsHtml(student, issuedCertificate)
     : `
@@ -17943,7 +23847,7 @@ function generateCertificate(admissionNo, certType, issuedCertificate = null) {
               <div style="border:1px solid #cbd5e1; padding:8px; border-radius:8px;"><small style="color:#64748b;">Student</small><div contenteditable="true" style="font-weight:900;">${student.name}</div></div>
               <div style="border:1px solid #cbd5e1; padding:8px; border-radius:8px;"><small style="color:#64748b;">Admission No</small><div contenteditable="true" style="font-weight:900;">${student.admissionNo}</div></div>
               <div style="border:1px solid #cbd5e1; padding:8px; border-radius:8px;"><small style="color:#64748b;">Class / Section</small><div contenteditable="true" style="font-weight:900;">${student.currentClass || student.class || 'LKG'} - ${student.currentSection || student.section || 'A'}</div></div>
-              <div style="border:1px solid #cbd5e1; padding:8px; border-radius:8px;"><small style="color:#64748b;">Date of Birth</small><div contenteditable="true" style="font-weight:900;">${formatDobToDDMMYYYY(student.dob) || 'As per record'}</div></div>
+              <div style="border:1px solid #cbd5e1; padding:8px; border-radius:8px;"><small style="color:#64748b;">Date of Birth</small><div contenteditable="true" style="font-weight:900;">${formatStudentDob(student) || 'As per record'}</div></div>
             </div>
             <div contenteditable="true" style="position:relative; z-index:1; font-family:Georgia, 'Times New Roman', serif; font-size:20px; line-height:1.9; color:#111827; text-align:justify; margin:30px 22px 20px; padding:18px; border-left:5px solid #d4af37; background:rgba(255,255,255,0.76);">
               ${certText}
@@ -18266,19 +24170,33 @@ function openCreateSessionModal() {
   document.body.insertAdjacentHTML('beforeend', modalHtml);
 }
 
-function saveNewSession() {
+async function saveNewSession() {
   const name = document.getElementById('newSessName').value.trim();
   const start = document.getElementById('newSessStart').value;
   const end = document.getElementById('newSessEnd').value;
 
   if (name) {
-    SchoolData.sessions.push({
+    const candidateSession = {
       id: name,
       name: name,
       startDate: start,
       endDate: end,
       status: "Upcoming"
-    });
+    };
+
+    if ((SchoolData.sessions || []).some(session => String(session?.id || session?.name || '') === name)) {
+      showNotification(`Academic Session ${name} already exists.`, 'warning');
+      return;
+    }
+
+    try {
+      await persistConfigurationDelta('academicSession', name, candidateSession, `Academic Session ${name} created.`);
+    } catch (error) {
+      showNotification(`Academic session was not created: ${error?.message || 'cloud rejected the change.'}`, 'error');
+      return;
+    }
+    SchoolData.sessions.push(candidateSession);
+    saveSchoolDataToStorage({ skipCloudPush: true });
 
     const select = document.getElementById('sessionSelect');
     if (select) {
@@ -18288,48 +24206,244 @@ function saveNewSession() {
       select.appendChild(opt);
     }
 
-    const modal = document.getElementById('sessionCreateModal');
-    if (modal) modal.remove();
-
-    showNotification(`Done: Academic Session ${name} Created!`, 'success');
+    document.getElementById('sessionCreateModal')?.remove();
     renderSessionsPage(document.getElementById('contentBody'));
   }
-
-  saveSchoolDataToStorage();
 }
 
-function toggleSessionStatus(sessId) {
+async function toggleSessionStatus(sessId) {
   const sess = SchoolData.sessions.find(s => s.id === sessId);
   if (sess) {
-    sess.status = sess.status === 'Active' ? 'Closed' : 'Active';
-    showNotification(`Session ${sess.name} status changed to ${sess.status}`, 'info');
+    const candidate = { ...sess, status: sess.status === 'Active' ? 'Closed' : 'Active' };
+    try {
+      await persistConfigurationDelta('academicSession', String(sess.id), candidate, `Session ${sess.name} status changed to ${candidate.status}.`);
+    } catch (error) {
+      showNotification(`Session status was not changed: ${error?.message || 'cloud rejected the change.'}`, 'error');
+      return;
+    }
+    Object.assign(sess, candidate);
+    saveSchoolDataToStorage({ skipCloudPush: true });
     renderSessionsPage(document.getElementById('contentBody'));
   }
+}
 
-  saveSchoolDataToStorage();
+function getReportsFilterValues() {
+  const className = document.getElementById('reportsClassFilter')?.value || window.reportsFilterClass || 'ALL';
+  const fromVal = document.getElementById('reportsFromDate')?.value || window.reportsFilterFrom || '';
+  const toVal = document.getElementById('reportsToDate')?.value || window.reportsFilterTo || '';
+  window.reportsFilterClass = className;
+  window.reportsFilterFrom = fromVal;
+  window.reportsFilterTo = toVal;
+  const fromDate = fromVal ? parseReceiptDateValue(fromVal) : null;
+  const toDate = toVal ? parseReceiptDateValue(toVal) : null;
+  if (fromDate) fromDate.setHours(0, 0, 0, 0);
+  if (toDate) toDate.setHours(23, 59, 59, 999);
+  return {
+    className,
+    fromKey: fromVal ? toLocalDateKey(fromVal) : '',
+    toKey: toVal ? toLocalDateKey(toVal) : '',
+    fromDate,
+    toDate
+  };
+}
+
+function getStudentsForReportsFilter() {
+  const { className } = getReportsFilterValues();
+  let students = getStudentsByActiveSession();
+  if (className && className !== 'ALL') {
+    students = students.filter(s => (s.currentClass || s.class) === className);
+  }
+  return students;
+}
+
+function buildReportsFilterLabel() {
+  const { className, fromKey, toKey } = getReportsFilterValues();
+  const parts = [`Session ${SchoolData.activeSession}`];
+  if (className && className !== 'ALL') parts.push(className);
+  if (fromKey || toKey) parts.push(`${fromKey || 'start'} to ${toKey || 'today'}`);
+  return parts.join(' | ');
+}
+
+function exportAttendanceRangeReport() {
+  const { fromKey, toKey } = getReportsFilterValues();
+  const students = getStudentsForReportsFilter();
+  const headers = ['Admission No', 'PEN', 'Student Name', 'Class', 'Section', 'Present Days', 'Absent Days', 'Late Days', 'Working Days', 'Attendance %', 'From Date', 'To Date'];
+  const lines = [headers.join(',')];
+  students.forEach((s) => {
+    const summary = getStudentAttendanceSummaryForDateRange(s, fromKey, toKey);
+    lines.push([
+      csvEscape(s.admissionNo),
+      csvEscape(getStudentPen(s)),
+      csvEscape(s.name),
+      csvEscape(s.currentClass || s.class || ''),
+      csvEscape(s.currentSection || s.section || ''),
+      summary.daysPresent,
+      summary.daysAbsent,
+      summary.daysLate,
+      summary.workingDays,
+      summary.percentage != null ? summary.percentage : '',
+      csvEscape(fromKey || 'all'),
+      csvEscape(toKey || 'all')
+    ].join(','));
+  });
+  downloadReportsCsvFile(`Attendance_Report_${buildReportsFilterLabel().replace(/[^a-z0-9]+/gi, '_')}.csv`, lines.join('\n'));
+  showNotification(`Exported attendance report for ${students.length} student(s).`, 'success');
+}
+
+function exportFeePaymentsRangeReport() {
+  const { fromKey, toKey, fromDate, toDate } = getReportsFilterValues();
+  const students = getStudentsForReportsFilter();
+  const session = SchoolData.activeSession;
+  const headers = ['Admission No', 'PEN', 'Student Name', 'Class', 'Section', 'Receipt No', 'Date', 'Amount', 'Tuition', 'Annual', 'Exam', 'Mode', 'Current Due'];
+  const lines = [headers.join(',')];
+  let count = 0;
+  students.forEach((s) => {
+    const status = getStudentFeeCategoryStatus(s);
+    const payments = getUniquePaymentsView(s.feeRecords?.[session]?.payments).filter((p) => {
+      if (!fromDate && !toDate) return true;
+      const d = parseReceiptDateValue(p.date);
+      if (!d) return false;
+      if (fromDate && d < fromDate) return false;
+      if (toDate && d > toDate) return false;
+      return true;
+    });
+    if (!payments.length) {
+      lines.push([
+        csvEscape(s.admissionNo), csvEscape(getStudentPen(s)), csvEscape(s.name),
+        csvEscape(s.currentClass || ''), csvEscape(s.currentSection || ''),
+        '', '', 0, 0, 0, 0, '', status.totalDue || 0
+      ].join(','));
+      return;
+    }
+    payments.forEach((p) => {
+      const br = getPaymentPaidBreakdown(p);
+      count += 1;
+      lines.push([
+        csvEscape(s.admissionNo), csvEscape(getStudentPen(s)), csvEscape(s.name),
+        csvEscape(s.currentClass || ''), csvEscape(s.currentSection || ''),
+        csvEscape(p.receiptNo || ''), csvEscape(p.date || ''), p.amount || 0,
+        br.tuitionPaid, br.annualPaid, br.examPaid, csvEscape(p.mode || p.paymentMode || 'Cash'),
+        status.totalDue || 0
+      ].join(','));
+    });
+  });
+  downloadReportsCsvFile(`Fee_Payments_Report_${buildReportsFilterLabel().replace(/[^a-z0-9]+/gi, '_')}.csv`, lines.join('\n'));
+  showNotification(`Exported ${count} fee receipt row(s).`, 'success');
+}
+
+function exportCombinedFeeAttendanceReport() {
+  const { fromKey, toKey, fromDate, toDate } = getReportsFilterValues();
+  const students = getStudentsForReportsFilter();
+  const session = SchoolData.activeSession;
+  const headers = ['Admission No', 'PEN', 'Student Name', 'Class', 'Section', 'Present Days', 'Absent Days', 'Attendance %', 'Fee Collected (Range)', 'Current Due', 'Overdue Months'];
+  const lines = [headers.join(',')];
+  students.forEach((s) => {
+    const att = getStudentAttendanceSummaryForDateRange(s, fromKey, toKey);
+    const status = getStudentFeeCategoryStatus(s);
+    const collected = getUniquePaymentsView(s.feeRecords?.[session]?.payments).reduce((sum, p) => {
+      if (fromDate || toDate) {
+        const d = parseReceiptDateValue(p.date);
+        if (!d) return sum;
+        if (fromDate && d < fromDate) return sum;
+        if (toDate && d > toDate) return sum;
+      }
+      return sum + Number(p.amount || 0);
+    }, 0);
+    lines.push([
+      csvEscape(s.admissionNo), csvEscape(getStudentPen(s)), csvEscape(s.name),
+      csvEscape(s.currentClass || ''), csvEscape(s.currentSection || ''),
+      att.daysPresent, att.daysAbsent, att.percentage != null ? att.percentage : '',
+      collected, status.totalDue || 0, csvEscape((status.overdueMonths || []).join('; '))
+    ].join(','));
+  });
+  downloadReportsCsvFile(`Combined_Fee_Attendance_${buildReportsFilterLabel().replace(/[^a-z0-9]+/gi, '_')}.csv`, lines.join('\n'));
+  showNotification(`Exported combined report for ${students.length} student(s).`, 'success');
+}
+
+function downloadReportsCsvFile(filename, content) {
+  const blob = new Blob(['\ufeff' + content], { type: 'text/csv;charset=utf-8;' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
 }
 
 function renderReportsPage(container) {
   const canDuesReport = canUserViewSchoolTotalDues();
+  const canRevenueReport = canUserViewSchoolTotalRevenue();
+  const classOptions = getSchoolClassNames();
+  const selectedClass = window.reportsFilterClass || 'ALL';
+  const fromDate = window.reportsFilterFrom || '';
+  const toDate = window.reportsFilterTo || '';
+  const classSelectOptions = ['ALL', ...classOptions.filter(c => c !== 'ALL')];
+
   container.innerHTML = `
     <div class="page-header">
       <div>
         <h2 class="page-title"><i class="fa-solid fa-chart-column" style="color:var(--accent-warning)"></i> Reports & Analytics</h2>
-        <p class="page-subtitle">Generate Admission, Fee & Attendance Reports</p>
+        <p class="page-subtitle">Class-wise and custom date-range reports for fees and attendance — Session ${SchoolData.activeSession}</p>
+      </div>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="syncAttendanceFromGoogleSheets()"><i class="fa-solid fa-cloud-arrow-down"></i> Sync Attendance from NFC Sheet</button>
+        <button class="btn btn-secondary" onclick="window.location.hash='attendance'"><i class="fa-solid fa-clipboard-user"></i> Open Attendance Register</button>
       </div>
     </div>
+
+    <div class="glass-card" style="margin-bottom:20px; border:1px solid #334155;">
+      <h3 style="margin:0 0 14px 0;"><i class="fa-solid fa-filter"></i> Report Filters</h3>
+      <div style="display:flex; flex-wrap:wrap; gap:14px; align-items:flex-end;">
+        <div>
+          <label style="font-size:0.78rem; font-weight:700; color:#94a3b8; display:block; margin-bottom:4px;">Class</label>
+          <select id="reportsClassFilter" class="session-dropdown" style="width:190px; font-weight:700;">
+            ${classSelectOptions.map(c => `<option value="${c}" ${c === selectedClass ? 'selected' : ''}>${c === 'ALL' ? 'All Classes' : c}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label style="font-size:0.78rem; font-weight:700; color:#94a3b8; display:block; margin-bottom:4px;">From Date</label>
+          <input type="date" id="reportsFromDate" class="session-dropdown" style="width:170px; font-weight:700;" value="${fromDate}">
+        </div>
+        <div>
+          <label style="font-size:0.78rem; font-weight:700; color:#94a3b8; display:block; margin-bottom:4px;">To Date</label>
+          <input type="date" id="reportsToDate" class="session-dropdown" style="width:170px; font-weight:700;" value="${toDate}">
+        </div>
+        <button class="btn btn-secondary" onclick="window.reportsFilterFrom=''; window.reportsFilterTo=''; renderReportsPage(document.getElementById('contentBody'));">Clear Dates</button>
+      </div>
+      <p style="margin:12px 0 0 0; font-size:0.78rem; color:#94a3b8;">Leave dates empty for full-session attendance totals. Fee payment export uses receipt dates in the selected range.</p>
+    </div>
+
     <div class="grid-2">
       <div class="glass-card">
-        <h3><i class="fa-solid fa-download"></i> Export Dues Report</h3>
-        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Download Excel breakdown of all pending student fee dues for ${SchoolData.activeSession}.</p>
+        <h3><i class="fa-solid fa-clipboard-check"></i> Attendance Report</h3>
+        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Present / absent / late totals per student for the selected class and date range.</p>
+        <button class="btn btn-primary" onclick="exportAttendanceRangeReport()"><i class="fa-solid fa-file-csv"></i> Export Attendance CSV</button>
+      </div>
+      <div class="glass-card">
+        <h3><i class="fa-solid fa-download"></i> Fee Dues Snapshot</h3>
+        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Current-session dues with tuition, annual, and exam bifurcation for every student in the filter.</p>
         ${canDuesReport
-          ? `<button class="btn btn-primary" onclick="showNotification('Exporting Dues Report to Excel...', 'success')">Export Excel</button>`
+          ? `<button class="btn btn-primary" onclick="exportAllStudentsFeeReport()"><i class="fa-solid fa-file-csv"></i> Export Fee Dues Report</button>`
           : `<button class="btn btn-secondary" disabled style="opacity:0.55;">Hidden — need View Total Dues right</button>`}
       </div>
       <div class="glass-card">
-        <h3><i class="fa-solid fa-file-pdf"></i> Export Attendance Summary</h3>
-        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Generate PDF report of monthly NFC attendance logs.</p>
-        <button class="btn btn-secondary" onclick="showNotification('Generating Attendance PDF...', 'info')">Export PDF</button>
+        <h3><i class="fa-solid fa-receipt"></i> Fee Payments (Date Range)</h3>
+        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Receipt-by-receipt export filtered by From/To dates and class.</p>
+        ${canRevenueReport
+          ? `<button class="btn btn-secondary" onclick="exportFeePaymentsRangeReport()" style="background:#0284c7; color:#fff; border:none; font-weight:700;"><i class="fa-solid fa-file-invoice-dollar"></i> Export Payments CSV</button>`
+          : `<button class="btn btn-secondary" disabled style="opacity:0.55;">Hidden — need View Total Revenue right</button>`}
+      </div>
+      <div class="glass-card">
+        <h3><i class="fa-solid fa-table"></i> Combined Fee + Attendance</h3>
+        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">One sheet with PEN, attendance totals, fee collected in range, and current due.</p>
+        <button class="btn btn-secondary" onclick="exportCombinedFeeAttendanceReport()" style="background:#7c3aed; color:#fff; border:none; font-weight:700;"><i class="fa-solid fa-table-columns"></i> Export Combined CSV</button>
+      </div>
+      <div class="glass-card">
+        <h3><i class="fa-solid fa-file-invoice-dollar"></i> Fee Receipts Ledger</h3>
+        <p style="font-size:0.85rem; color:var(--text-muted); margin:10px 0;">Open the receipts ledger to filter by month or date range, then export with tuition/annual/exam bifurcation and totals.</p>
+        ${canRevenueReport
+          ? `<button class="btn btn-secondary" onclick="window.location.hash='receipts'" style="background:#0284c7; color:#fff; border:none; font-weight:700;"><i class="fa-solid fa-file-invoice-dollar"></i> Open Receipts Ledger</button>`
+          : `<button class="btn btn-secondary" disabled style="opacity:0.55;">Hidden — need View Total Revenue right</button>`}
       </div>
     </div>
   `;
@@ -18349,7 +24463,7 @@ function renderSettingsHubPage(container) {
     </div>
     <div class="grid-2" style="gap:16px;">
       <a href="#print-settings" class="glass-card" style="display:block; text-decoration:none; padding:22px; border:2px solid #0ea5e9;">
-        <h3 style="margin:0 0 8px 0; color:#38bdf8;"><i class="fa-solid fa-print"></i> Print</h3>
+        <h3 style="margin:0 0 8px 0; color:#0284c7;"><i class="fa-solid fa-print"></i> Print</h3>
         <p style="margin:0; color:var(--text-muted); font-size:0.9rem;">USB, WiFi or Bluetooth. 58mm / 80mm receipts, A4 certificates, QR on/off.</p>
       </a>
       ${canAdmin ? `
@@ -18383,7 +24497,7 @@ function renderPrintSettingsPage(container) {
 
     <div class="grid-2" style="align-items:start; gap:20px;">
       <div class="glass-card" style="border:2px solid #0ea5e9; padding:22px;">
-        <h3 style="margin-top:0; color:#38bdf8;">Default thermal printer</h3>
+        <h3 style="margin-top:0; color:#0284c7;">Default thermal printer</h3>
         <label style="font-weight:800; display:block; margin-bottom:6px;">Windows default thermal printer name</label>
         <input id="printPrinterName" class="session-dropdown" style="width:100%; margin-bottom:6px;" value="${escapeHtml(printerLabel)}" placeholder="Example: POS-58 Thermal Printer">
         <p style="font-size:0.78rem; color:var(--text-muted); margin:0 0 14px 0;">Enter the printer name exactly as it appears in Windows. The receipt button will show “Print — ${escapeHtml(printerLabel)}”.</p>
@@ -18490,7 +24604,7 @@ function renderBackupPage(container) {
       <div style="display:grid; gap:10px; margin-bottom:12px;">
         <label style="font-size:0.8rem; color:var(--text-muted);">School ID</label>
         <input id="cloudSchoolIdInput" type="text" value="mmm-jhs" style="padding:8px 10px; border-radius:8px; border:1px solid #334155; background:#0f172a; color:#fff;">
-        <label style="font-size:0.8rem; color:var(--text-muted);">Cloud secret (set same value in Render as ERP_CLOUD_SECRET)</label>
+        <label style="font-size:0.8rem; color:var(--text-muted);">Cloud secret (set in Vercel as ERP_CLOUD_SECRET)</label>
         <input id="cloudSecretInput" type="password" placeholder="Enter cloud sync secret" style="padding:8px 10px; border-radius:8px; border:1px solid #334155; background:#0f172a; color:#fff;">
       </div>
       <p id="cloudSyncStatusLine" style="font-size:0.78rem; color:#94a3b8; margin:0 0 12px 0;">Checking cloud status...</p>
@@ -18634,7 +24748,7 @@ function setupGlobalSearch() {
         resultsContainer.innerHTML = matches.map(s => `
           <div style="display:flex; justify-content:space-between; align-items:center; padding:12px; border-bottom:1px solid var(--border-color); cursor:pointer;" onclick="closeSearchAndOpenProfile('${s.admissionNo}')">
             <div style="display:flex; align-items:center; gap:12px;">
-              <img src="${s.photo}" style="width:38px; height:38px; border-radius:50%; object-fit:cover;">
+              ${getStudentDirectoryPhotoHtml(s, 38)}
               <div>
                 <strong>${s.name}</strong> (${s.currentClass || 'LKG'})<br>
                 <small style="color:var(--text-muted);">Adm: ${s.admissionNo} | Father: ${s.parentName}</small>
@@ -18657,7 +24771,7 @@ function closeSearchAndOpenProfile(admNo) {
 function getVerifiedStudentWalletBalance(student, session = SchoolData.activeSession) {
   if (!student) return 0;
   const sessionRecord = student.feeRecords?.[session] || student.currentFeeInfo || {};
-  const payments = Array.isArray(sessionRecord.payments) ? sessionRecord.payments : [];
+  const payments = getUniquePaymentsView(sessionRecord.payments);
   return payments.length > 0 ? (Number(student.walletBalance) || 0) : 0;
 }
 
@@ -18676,25 +24790,27 @@ function openStudentProfile(admissionNo) {
   const sec = student.currentSection || student.section || 'A';
   const rollNo = student.rollNo || student.currentRollNo || '01';
 
-  // Fee Details
+  // Fee Details — same figures the Fee Management ledger shows
   const feeRec = (student.feeRecords && student.feeRecords[currentSession]) ? student.feeRecords[currentSession] : (student.currentFeeInfo || {});
   const paidMonths = feeRec.paidMonths || [];
-  const dueMonths = feeRec.dueMonths || ["June", "July", "August"];
+  const dueSummary = getStudentDueSummary(student);
+  const dueMonths = dueSummary.overdueMonths;
   const monthlyTuition = getStudentMonthlyTuitionRate(student, currentSession);
-  const previousSessionDue = feeRec.previousSessionDue || 0;
-  const currentTuitionDue = dueMonths.length * monthlyTuition;
-  const walletBalance = getVerifiedStudentWalletBalance(student, currentSession);
-  const partialDue = student.partialDue || 0;
-  const totalNetDue = Math.max(0, currentTuitionDue + previousSessionDue + partialDue - walletBalance);
+  const previousSessionDue = dueSummary.previousSessionDue;
+  const walletBalance = dueSummary.wallet;
+  const partialDue = dueSummary.partialDue;
+  const totalNetDue = dueSummary.totalDue;
 
   // Payment history payments array
-  const payments = (feeRec.payments || []);
+  const payments = getUniquePaymentsView(feeRec.payments);
 
   // Attendance calculation
   const attLogs = student.attendanceLogs || {};
   const totalLogs = Object.keys(attLogs).length;
   const presentCount = Object.values(attLogs).filter(l => l.status === 'Present').length;
   const attPercentage = totalLogs > 0 ? Math.round((presentCount / totalLogs) * 100) : null;
+  const isInactive = !isStudentActiveForRoster(student);
+  const canReactivate = canCurrentUserReactivateStudents();
 
   const modalHtml = `
     <div class="modal-overlay active" id="studentProfileModal" style="z-index:99999; backdrop-filter:blur(8px);">
@@ -18705,18 +24821,20 @@ function openStudentProfile(admissionNo) {
           <button onclick="document.getElementById('studentProfileModal').remove()" style="position:absolute; top:16px; right:16px; background:rgba(255,255,255,0.15); color:#ffffff; border:none; width:32px; height:32px; border-radius:50%; cursor:pointer; font-size:1.1rem; display:flex; align-items:center; justify-content:center;">X</button>
           
           <div style="display:flex; gap:20px; align-items:center; flex-wrap:wrap;">
-            <img src="${student.photo || 'https://images.unsplash.com/photo-1544717305-2782549b5136?w=150&auto=format&fit=crop&q=80'}" style="width:90px; height:90px; border-radius:50%; object-fit:cover; border:3px solid #818cf8; box-shadow:0 10px 20px rgba(0,0,0,0.4);">
+            ${getStudentDirectoryPhotoHtml(student, 90)}
             <div>
               <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
                 <h2 style="margin:0; color:#ffffff; font-size:1.5rem; font-weight:800; font-family:var(--font-heading, sans-serif);">${student.name}</h2>
-                <span style="background:#4f46e5; color:#ffffff; padding:3px 10px; border-radius:12px; font-size:0.75rem; font-weight:700;">Adm: ${student.admissionNo}</span>
+                <span class="adm-no-chip profile-header-adm">Adm ${student.admissionNo}</span>
                 <span style="background:#059669; color:#ffffff; padding:3px 10px; border-radius:12px; font-size:0.75rem; font-weight:700;">Roll No: ${rollNo}</span>
+                ${isInactive ? `<span style="background:#f59e0b; color:#0f172a; padding:3px 10px; border-radius:12px; font-size:0.75rem; font-weight:800;">Left / Inactive</span>` : ''}
+                ${isInactive && canReactivate ? `<button class="btn btn-primary" style="padding:4px 12px; font-size:0.75rem; background:linear-gradient(135deg,#10b981,#059669); border:none;" onclick="document.getElementById('studentProfileModal').remove(); reactivateInactiveStudent('${student.admissionNo}');"><i class="fa-solid fa-user-check"></i> Bring Back to Active</button>` : ''}
               </div>
               
               <div style="margin-top:6px; color:#c7d2fe; font-size:0.88rem; display:flex; gap:16px; flex-wrap:wrap;">
                 <span><i class="fa-solid fa-graduation-cap" style="color:#a5b4fc;"></i> <strong>${cls} - ${sec}</strong></span>
                 <span><i class="fa-solid fa-venus-mars" style="color:#a5b4fc;"></i> ${student.gender || 'Student'}</span>
-                <span><i class="fa-solid fa-calendar-days" style="color:#a5b4fc;"></i> DOB: <strong>${formatDobToDDMMYYYY(student.dob)}</strong></span>
+                <span><i class="fa-solid fa-calendar-days" style="color:#a5b4fc;"></i> DOB: <strong>${formatStudentDob(student)}</strong></span>
               </div>
 
               ${attPercentage !== null ? `<div style="margin-top:8px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
@@ -18744,7 +24862,7 @@ function openStudentProfile(admissionNo) {
 
             <div style="background:#1e293b; padding:14px; border-radius:12px; border-left:4px solid #38bdf8;">
               <span style="font-size:0.75rem; color:#94a3b8; text-transform:uppercase; font-weight:700; letter-spacing:0.5px;">Monthly Tuition Rate</span>
-              <div style="font-size:1.4rem; font-weight:800; color:#38bdf8; margin-top:2px;">
+              <div style="font-size:1.4rem; font-weight:800; color:#0284c7; margin-top:2px;">
                 Rs${monthlyTuition.toLocaleString('en-IN')} / mo
               </div>
               <small style="color:#cbd5e1; font-size:0.72rem;">Session ${currentSession}</small>
@@ -18752,7 +24870,7 @@ function openStudentProfile(admissionNo) {
 
             <div style="background:#1e293b; padding:14px; border-radius:12px; border-left:4px solid #a855f7;">
               <span style="font-size:0.75rem; color:#94a3b8; text-transform:uppercase; font-weight:700; letter-spacing:0.5px;">Wallet / Partial Balance</span>
-              <div style="font-size:1.2rem; font-weight:800; color:#c084fc; margin-top:2px;">
+              <div style="font-size:1.2rem; font-weight:800; color:#6d28d9; margin-top:2px;">
                 ${walletBalance > 0 ? `+ Rs${walletBalance} Advance` : partialDue > 0 ? `- Rs${partialDue} Shortage` : 'Rs0 Balance'}
               </div>
               <small style="color:#cbd5e1; font-size:0.72rem;">Auto-adjusted on next receipt</small>
@@ -18771,13 +24889,14 @@ function openStudentProfile(admissionNo) {
               <div style="display:flex; flex-direction:column; gap:8px; font-size:0.83rem;">
                 <div><span style="color:#94a3b8;">Father's Name:</span> <strong style="color:#ffffff;">${student.parentName || 'N/A'}</strong></div>
                 <div><span style="color:#94a3b8;">Mother's Name:</span> <strong style="color:#ffffff;">${student.motherName || 'N/A'}</strong></div>
-                <div><span style="color:#94a3b8;">Primary Mobile:</span> <strong style="color:#38bdf8;">${student.parentPhone || 'N/A'}</strong> 
+                <div><span style="color:#94a3b8;">Primary Mobile:</span> <strong style="color:#0284c7;">${student.parentPhone || 'N/A'}</strong> 
                   ${student.parentPhone ? `<a href="tel:${student.parentPhone}" style="margin-left:8px; color:#34d399; text-decoration:none;"><i class="fa-solid fa-phone"></i> Call</a>` : ''}
                 </div>
-                <div><span style="color:#94a3b8;">Email Address:</span> <span style="color:#cbd5e1;">${student.parentEmail || 'N/A'}</span></div>
-                <div><span style="color:#94a3b8;">Aadhaar Number:</span> <code style="color:#fbbf24;">${student.aadhaar || 'N/A'}</code></div>
-                <div><span style="color:#94a3b8;">School Bot Chat ID:</span> <code style="color:#60a5fa;">${getStudentSchoolChatId(student) || 'Not Linked'}</code></div>
-                <div><span style="color:#94a3b8;">Home Address:</span> <span style="color:#cbd5e1;">${student.address || 'N/A'}</span></div>
+                <div><span style="color:#94a3b8;">Email Address:</span> <span style="color:#374151;">${student.parentEmail || 'N/A'}</span></div>
+                <div><span style="color:#94a3b8;">PEN (Permanent Education No.):</span> <code style="color:#6d28d9; font-weight:800;">${getStudentPen(student)}</code></div>
+                <div><span style="color:#94a3b8;">Aadhaar Number:</span> <code style="color:#b45309;">${student.aadhaar || 'N/A'}</code></div>
+                <div><span style="color:#94a3b8;">School Bot Chat ID:</span> <code style="color:#1d4ed8;">${getStudentSchoolChatId(student) || 'Not Linked'}</code></div>
+                <div><span style="color:#94a3b8;">Home Address:</span> <span style="color:#374151;">${student.address || 'N/A'}</span></div>
               </div>
             </div>
 
@@ -18788,12 +24907,12 @@ function openStudentProfile(admissionNo) {
               </h4>
               <div style="display:flex; flex-direction:column; gap:10px;">
                 <button class="btn btn-secondary" onclick="viewHalfYearlyReportCard('${student.admissionNo}')" style="width:100%; text-align:left; background:#0f172a; border:1px solid #475569; color:#ffffff; padding:10px 14px; border-radius:8px; cursor:pointer; font-size:0.83rem; display:flex; justify-content:space-between; align-items:center;">
-                  <span><i class="fa-solid fa-receipt" style="color:#38bdf8;"></i> View Half-Yearly Report Card</span>
+                  <span><i class="fa-solid fa-receipt" style="color:#0284c7;"></i> View Half-Yearly Report Card</span>
                   <i class="fa-solid fa-chevron-right" style="font-size:0.75rem; color:#94a3b8;"></i>
                 </button>
 
                 <button class="btn btn-secondary" onclick="viewFinalAnnualReportCard('${student.admissionNo}')" style="width:100%; text-align:left; background:#0f172a; border:1px solid #475569; color:#ffffff; padding:10px 14px; border-radius:8px; cursor:pointer; font-size:0.83rem; display:flex; justify-content:space-between; align-items:center;">
-                  <span><i class="fa-solid fa-award" style="color:#fbbf24;"></i> View Final Annual Report Card</span>
+                  <span><i class="fa-solid fa-award" style="color:#b45309;"></i> View Final Annual Report Card</span>
                   <i class="fa-solid fa-chevron-right" style="font-size:0.75rem; color:#94a3b8;"></i>
                 </button>
 
@@ -18808,7 +24927,7 @@ function openStudentProfile(admissionNo) {
 
           <!-- PAYMENT HISTORY LEDGER TABLE -->
           <div style="background:#1e293b; padding:16px; border-radius:14px; border:1px solid #334155; margin-bottom:20px;">
-            <h4 style="margin:0 0 12px 0; color:#fbbf24; font-size:0.95rem; font-weight:700; display:flex; align-items:center; gap:8px;">
+            <h4 style="margin:0 0 12px 0; color:#b45309; font-size:0.95rem; font-weight:700; display:flex; align-items:center; gap:8px;">
               <i class="fa-solid fa-clock-rotate-left"></i> Payment History Ledger (${payments.length} Transactions)
             </h4>
             
@@ -18818,7 +24937,7 @@ function openStudentProfile(admissionNo) {
               <div style="max-height:180px; overflow-y:auto;">
                 <table style="width:100%; border-collapse:collapse; font-size:0.8rem; text-align:left;">
                   <thead>
-                    <tr style="border-bottom:1px solid #475569; color:#cbd5e1;">
+                    <tr style="border-bottom:1px solid #475569; color:#374151;">
                       <th style="padding:6px;">Receipt #</th>
                       <th style="padding:6px;">Date</th>
                       <th style="padding:6px;">Amount</th>
@@ -18830,7 +24949,7 @@ function openStudentProfile(admissionNo) {
                   <tbody>
                     ${payments.map(p => `
                       <tr style="border-bottom:1px solid #334155;">
-                        <td style="padding:6px;"><code style="color:#c084fc;">#${p.receiptNo}</code></td>
+                        <td style="padding:6px;"><code style="color:#6d28d9;">#${p.receiptNo}</code></td>
                         <td style="padding:6px;">${p.date}</td>
                         <td style="padding:6px;"><strong style="color:#34d399;">Rs${(p.amount || 0).toLocaleString('en-IN')}</strong></td>
                         <td style="padding:6px;">${p.mode || 'Cash'}</td>
@@ -18935,7 +25054,7 @@ function pollSingleTelegramBot(botKey, token) {
     });
 }
 
-// Telegram commands are handled by the 24/7 Render webhook. Browser polling is intentionally disabled.
+// Telegram commands are handled by the Vercel webhook. Browser polling is intentionally disabled.
 const ENABLE_BROWSER_TELEGRAM_POLLING = false;
 if (ENABLE_BROWSER_TELEGRAM_POLLING) {
   setInterval(pollTelegramBotUpdates, 3000);
@@ -18963,3 +25082,1142 @@ async function sendTelegramNoticeTest() {
   if (!ok) return;
   await triggerSingleFeeReminder(cleanAdmissionNo, 'Test notification from MMMJH School Fee & Notice Bot (@mmmjhschoolbot). Fee receipts and school notices are dispatched via this dedicated channel.');
 }
+
+
+/* ============================================================================
+   TEACHER MOBILE PORTAL & MOBILE MARKS ENTRY ENGINE
+   ============================================================================ */
+
+function isMobileViewport() {
+  return window.innerWidth <= 768 || /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+}
+
+function shouldUseTeacherMobileView() {
+  const user = getCurrentActiveUser();
+  if (!user) return false;
+  const isTeacher = typeof isTeacherRoleUser === 'function' ? isTeacherRoleUser(user) : String(user.role || '').includes('Teacher');
+  const isAdmin = typeof isSuperAdminUser === 'function' ? isSuperAdminUser(user) : (user.role === 'Super Admin' || user.role === 'Admin');
+  return (isTeacher && !isAdmin && isMobileViewport());
+}
+
+function findTeacherForUser(user) {
+  if (!user || !Array.isArray(SchoolData.teachers)) return null;
+
+  // 1. By direct ID
+  let t = SchoolData.teachers.find(tch =>
+    (user.assignedTeacherId && (tch.id === user.assignedTeacherId || tch._id === user.assignedTeacherId)) ||
+    (tch.linkedStaffUserId && (tch.linkedStaffUserId === user.id || tch.linkedStaffUserId === user._id))
+  );
+  if (t) return t;
+
+  // 2. By clean normalized name (stripping titles like Mrs./Mr./Miss/Dr.)
+  const clean = (s) => String(s || '').toLowerCase().replace(/^(mrs\.|mr\.|miss|ms\.|dr\.|prof\.)\s*/i, '').trim();
+  const uClean = clean(user.name);
+  const uName = String(user.name || '').toLowerCase().trim();
+  const uUser = String(user.username || '').toLowerCase().trim();
+
+  if (uClean) {
+    t = SchoolData.teachers.find(tch => {
+      const tClean = clean(tch.name);
+      return tClean === uClean ||
+             (tClean.length >= 3 && (tClean.includes(uClean) || uClean.includes(tClean)));
+    });
+    if (t) return t;
+  }
+
+  // 3. Match username in teacher name
+  if (uUser && uUser.length >= 3) {
+    t = SchoolData.teachers.find(tch => {
+      const tClean = clean(tch.name);
+      return tClean.includes(uUser) || (tch.email && tch.email.toLowerCase().includes(uUser));
+    });
+    if (t) return t;
+  }
+
+  return null;
+}
+
+function getTeacherAssignedSubjects(user) {
+  if (!user) user = getCurrentActiveUser();
+  if (!user) return [];
+
+  const isAdmin = (typeof isSuperAdminUser === 'function' && isSuperAdminUser(user)) ||
+                  (typeof isMainAdminUser === 'function' && isMainAdminUser(user)) ||
+                  user.role === 'Super Admin' || user.role === 'Admin' || user.role === 'Principal';
+
+  // If Super Admin selected a specific teacher to preview on mobile
+  if (isAdmin && window._adminTeacherPreviewId && window._adminTeacherPreviewId !== 'ALL') {
+    const previewTeacher = (SchoolData.teachers || []).find(t => t.id === window._adminTeacherPreviewId || t.name === window._adminTeacherPreviewId);
+    if (previewTeacher) {
+      user = {
+        id: previewTeacher.linkedStaffUserId || previewTeacher.id,
+        name: previewTeacher.name,
+        role: 'Teacher',
+        assignedTeacherId: previewTeacher.id,
+        assignedSubject: previewTeacher.assignedSubject || previewTeacher.subject || 'Science',
+        assignedClass: previewTeacher.assignedClass || previewTeacher.classesTaught?.[0] || previewTeacher.class || 'Class 8',
+        assignedClasses: previewTeacher.classesTaught || (previewTeacher.classes ? (Array.isArray(previewTeacher.classes) ? previewTeacher.classes : [previewTeacher.classes]) : (previewTeacher.assignedClass ? [previewTeacher.assignedClass] : ['Class 8'])),
+        subjectMappings: previewTeacher.subjectMappings || []
+      };
+      // Evaluate as non-admin below
+    }
+  } else if (isAdmin) {
+    const schoolClasses = typeof getSchoolClassNames === 'function' ? getSchoolClassNames() : ['Class 1', 'Class 2', 'Class 3', 'Class 4', 'Class 5', 'Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10'];
+    const list = [];
+    schoolClasses.forEach(cls => {
+      const classSubjects = typeof getSubjectsForClassAndExam === 'function' ? getSubjectsForClassAndExam(cls, 'half_yearly') : [];
+      classSubjects.forEach(sub => {
+        list.push({
+          className: cls,
+          section: 'ALL',
+          subjectCode: sub.code,
+          subjectName: sub.name
+        });
+      });
+    });
+    return list;
+  }
+
+  // Explicit hard-lock rule for Mrs. Sonam Chauhan: Class 8 Science ONLY
+  const uName = String(user.name || '').toLowerCase();
+  const uUser = String(user.username || '').toLowerCase();
+  if (uName.includes('sonam') || uUser.includes('sonam')) {
+    return [
+      { className: 'Class 8', section: 'A', subjectCode: 'SCI', subjectName: 'Science' }
+    ];
+  }
+
+  const schoolClasses = typeof getSchoolClassNames === 'function' ? getSchoolClassNames() : ['Class 1', 'Class 2', 'Class 3', 'Class 4', 'Class 5', 'Class 6', 'Class 7', 'Class 8', 'Class 9', 'Class 10'];
+  const teacher = findTeacherForUser(user);
+
+  // Collect granular mappings directly
+  const mappings = (teacher && Array.isArray(teacher.subjectMappings) && teacher.subjectMappings.length)
+    ? teacher.subjectMappings
+    : (Array.isArray(user.subjectMappings) && user.subjectMappings.length ? user.subjectMappings : []);
+
+  const results = [];
+  const seen = new Set();
+
+  if (mappings.length > 0) {
+    mappings.forEach(m => {
+      const subCode = String(m.subjectCode || (m.subjectName ? m.subjectName.substring(0, 3).toUpperCase() : 'SUB')).trim();
+      const subName = String(m.subjectName || m.subjectCode || 'Subject').trim();
+      const classes = Array.isArray(m.classes) && m.classes.length ? m.classes :
+                      (m.class ? String(m.class).split(',').map(s => s.trim()).filter(Boolean) :
+                      (m.className ? [m.className] : []));
+      const sec = m.section || 'ALL';
+
+      const targetClasses = classes.length ? classes : (teacher?.assignedClass ? [teacher.assignedClass] : (user?.assignedClass ? [user.assignedClass] : []));
+
+      targetClasses.forEach(cls => {
+        const key = `${cls}_${sec}_${subCode.toUpperCase()}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          results.push({ className: cls, section: sec, subjectCode: subCode.toUpperCase(), subjectName: subName });
+        }
+      });
+    });
+  } else {
+    // Check fallback user / teacher single assignedSubject & assignedClass
+    const subjectTarget = user.assignedSubject || (teacher && (teacher.subject || teacher.assignedSubject)) || '';
+    const rawClasses = user.assignedClasses && user.assignedClasses.length ? user.assignedClasses :
+                      (user.assignedClass ? [user.assignedClass] : 
+                      (teacher && teacher.classesTaught && teacher.classesTaught.length ? teacher.classesTaught : 
+                      (teacher && teacher.assignedClass ? [teacher.assignedClass] :
+                      (teacher && teacher.classes ? (Array.isArray(teacher.classes) ? teacher.classes : [teacher.classes]) : []))));
+
+    const targetClasses = (Array.isArray(rawClasses) ? rawClasses : [rawClasses]).filter(c => c && c !== 'ALL');
+
+    if (subjectTarget && subjectTarget !== 'NONE' && subjectTarget !== 'ALL') {
+      targetClasses.forEach(cls => {
+        const subCode = subjectTarget.substring(0, 3).toUpperCase();
+        const key = `${cls}_ALL_${subCode}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          results.push({ className: cls, section: 'ALL', subjectCode: subCode, subjectName: subjectTarget });
+        }
+      });
+    }
+  }
+
+  return results;
+}
+
+function getExamSubmissionKey(className, section, subjectCode, examTerm) {
+  return `${String(className).trim()}_${String(section || 'ALL').trim()}_${String(subjectCode).trim()}_${String(examTerm).trim()}`.toLowerCase();
+}
+
+function isExamEntrySubmitted(className, section, subjectCode, examTerm) {
+  if (!SchoolData.examSubmissions) SchoolData.examSubmissions = {};
+  const key = getExamSubmissionKey(className, section, subjectCode, examTerm);
+  return !!(SchoolData.examSubmissions[key] && SchoolData.examSubmissions[key].locked);
+}
+
+/* ----------------------------------------------------------------------------
+   1. TEACHER MOBILE DASHBOARD (#teacher-mobile)
+   ---------------------------------------------------------------------------- */
+function renderTeacherMobileDashboard(container) {
+  const user = getCurrentActiveUser();
+  if (!user) {
+    window.location.hash = 'login';
+    return;
+  }
+
+  const assigned = getTeacherAssignedSubjects(user);
+  const teacher = findTeacherForUser(user);
+  const teacherClasses = Array.from(new Set(assigned.map(a => a.className)));
+  const teacherSubjects = Array.from(new Set(assigned.map(a => a.subjectName)));
+
+  // Calculate pending vs submitted counts
+  const standardTerms = ['ut1', 'ut2', 'half_yearly', 'ut3', 'annual'];
+  let totalTasks = assigned.length * standardTerms.length;
+  let submittedTasks = 0;
+
+  if (SchoolData.examSubmissions) {
+    assigned.forEach(a => {
+      standardTerms.forEach(term => {
+        if (isExamEntrySubmitted(a.className, a.section, a.subjectCode, term)) {
+          submittedTasks++;
+        }
+      });
+    });
+  }
+  const pendingTasks = Math.max(0, totalTasks - submittedTasks);
+  const isSuperAdmin = typeof isSuperAdminUser === 'function' ? isSuperAdminUser(user) : (user.role === 'Super Admin');
+
+  container.innerHTML = `
+    <div style="max-width:600px; margin:0 auto; padding:16px 14px 80px 14px; min-height:100vh; font-family:var(--font-main);">
+      
+      <!-- TOP MOBILE HEADER BANNER -->
+      <div style="background:linear-gradient(135deg, #1e1b4b 0%, #312e81 50%, #1e293b 100%); border:2px solid #4f46e5; border-radius:20px; padding:20px; margin-bottom:18px; box-shadow:0 12px 30px rgba(79, 70, 229, 0.35); position:relative; overflow:hidden;">
+        <div style="position:absolute; top:-20px; right:-20px; width:100px; height:100px; background:rgba(99, 102, 241, 0.15); border-radius:50%; pointer-events:none;"></div>
+        
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">
+          <div style="display:flex; align-items:center; gap:12px;">
+            <div style="width:54px; height:54px; border-radius:50%; background:#4f46e5; color:#ffffff; font-size:1.3rem; font-weight:900; display:flex; align-items:center; justify-content:center; border:2px solid #818cf8; box-shadow:0 4px 12px rgba(0,0,0,0.3);">
+              ${user.name ? user.name.charAt(0).toUpperCase() : 'T'}
+            </div>
+            <div>
+              <h2 style="margin:0; color:#ffffff; font-size:1.25rem; font-weight:900; letter-spacing:0.3px;">${escapeHtml(user.name)}</h2>
+              <div style="display:flex; gap:6px; align-items:center; margin-top:3px;">
+                <span class="badge badge-purple" style="font-size:0.75rem; padding:3px 8px; font-weight:800;">${escapeHtml(user.role || 'Teacher')}</span>
+                <span style="font-size:0.75rem; color:#c7d2fe;">Session ${SchoolData.activeSession || '2026-27'}</span>
+              </div>
+            </div>
+          </div>
+
+          <button onclick="logoutActiveUser()" title="Logout" style="background:#334155; color:#ef4444; border:none; width:38px; height:38px; border-radius:50%; display:flex; align-items:center; justify-content:center; cursor:pointer; font-size:1rem; box-shadow:0 2px 8px rgba(0,0,0,0.2);">
+            <i class="fa-solid fa-power-off"></i>
+          </button>
+        </div>
+
+        ${isSuperAdmin ? `
+          <div style="margin-top:12px; padding-top:10px; border-top:1px solid rgba(255,255,255,0.1); display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-size:0.75rem; color:#fde047;"><i class="fa-solid fa-crown"></i> Admin Preview Mode</span>
+            <a href="#dashboard" style="color:#ffffff; font-size:0.78rem; font-weight:800; text-decoration:none; background:#475569; padding:4px 10px; border-radius:6px;">
+              <i class="fa-solid fa-desktop"></i> Desktop ERP
+            </a>
+          </div>
+        ` : ''}
+      </div>
+
+      <!-- TEACHER ROSTER & SUBJECTS INFO PILLS -->
+      <div style="background:#0f172a; border:1px solid #334155; border-radius:16px; padding:16px; margin-bottom:18px; box-shadow:0 4px 16px rgba(0,0,0,0.3);">
+        <div style="margin-bottom:12px;">
+          <div style="font-size:0.75rem; text-transform:uppercase; color:#94a3b8; font-weight:800; letter-spacing:0.5px; margin-bottom:6px;">
+            <i class="fa-solid fa-chalkboard-user" style="color:#38bdf8;"></i> Assigned Classes
+          </div>
+          <div style="display:flex; flex-wrap:wrap; gap:6px;">
+            ${teacherClasses.length ? teacherClasses.map(c => `<span class="badge badge-info" style="font-size:0.8rem; font-weight:800; padding:4px 10px;">${escapeHtml(c)}</span>`).join('') : '<span style="color:#64748b; font-size:0.82rem;">No classes assigned yet.</span>'}
+          </div>
+        </div>
+
+        <div>
+          <div style="font-size:0.75rem; text-transform:uppercase; color:#94a3b8; font-weight:800; letter-spacing:0.5px; margin-bottom:6px;">
+            <i class="fa-solid fa-book-open" style="color:#a855f7;"></i> Assigned Subjects
+          </div>
+          <div style="display:flex; flex-wrap:wrap; gap:6px;">
+            ${teacherSubjects.length ? teacherSubjects.map(s => `<span class="badge badge-purple" style="font-size:0.8rem; font-weight:800; padding:4px 10px;">${escapeHtml(s)}</span>`).join('') : '<span style="color:#64748b; font-size:0.82rem;">No subjects mapped yet.</span>'}
+          </div>
+        </div>
+      </div>
+
+      <!-- STATS OVERVIEW CARDS -->
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:20px;">
+        <div style="background:#1e293b; border:1.5px solid #f59e0b; border-radius:16px; padding:16px; text-align:center;">
+          <div style="font-size:0.75rem; font-weight:800; color:#fbbf24; text-transform:uppercase;">Pending Entry</div>
+          <div style="font-size:1.8rem; font-weight:900; color:#ffffff; margin-top:4px;">${pendingTasks}</div>
+          <div style="font-size:0.72rem; color:#94a3b8; margin-top:2px;">Terms to enter</div>
+        </div>
+
+        <div style="background:#1e293b; border:1.5px solid #10b981; border-radius:16px; padding:16px; text-align:center;">
+          <div style="font-size:0.75rem; font-weight:800; color:#34d399; text-transform:uppercase;">Submitted Marks</div>
+          <div style="font-size:1.8rem; font-weight:900; color:#ffffff; margin-top:4px;">${submittedTasks}</div>
+          <div style="font-size:0.72rem; color:#94a3b8; margin-top:2px;">Locked &amp; approved</div>
+        </div>
+      </div>
+
+      <!-- QUICK TOUCH ACTION BUTTONS -->
+      <div style="display:flex; flex-direction:column; gap:12px;">
+        
+        <button onclick="window.location.hash='marks-entry-mobile'" style="background:linear-gradient(135deg, #0284c7 0%, #0369a1 100%); color:#ffffff; border:none; border-radius:16px; padding:18px 20px; font-size:1.05rem; font-weight:900; display:flex; align-items:center; justify-content:space-between; box-shadow:0 8px 24px rgba(2, 132, 199, 0.4); cursor:pointer;">
+          <div style="display:flex; align-items:center; gap:14px;">
+            <div style="width:42px; height:42px; border-radius:12px; background:rgba(255,255,255,0.2); display:flex; align-items:center; justify-content:center; font-size:1.2rem;">
+              <i class="fa-solid fa-file-pen"></i>
+            </div>
+            <div style="text-align:left;">
+              <div>Enter Student Marks</div>
+              <div style="font-size:0.75rem; color:#bae6fd; font-weight:600;">UT1, UT2, Half Yearly, UT3, Annual</div>
+            </div>
+          </div>
+          <i class="fa-solid fa-chevron-right"></i>
+        </button>
+
+        <button onclick="window.location.hash='marks-entry-mobile'; window._viewOnlySubmitted=true;" style="background:#1e293b; color:#ffffff; border:1px solid #334155; border-radius:16px; padding:16px 20px; font-size:1rem; font-weight:800; display:flex; align-items:center; justify-content:space-between; box-shadow:0 4px 14px rgba(0,0,0,0.2); cursor:pointer;">
+          <div style="display:flex; align-items:center; gap:14px;">
+            <div style="width:40px; height:40px; border-radius:12px; background:#0f172a; color:#10b981; display:flex; align-items:center; justify-content:center; font-size:1.1rem; border:1px solid #334155;">
+              <i class="fa-solid fa-clipboard-check"></i>
+            </div>
+            <div style="text-align:left;">
+              <div>View Submitted Marks</div>
+              <div style="font-size:0.75rem; color:#94a3b8; font-weight:600;">Check locked &amp; finalized marks</div>
+            </div>
+          </div>
+          <i class="fa-solid fa-chevron-right"></i>
+        </button>
+
+        <button onclick="window.location.hash='teacher-attendance-mobile'" style="background:#1e293b; color:#ffffff; border:1px solid #334155; border-radius:16px; padding:16px 20px; font-size:1rem; font-weight:800; display:flex; align-items:center; justify-content:space-between; box-shadow:0 4px 14px rgba(0,0,0,0.2); cursor:pointer;">
+          <div style="display:flex; align-items:center; gap:14px;">
+            <div style="width:40px; height:40px; border-radius:12px; background:#0f172a; color:#f59e0b; display:flex; align-items:center; justify-content:center; font-size:1.1rem; border:1px solid #334155;">
+              <i class="fa-solid fa-user-check"></i>
+            </div>
+            <div style="text-align:left;">
+              <div>Class Attendance</div>
+              <div style="font-size:0.75rem; color:#94a3b8; font-weight:600;">Mark daily presence &amp; bunk alerts</div>
+            </div>
+          </div>
+          <i class="fa-solid fa-chevron-right"></i>
+        </button>
+
+      </div>
+
+    </div>
+  `;
+}
+
+
+/* ----------------------------------------------------------------------------
+   2. MOBILE MARKS ENTRY ENGINE (#marks-entry-mobile)
+   Horizontal 3-Cell Layout (UT1 | UT2 | Half Yearly) & Exact ERP examMarks Storage
+   ---------------------------------------------------------------------------- */
+let _mobileMarkAutosaveTimer = null;
+
+function resolveMobileExamComponentConfig(className, subjectCode, compId) {
+  const component = compId === 'half_yearly' ? 'hy' : (compId === 'annual' ? 'fin' : compId);
+  const max = getSubjectExamComponentMax(className, subjectCode, component);
+  const weight = getSubjectExamComponentWeightage(className, subjectCode, component);
+
+  if (compId === 'ut1') {
+    return { name: 'UT 1', key: 'ut1', max, weight, color: '#38bdf8' };
+  }
+  if (compId === 'ut2') {
+    return { name: 'UT 2', key: 'ut2', max, weight, color: '#38bdf8' };
+  }
+  if (compId === 'half_yearly' || compId === 'hy') {
+    return { name: 'Half Yearly', key: 'hy', max, weight, color: '#f59e0b' };
+  }
+  if (compId === 'ut3') {
+    return { name: 'UT 3', key: 'ut3', max, weight, color: '#a855f7' };
+  }
+  if (compId === 'ut4') {
+    return { name: 'UT 4', key: 'ut4', max, weight, color: '#ec4899' };
+  }
+  if (compId === 'annual' || compId === 'fin') {
+    return { name: 'Annual Exam', key: 'fin', max, weight, color: '#10b981' };
+  }
+  return { name: compId.toUpperCase(), key: compId, max, weight, color: '#38bdf8' };
+}
+
+function renderMobileMarksEntry(container) {
+  const user = getCurrentActiveUser();
+  if (!user) {
+    window.location.hash = 'login';
+    return;
+  }
+
+  // Ensure mobile UI stays in sync with PC by fetching V2 marks from the cloud
+  if (window.ERP_V2_READ_FLAGS && window.ERP_V2_READ_FLAGS.marks && typeof window.refreshStudentMarksFromV2 === 'function') {
+    requestErpV2ScreenRefresh('marks', 'mobile_marks_entry', window.refreshStudentMarksFromV2, function() {
+      if (document.getElementById('contentBody') === container || window.location.hash.includes('teacher-mobile')) {
+        renderMobileMarksEntry(container);
+      }
+    });
+  }
+
+  const assigned = getTeacherAssignedSubjects(user);
+  const isSuperAdmin = typeof isSuperAdminUser === 'function' ? isSuperAdminUser(user) : (user.role === 'Super Admin' || user.role === 'Admin');
+
+  if (!assigned.length && !isSuperAdmin) {
+    container.innerHTML = `
+      <div style="max-width:600px; margin:40px auto; padding:24px; text-align:center; background:#1e293b; border-radius:16px; border:1px solid #f59e0b;">
+        <i class="fa-solid fa-triangle-exclamation" style="font-size:2.5rem; color:#f59e0b; margin-bottom:12px;"></i>
+        <h3 style="color:#ffffff;">No Assigned Classes or Subjects</h3>
+        <p style="color:#94a3b8; font-size:0.9rem;">Your teacher account has not been assigned any subjects in the Teachers Directory. Please contact the Principal or Admin to map your subjects.</p>
+        <a href="#teacher-mobile" class="btn btn-secondary" style="margin-top:14px; display:inline-block;">Back to Dashboard</a>
+      </div>
+    `;
+    return;
+  }
+
+  // Strictly filter classes to ONLY those assigned to this teacher
+  const schoolClasses = Array.from(new Set(assigned.map(a => a.className)));
+  const activeClass = (schoolClasses.includes(window.activeMobileExamClass) ? window.activeMobileExamClass : schoolClasses[0]) || 'Class 5';
+  window.activeMobileExamClass = activeClass;
+
+  // Real subjects for active class
+  const validSubjectsForClass = assigned.filter(a => a.className === activeClass);
+  const validCodes = validSubjectsForClass.map(s => s.subjectCode);
+  const activeSubjectCode = (validCodes.includes(window.activeMobileExamSubject) ? window.activeMobileExamSubject : validCodes[0]) || (validCodes[0] || 'ENG');
+  window.activeMobileExamSubject = activeSubjectCode;
+
+  // Major Term Group: 'half_yearly' (Term 1) or 'annual' (Term 2)
+  const activeTermGroup = window.activeMobileExamTermGroup || 'half_yearly';
+  window.activeMobileExamTermGroup = activeTermGroup;
+
+  const activeSubObj = validSubjectsForClass.find(s => s.subjectCode === activeSubjectCode) || { subjectCode: activeSubjectCode, subjectName: activeSubjectCode };
+
+  // 3 Horizontal Term Components
+  const termComponents = (activeTermGroup === 'half_yearly')
+    ? [
+        { id: 'ut1', ...resolveMobileExamComponentConfig(activeClass, activeSubjectCode, 'ut1') },
+        { id: 'ut2', ...resolveMobileExamComponentConfig(activeClass, activeSubjectCode, 'ut2') },
+        { id: 'half_yearly', ...resolveMobileExamComponentConfig(activeClass, activeSubjectCode, 'half_yearly') }
+      ]
+    : [
+        { id: 'ut3', ...resolveMobileExamComponentConfig(activeClass, activeSubjectCode, 'ut3') },
+        { id: 'ut4', ...resolveMobileExamComponentConfig(activeClass, activeSubjectCode, 'ut4') },
+        { id: 'annual', ...resolveMobileExamComponentConfig(activeClass, activeSubjectCode, 'annual') }
+      ];
+
+  // Check if locked
+  const isLocked = isExamEntrySubmitted(activeClass, 'ALL', activeSubjectCode, activeTermGroup);
+
+  // Filter students for active class (sorted by roll number or admission number)
+  const allStudents = typeof getStudentsByActiveSession === 'function' ? getStudentsByActiveSession() : (SchoolData.students || []);
+  const students = allStudents
+    .filter(s => s.currentClass === activeClass)
+    .sort((a, b) => {
+      const rA = Number(a.currentRollNo || a.rollNo || a.admissionNo || 0);
+      const rB = Number(b.currentRollNo || b.rollNo || b.admissionNo || 0);
+      return rA - rB;
+    });
+
+  const totalStudents = students.length;
+  let cardIdx = Number(window.activeMobileCardStudentIdx || 0);
+  if (isNaN(cardIdx) || cardIdx < 0) cardIdx = 0;
+  if (cardIdx >= totalStudents && totalStudents > 0) cardIdx = totalStudents - 1;
+  window.activeMobileCardStudentIdx = cardIdx;
+
+  const curStudent = students[cardIdx];
+  const photoSrc = curStudent ? (typeof resolveStudentPhotoSrc === 'function' ? resolveStudentPhotoSrc(curStudent) : '') : '';
+  const markSubKey = String(activeSubjectCode || '').trim().toLowerCase();
+
+  container.innerHTML = `
+    <div style="max-width:640px; margin:0 auto; padding-bottom:110px; font-family:var(--font-main);">
+      
+      <!-- STICKY TOP FILTER BAR -->
+      <div style="position:sticky; top:0; z-index:1000; background:#0f172a; border-bottom:2px solid #334155; padding:12px 14px; box-shadow:0 8px 24px rgba(0,0,0,0.6);">
+        
+        
+        ${isSuperAdmin ? `
+          <div style="background:rgba(99, 102, 241, 0.15); border:1px solid #6366f1; border-radius:10px; padding:8px 12px; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+            <div style="font-size:0.78rem; color:#c7d2fe; font-weight:800;">
+              <i class="fa-solid fa-user-shield" style="color:#818cf8;"></i> <strong>Super Admin Mode</strong>
+            </div>
+            <div style="display:flex; align-items:center; gap:6px;">
+              <span style="font-size:0.72rem; color:#94a3b8; font-weight:800;">Test View as:</span>
+              <select class="session-dropdown" style="font-size:0.75rem; font-weight:800; padding:4px 8px; background:#0f172a; color:#ffffff;" onchange="window._adminTeacherPreviewId=this.value; window.activeMobileExamClass=null; window.activeMobileExamSubject=null; window.activeMobileCardStudentIdx=0; renderMobileMarksEntry(document.getElementById('contentBody'));">
+                <option value="ALL" ${(!window._adminTeacherPreviewId || window._adminTeacherPreviewId === 'ALL') ? 'selected' : ''}>Full Admin (All Classes)</option>
+                ${(SchoolData.teachers || []).map(t => `<option value="${t.id}" ${window._adminTeacherPreviewId === t.id ? 'selected' : ''}>${escapeHtml(t.name)} (${escapeHtml(t.assignedSubject || t.subject || 'Teacher')})</option>`).join('')}
+              </select>
+            </div>
+          </div>
+        ` : ''}
+
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+          <a href="#teacher-mobile" style="color:#cbd5e1; font-size:0.85rem; font-weight:800; text-decoration:none; display:flex; align-items:center; gap:6px; background:#1e293b; padding:6px 12px; border-radius:8px; border:1px solid #334155;">
+            <i class="fa-solid fa-arrow-left"></i> Dashboard
+          </a>
+
+          <div style="display:flex; align-items:center; gap:8px;">
+            ${isLocked ? `
+              <span class="badge badge-success" style="font-size:0.75rem; padding:4px 10px; font-weight:800; background:#065f46; color:#a7f3d0; border:1px solid #10b981;">
+                <i class="fa-solid fa-lock"></i> Submitted to Admin
+              </span>
+            ` : `
+              <span id="mobileSaveStatusIndicator" class="badge badge-info" style="font-size:0.75rem; padding:4px 10px; font-weight:800;">
+                <i class="fa-solid fa-bolt"></i> Auto-Save Active
+              </span>
+            `}
+          </div>
+        </div>
+
+        <!-- 2-COL ROW (CLASS SELECTOR + EVALUATION TERM SELECTOR) -->
+        <div style="display:grid; grid-template-columns:1fr 1.3fr; gap:8px; margin-bottom:12px;">
+          <div>
+            <label style="font-size:0.7rem; color:#94a3b8; font-weight:800; text-transform:uppercase; display:block; margin-bottom:2px;">Class</label>
+            <select class="session-dropdown" style="width:100%; font-weight:800; font-size:0.85rem; padding:8px 6px; background:#1e293b; color:#ffffff;" onchange="window.activeMobileExamClass=this.value; window.activeMobileCardStudentIdx=0; renderMobileMarksEntry(document.getElementById('contentBody'));">
+              ${schoolClasses.map(c => `<option value="${c}" ${c === activeClass ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('')}
+            </select>
+          </div>
+
+          <div>
+            <label style="font-size:0.7rem; color:#94a3b8; font-weight:800; text-transform:uppercase; display:block; margin-bottom:2px;">Evaluation Term</label>
+            <select class="session-dropdown" style="width:100%; font-weight:800; font-size:0.85rem; padding:8px 6px; background:#1e293b; color:#ffffff;" onchange="window.activeMobileExamTermGroup=this.value; renderMobileMarksEntry(document.getElementById('contentBody'));">
+              <option value="half_yearly" ${activeTermGroup === 'half_yearly' ? 'selected' : ''}>Term 1 (UT1 + UT2 + HY)</option>
+              <option value="annual" ${activeTermGroup === 'annual' ? 'selected' : ''}>Term 2 (UT3 + UT4 + Final)</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- MAPPED SUBJECT PILLS / BUTTONS (NO HIDDEN DROPDOWN) -->
+        <div style="margin-bottom:8px;">
+          <div style="font-size:0.7rem; color:#94a3b8; font-weight:800; text-transform:uppercase; margin-bottom:6px; display:flex; align-items:center; gap:6px;">
+            <i class="fa-solid fa-book" style="color:#38bdf8;"></i> Select Subject (${validSubjectsForClass.length} mapped):
+          </div>
+          <div style="display:flex; gap:6px; overflow-x:auto; padding-bottom:4px; -webkit-overflow-scrolling:touch;">
+            ${validSubjectsForClass.map(s => {
+              const isSelected = (s.subjectCode === activeSubjectCode);
+              return `
+                <button type="button" 
+                  onclick="window.activeMobileExamSubject='${s.subjectCode}'; window.activeMobileCardStudentIdx=0; renderMobileMarksEntry(document.getElementById('contentBody'));"
+                  style="padding:7px 14px; border-radius:10px; font-size:0.82rem; font-weight:900; white-space:nowrap; border:none; cursor:pointer; flex-shrink:0; ${isSelected ? 'background:linear-gradient(135deg, #6366f1 0%, #4f46e5 100%); color:#ffffff; border:2px solid #a5b4fc; box-shadow:0 4px 12px rgba(99,102,241,0.4);' : 'background:#1e293b; color:#cbd5e1; border:1px solid #334155;'}">
+                  ${escapeHtml(s.subjectName)}
+                </button>
+              `;
+            }).join('')}
+          </div>
+        </div>
+
+        <!-- EXAM TARGET BANNER -->
+        <div style="background:#1e293b; border:1px solid #334155; border-radius:10px; padding:8px 12px; display:flex; justify-content:space-between; align-items:center; font-size:0.82rem; flex-wrap:wrap; gap:6px;">
+          <div>
+            <strong style="color:#38bdf8;">${escapeHtml(activeClass)} &bull; ${escapeHtml(activeSubObj.subjectName || activeSubObj.name)}</strong>
+          </div>
+          <div style="display:flex; gap:8px; font-weight:800; font-size:0.78rem;">
+            ${termComponents.map(c => `
+              <span style="background:#0f172a; padding:2px 8px; border-radius:6px; border:1px solid #334155; color:${c.color};">
+                ${c.name} (Max: <strong>${c.max}</strong>)
+              </span>
+            `).join('')}
+          </div>
+        </div>
+
+      </div>
+
+      ${!curStudent ? `
+        <div style="text-align:center; padding:40px 20px; color:#94a3b8;">
+          <i class="fa-solid fa-users-slash" style="font-size:2.5rem; color:#f59e0b; margin-bottom:12px;"></i>
+          <h3>No Students Found in ${escapeHtml(activeClass)}</h3>
+          <p>Please select another class above.</p>
+        </div>
+      ` : `
+        <!-- ACTIVE STUDENT FOCUS CARD -->
+        <div id="mobileStudentCardBox" style="padding:14px;">
+          
+          <div style="background:linear-gradient(180deg, rgba(15, 23, 42, 0.98) 0%, rgba(30, 41, 59, 0.98) 100%); border:2px solid #6366f1; border-radius:18px; padding:18px; box-shadow:0 15px 40px rgba(99, 102, 241, 0.25);">
+            
+            <!-- CARD HEADER & STUDENT JUMPER -->
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; flex-wrap:wrap; gap:10px; border-bottom:1px solid #334155; padding-bottom:12px;">
+              <span class="badge badge-purple" style="font-size:0.85rem; padding:5px 12px; font-weight:900;">
+                <i class="fa-solid fa-user-graduate"></i> Student ${cardIdx + 1} of ${totalStudents}
+              </span>
+
+              <div style="display:flex; align-items:center; gap:8px;">
+                <label style="font-size:0.75rem; font-weight:800; color:#94a3b8;">Jump to:</label>
+                <select class="session-dropdown" style="width:180px; font-size:0.82rem; font-weight:800; padding:5px 8px; background:#0f172a; color:#ffffff;" onchange="saveMobileTermGroupMarks('${curStudent.admissionNo}'); window.activeMobileCardStudentIdx=Number(this.value); renderMobileMarksEntry(document.getElementById('contentBody'));">
+                  ${students.map((s, i) => `
+                    <option value="${i}" ${i === cardIdx ? 'selected' : ''}>
+                      ${String(i + 1).padStart(2, '0')}. ${escapeHtml(s.name)} (Adm: ${s.admissionNo})
+                    </option>
+                  `).join('')}
+                </select>
+              </div>
+            </div>
+
+            <!-- STUDENT INFO BANNER -->
+            <div style="background:#0f172a; border:1px solid #334155; border-radius:14px; padding:12px 14px; margin-bottom:16px; display:flex; align-items:center; gap:14px;">
+              ${photoSrc 
+                ? `<img loading="lazy" src="${photoSrc}" style="width:52px; height:52px; border-radius:50%; object-fit:cover; border:2px solid #38bdf8; box-shadow:0 4px 12px rgba(56,189,248,0.3);">`
+                : `<div style="width:52px; height:52px; border-radius:50%; background:#4f46e5; color:#fff; font-weight:900; font-size:1.2rem; display:flex; align-items:center; justify-content:center; border:2px solid #818cf8;">${getStudentInitials(curStudent.name)}</div>`}
+              
+              <div style="flex:1;">
+                <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                  <h3 style="margin:0; color:#38bdf8; font-size:1.15rem; font-weight:900;">${escapeHtml(curStudent.name)}</h3>
+                  <span class="badge badge-success" style="font-size:0.78rem;">Roll #${String(cardIdx + 1).padStart(2, '0')}</span>
+                </div>
+                <div style="font-size:0.82rem; color:#94a3b8; margin-top:3px;">
+                  Adm No: <code style="color:#a5b4fc; font-weight:800;">${curStudent.admissionNo}</code> &bull; S/O: ${escapeHtml(curStudent.parentName || 'Parent')}
+                </div>
+              </div>
+            </div>
+
+            <!-- 3 HORIZONTAL TERM CELLS (UT1 | UT2 | HALF YEARLY) SIDE-BY-SIDE IN ONE ROW -->
+            <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin-bottom:20px; align-items:stretch;">
+              ${termComponents.map(cfg => {
+                const markObj = (curStudent.examMarks && curStudent.examMarks[markSubKey]) ? curStudent.examMarks[markSubKey] : {};
+                const markValFromStore = markObj[cfg.key];
+                const isAbsent = (markValFromStore === 'AB' || markValFromStore === 'ab');
+                const markVal = isAbsent ? '' : (markValFromStore !== undefined && markValFromStore !== null ? markValFromStore : '');
+
+                return `
+                  <div class="mobile-term-cell-card" id="cell_${curStudent.admissionNo}_${cfg.key}" style="background:#0f172a; border:1.5px solid ${isAbsent ? '#ef4444' : '#334155'}; border-radius:14px; padding:10px 4px; display:flex; flex-direction:column; align-items:center; justify-content:space-between; gap:8px; box-shadow:0 4px 12px rgba(0,0,0,0.3); height:154px; box-sizing:border-box;">
+                    
+                    <!-- FIXED HEIGHT HEADER (PREVENTS VERTICAL SHIFT) -->
+                    <div style="height:38px; display:flex; flex-direction:column; justify-content:center; align-items:center; text-align:center; width:100%;">
+                      <div style="font-size:0.86rem; font-weight:900; color:${cfg.color}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:95%;">
+                        ${cfg.name}
+                      </div>
+                      <div style="font-size:0.7rem; color:#94a3b8; line-height:1; margin-top:2px;">
+                        Max: <strong style="color:#ffffff;">${cfg.max}</strong>
+                      </div>
+                    </div>
+
+                    <!-- MARKS INPUT (STRICTLY CAPPED TO cfg.max) -->
+                    <div style="width:100%; display:flex; justify-content:center;">
+                      <input type="number" 
+                        class="session-dropdown mobile-term-input-field" 
+                        id="inp_${curStudent.admissionNo}_${cfg.key}"
+                        data-adm="${curStudent.admissionNo}"
+                        data-key="${cfg.key}"
+                        data-term="${cfg.id}"
+                        data-max="${cfg.max}"
+                        min="0" max="${cfg.max}" step="0.5"
+                        placeholder="0-${cfg.max}"
+                        value="${markVal}"
+                        ${isLocked || isAbsent ? 'disabled' : ''}
+                        style="width:92%; max-width:84px; height:44px; font-size:1.2rem; font-weight:900; text-align:center; background:#1e293b; border:2px solid ${isAbsent ? '#475569' : cfg.color}; border-radius:10px; color:#ffffff; padding:0; box-sizing:border-box;"
+                        oninput="handleStrictMobileMarkInput(this, ${cfg.max})"
+                        onblur="flushMobileTermMarkSave('${curStudent.admissionNo}')">
+                    </div>
+
+                    <!-- AB BUTTON -->
+                    <div style="width:100%; display:flex; justify-content:center;">
+                      <button type="button"
+                        id="btn_ab_${curStudent.admissionNo}_${cfg.key}"
+                        onclick="toggleMobileTermStudentAbsent('${curStudent.admissionNo}', '${cfg.key}', ${cfg.max})"
+                        ${isLocked ? 'disabled' : ''}
+                        style="width:92%; max-width:84px; height:34px; font-size:0.78rem; font-weight:900; border-radius:8px; border:none; cursor:pointer; display:flex; align-items:center; justify-content:center; ${isAbsent ? 'background:#ef4444; color:#ffffff; box-shadow:0 0 10px rgba(239,68,68,0.5);' : 'background:#334155; color:#cbd5e1;'}">
+                        ${isAbsent ? 'AB 🚨' : 'AB'}
+                      </button>
+                    </div>
+
+                  </div>
+                `;
+              }).join('')}
+            </div>
+
+            <!-- PREVIOUS & SAVE & NEXT BUTTONS (IN 1 CLICK) -->
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; border-top:1px solid #334155; padding-top:16px;">
+              <button type="button" class="btn btn-secondary" onclick="handleMobilePrevStudent('${curStudent.admissionNo}')" ${cardIdx === 0 ? 'disabled style="opacity:0.4; cursor:not-allowed;"' : ''} style="padding:12px 18px; font-weight:800; font-size:0.92rem; border-radius:12px;">
+                <i class="fa-solid fa-chevron-left"></i> Previous
+              </button>
+
+              <span style="font-size:0.88rem; font-weight:800; color:#94a3b8;">${cardIdx + 1} / ${totalStudents}</span>
+
+              <button id="mobileMarksSaveNextBtn" type="button" class="btn btn-primary" onclick="handleMobileSaveAndNextStudent('${curStudent.admissionNo}')" style="padding:12px 24px; font-weight:900; font-size:0.95rem; background:linear-gradient(135deg, #10b981 0%, #059669 100%); border:none; border-radius:12px; box-shadow:0 6px 20px rgba(16,185,129,0.4); cursor:pointer; display:flex; align-items:center; gap:8px;">
+                <i class="fa-solid fa-floppy-disk"></i> Save &amp; Next <i class="fa-solid fa-chevron-right"></i>
+              </button>
+            </div>
+
+          </div>
+
+        </div>
+      `}
+
+      <!-- STICKY BOTTOM ACTION BAR (SUBMIT TO ADMIN) -->
+      <div style="position:fixed; bottom:0; left:0; right:0; z-index:1000; background:#0f172a; border-top:2px solid #334155; padding:12px 16px; display:flex; justify-content:space-between; align-items:center; gap:12px; box-shadow:0 -6px 25px rgba(0,0,0,0.6);">
+        
+        <button type="button" class="btn btn-secondary" onclick="saveMobileTermGroupMarks(null, true)" style="flex:1; height:48px; font-size:0.95rem; font-weight:800; border-radius:12px; display:flex; align-items:center; justify-content:center; gap:8px;">
+          <i class="fa-solid fa-floppy-disk"></i> Save All
+        </button>
+
+        ${isLocked ? `
+          ${isSuperAdmin ? `
+            <button type="button" class="btn btn-warning" onclick="unlockMobileMarksForEdit('${activeClass}', 'ALL', '${activeSubjectCode}', '${activeTermGroup}')" style="flex:1.2; height:48px; font-size:0.92rem; font-weight:900; border-radius:12px; background:#f59e0b; border:none; color:#000000; display:flex; align-items:center; justify-content:center; gap:8px; cursor:pointer;">
+              <i class="fa-solid fa-lock-open"></i> Unlock for Edit
+            </button>
+          ` : `
+            <button type="button" class="btn btn-secondary" disabled style="flex:1.2; height:48px; font-size:0.9rem; font-weight:800; border-radius:12px; opacity:0.85; background:#064e3b; color:#a7f3d0; border:1px solid #10b981; display:flex; align-items:center; justify-content:center; gap:8px;">
+              <i class="fa-solid fa-circle-check"></i> Submitted (Locked)
+            </button>
+          `}
+        ` : `
+          <button type="button" class="btn btn-primary" onclick="submitMobileMarksForApproval('${activeClass}', 'ALL', '${activeSubjectCode}', '${activeTermGroup}', '${escapeHtml(activeSubObj.subjectName || activeSubObj.name)}')" style="flex:1.2; height:48px; font-size:0.95rem; font-weight:900; border-radius:12px; background:linear-gradient(135deg, #10b981 0%, #059669 100%); border:none; box-shadow:0 4px 14px rgba(16,185,129,0.4); display:flex; align-items:center; justify-content:center; gap:8px; cursor:pointer;">
+            <i class="fa-solid fa-paper-plane"></i> Submit to Admin
+          </button>
+        `}
+
+      </div>
+
+    </div>
+  `;
+}
+
+function handleStrictMobileMarkInput(inputEl, maxMarks) {
+  const raw = inputEl.value.trim();
+  if (raw === '') {
+    inputEl.style.borderColor = '#38bdf8';
+    inputEl.style.color = '#ffffff';
+    saveMobileTermGroupMarks(inputEl.getAttribute('data-adm'), false);
+    return;
+  }
+
+  const num = parseFloat(raw);
+  if (isNaN(num) || num < 0) {
+    inputEl.value = '';
+    return;
+  }
+
+  // Strictly block and cap numbers > maxMarks (e.g. entering 21 or 32 when max is 20)
+  if (num > maxMarks) {
+    inputEl.value = maxMarks;
+    inputEl.style.borderColor = '#ef4444';
+    inputEl.style.color = '#ef4444';
+    showNotification(`Max allowed mark for this exam is ${maxMarks}. Value capped to ${maxMarks}.`, 'warning');
+    setTimeout(() => {
+      inputEl.style.borderColor = '#38bdf8';
+      inputEl.style.color = '#ffffff';
+    }, 1000);
+  } else {
+    inputEl.style.borderColor = '#38bdf8';
+    inputEl.style.color = '#ffffff';
+  }
+
+  const indicator = document.getElementById('mobileSaveStatusIndicator');
+  if (indicator) {
+    indicator.innerHTML = '<i class="fa-solid fa-rotate fa-spin"></i> Saving...';
+    indicator.className = 'badge badge-warning';
+  }
+
+  if (_mobileMarkAutosaveTimer) clearTimeout(_mobileMarkAutosaveTimer);
+  _mobileMarkAutosaveTimer = setTimeout(() => {
+    saveMobileTermGroupMarks(inputEl.getAttribute('data-adm'), false);
+  }, 600);
+}
+
+function flushMobileTermMarkSave(admissionNo) {
+  saveMobileTermGroupMarks(admissionNo, false);
+}
+
+function toggleMobileTermStudentAbsent(admissionNo, compKey, maxMarks) {
+  const student = (SchoolData.students || []).find(s => String(s.admissionNo) === String(admissionNo));
+  if (!student) return;
+
+  const activeSubjectCode = window.activeMobileExamSubject || 'ENG';
+  const subKey = String(activeSubjectCode || '').trim().toLowerCase();
+
+  if (!student.examMarks) student.examMarks = {};
+  if (!student.examMarks[subKey]) student.examMarks[subKey] = {};
+
+  const currentVal = student.examMarks[subKey][compKey];
+  const isCurrentlyAbsent = (currentVal === 'AB' || currentVal === 'ab');
+
+  const inp = document.getElementById(`inp_${admissionNo}_${compKey}`);
+  const btn = document.getElementById(`btn_ab_${admissionNo}_${compKey}`);
+  const card = document.getElementById(`cell_${admissionNo}_${compKey}`);
+
+  if (isCurrentlyAbsent) {
+    delete student.examMarks[subKey][compKey];
+    if (inp) {
+      inp.disabled = false;
+      inp.value = '';
+      inp.style.borderColor = '#38bdf8';
+      inp.focus();
+    }
+    if (btn) {
+      btn.innerHTML = 'AB';
+      btn.style.background = '#334155';
+      btn.style.color = '#cbd5e1';
+      btn.style.boxShadow = 'none';
+    }
+    if (card) card.style.borderColor = '#334155';
+  } else {
+    student.examMarks[subKey][compKey] = 'AB';
+    if (inp) {
+      inp.disabled = true;
+      inp.value = '';
+      inp.style.borderColor = '#475569';
+    }
+    if (btn) {
+      btn.innerHTML = 'AB 🚨';
+      btn.style.background = '#ef4444';
+      btn.style.color = '#ffffff';
+      btn.style.boxShadow = '0 0 10px rgba(239,68,68,0.5)';
+    }
+    if (card) card.style.borderColor = '#ef4444';
+  }
+
+  saveMobileTermGroupMarks(admissionNo, false);
+}
+
+async function saveMobileTermGroupMarks(targetAdmissionNo = null, showToast = false) {
+  const activeClass = window.activeMobileExamClass || 'Class 5';
+  const activeSubjectCode = window.activeMobileExamSubject || 'ENG';
+  const subKey = String(activeSubjectCode || '').trim().toLowerCase();
+
+  const inputs = Array.from(document.querySelectorAll('.mobile-term-input-field'));
+  const touchedAdmissions = new Set();
+  inputs.forEach(inp => {
+    const adm = inp.getAttribute('data-adm');
+    if (targetAdmissionNo && String(adm) !== String(targetAdmissionNo)) return;
+    touchedAdmissions.add(String(adm || ''));
+
+    const compKey = inp.getAttribute('data-key');
+    const termId = inp.getAttribute('data-term');
+    const maxMarks = parseFloat(inp.getAttribute('data-max')) || 100;
+    const student = (SchoolData.students || []).find(s => String(s.admissionNo) === String(adm));
+    if (!student) return;
+
+    if (!student.examMarks) student.examMarks = {};
+    if (!student.examMarks[subKey]) student.examMarks[subKey] = {};
+
+    // Do not overwrite if marked AB
+    if (student.examMarks[subKey][compKey] === 'AB' || student.examMarks[subKey][compKey] === 'ab') return;
+
+    const raw = inp.value.trim();
+    if (raw === '' || raw === null || isNaN(raw)) {
+      delete student.examMarks[subKey][compKey];
+    } else {
+      let num = parseFloat(raw);
+      if (num < 0) num = 0;
+      if (num > maxMarks) num = maxMarks;
+      student.examMarks[subKey][compKey] = num;
+    }
+  });
+
+  const indicator = document.getElementById('mobileSaveStatusIndicator');
+  if (indicator) {
+    indicator.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving…';
+    indicator.className = 'badge badge-warning';
+  }
+  saveSchoolDataToStorage({ skipCloudPush: true });
+
+  // Mobile marks must not wait for a whole-school snapshot upload. Persist one
+  // durable, authenticated delta per visible student/subject, then let the
+  // outbox retry safely in the background while the teacher moves on.
+  const deltas = Array.from(touchedAdmissions).map(admissionNo => {
+    const student = (SchoolData.students || []).find(s => String(s.admissionNo) === admissionNo);
+    if (!student) return null;
+    const studentInputs = inputs.filter(inp => String(inp.getAttribute('data-adm') || '') === admissionNo);
+    const storedMarks = student.examMarks?.[subKey] || {};
+    return {
+      admissionNo,
+      subjectCode: subKey,
+      sessionName: String(SchoolData.activeSession || ''),
+      term: String(window.activeMobileExamTermGroup || ''),
+      className: String(student.currentClass || student.class || activeClass || ''),
+      section: String(student.currentSection || student.section || ''),
+      assessments: studentInputs.map(inp => {
+        const key = String(inp.getAttribute('data-key') || '').trim().toLowerCase();
+        const storedValue = storedMarks[key];
+        return {
+          key,
+          value: storedValue === undefined || storedValue === null ? '' : String(storedValue && typeof storedValue === 'object' ? storedValue.value : storedValue).trim().toUpperCase(),
+          max: parseFloat(inp.getAttribute('data-max')) || 100,
+          expectedRevision: Number((storedValue && typeof storedValue === 'object' && storedValue.revision) || 0)
+        };
+      }).filter(item => item.key)
+    };
+  }).filter(delta => delta && delta.assessments.length);
+
+  try {
+    if (deltas.length && window.ERPOutbox?.enqueue) {
+      for (const delta of deltas) {
+        await window.ERPOutbox.enqueue('saveMarksDelta', delta);
+      }
+      if (indicator) {
+        indicator.innerHTML = '<i class="fa-solid fa-cloud-arrow-up"></i> Saved &amp; syncing';
+        indicator.className = 'badge badge-info';
+      }
+      if (window.ERPOutbox.flush) void window.ERPOutbox.flush();
+      if (showToast) showNotification(`Marks saved for ${activeClass} and queued for cloud sync.`, 'success');
+      return { ok: true, savedAt: new Date().toISOString(), queued: true };
+    }
+
+    // Compatibility fallback for browsers where IndexedDB/outbox is blocked.
+    if (deltas.length) {
+      for (const delta of deltas) {
+        await fetch('/api/erp-cloud?action=saveMarksDelta', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(typeof getErpSessionToken === 'function' && getErpSessionToken() ? { 'X-ERP-Session': getErpSessionToken() } : {})
+          },
+          body: JSON.stringify(delta)
+        });
+      }
+    }
+    if (indicator) {
+      indicator.innerHTML = '<i class="fa-solid fa-cloud-check"></i> Saved to cloud';
+      indicator.className = 'badge badge-success';
+    }
+    if (showToast) showNotification(`Marks saved to cloud for ${activeClass}.`, 'success');
+    return { ok: true, savedAt: new Date().toISOString() };
+  } catch (error) {
+    if (indicator) {
+      indicator.innerHTML = '<i class="fa-solid fa-triangle-exclamation"></i> Not saved';
+      indicator.className = 'badge badge-danger';
+    }
+    showNotification(`Marks were not saved: ${error.message}`, 'error');
+    throw error;
+  }
+}
+
+async function handleMobileSaveAndNextStudent(admissionNo) {
+  if (_mobileMarkAutosaveTimer) {
+    clearTimeout(_mobileMarkAutosaveTimer);
+    _mobileMarkAutosaveTimer = null;
+  }
+  const button = document.getElementById('mobileMarksSaveNextBtn');
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving...';
+  }
+  try {
+    await saveMobileTermGroupMarks(admissionNo, false);
+  } catch (error) {
+    console.error('Save failed:', error);
+    if (button) {
+      button.disabled = false;
+      button.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> Save &amp; Next <i class="fa-solid fa-chevron-right"></i>';
+    }
+    return;
+  }
+
+  // Force move to next student in the UI
+  let curIdx = Number(window.activeMobileCardStudentIdx || 0);
+  
+  // Verify array size
+  const activeClass = window.activeMobileExamClass || 'Class 5';
+  const allStudents = typeof getStudentsByActiveSession === 'function' ? getStudentsByActiveSession() : (SchoolData.students || []);
+  const students = allStudents.filter(s => s.currentClass === activeClass);
+  
+  if (curIdx < students.length - 1) {
+    window.activeMobileCardStudentIdx = curIdx + 1;
+    showNotification(`Saved. Showing next student...`, 'success');
+    try {
+      renderMobileMarksEntry(document.getElementById('contentBody'));
+    } catch(e) {
+      console.error("Render error:", e);
+    }
+  } else {
+    showNotification('Saved! All students completed for this class.', 'success');
+    if (button) {
+      button.disabled = false;
+      button.innerHTML = 'Saved <i class="fa-solid fa-check"></i>';
+    }
+  }
+}
+
+async function handleMobilePrevStudent(admissionNo) {
+  try {
+    await saveMobileTermGroupMarks(admissionNo, false);
+  } catch (error) {
+    return;
+  }
+  let curIdx = Number(window.activeMobileCardStudentIdx || 0);
+  if (curIdx > 0) {
+    window.activeMobileCardStudentIdx = curIdx - 1;
+    renderMobileMarksEntry(document.getElementById('contentBody'));
+  }
+}
+
+
+/* ----------------------------------------------------------------------------
+   4. OPTIONAL TEACHER ATTENDANCE MOBILE VIEW (#teacher-attendance-mobile)
+   ---------------------------------------------------------------------------- */
+function renderTeacherAttendanceMobile(container) {
+  const user = getCurrentActiveUser();
+  if (!user) {
+    window.location.hash = 'login';
+    return;
+  }
+
+  const assigned = getTeacherAssignedSubjects(user);
+  const schoolClasses = Array.from(new Set(assigned.map(a => a.className)));
+  const activeClass = window.activeMobileAttClass || schoolClasses[0] || 'Class 5';
+  window.activeMobileAttClass = activeClass;
+
+  const allStudents = typeof getStudentsByActiveSession === 'function' ? getStudentsByActiveSession() : (SchoolData.students || []);
+  const students = allStudents.filter(s => s.currentClass === activeClass);
+
+  const todayStr = new Date().toISOString().split('T')[0];
+  const attendanceDate = window.activeMobileAttDate || todayStr;
+  window.activeMobileAttDate = attendanceDate;
+
+  const dayRecords = {};
+  students.forEach((student) => {
+    const saved = student?.attendanceLogs?.[attendanceDate]?.status;
+    if (saved) dayRecords[student.admissionNo] = String(saved).toLowerCase().startsWith('a') ? 'A' : 'P';
+  });
+
+  let presentCount = 0;
+  let absentCount = 0;
+  students.forEach(s => {
+    const st = dayRecords[s.admissionNo] || 'P';
+    if (st === 'P') presentCount++;
+    else absentCount++;
+  });
+
+  container.innerHTML = `
+    <div style="max-width:600px; margin:0 auto; padding-bottom:100px; font-family:var(--font-main);">
+      
+      <!-- STICKY HEADER -->
+      <div style="position:sticky; top:0; z-index:1000; background:#0f172a; border-bottom:2px solid #334155; padding:12px 14px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+          <a href="#teacher-mobile" style="color:#cbd5e1; font-size:0.85rem; font-weight:800; text-decoration:none; display:flex; align-items:center; gap:6px; background:#1e293b; padding:6px 12px; border-radius:8px; border:1px solid #334155;">
+            <i class="fa-solid fa-arrow-left"></i> Dashboard
+          </a>
+          <span class="badge badge-purple" style="font-size:0.75rem; padding:4px 10px; font-weight:800;">
+            <i class="fa-solid fa-calendar-day"></i> ${attendanceDate}
+          </span>
+        </div>
+
+        <div style="display:flex; gap:10px; align-items:center;">
+          <div style="flex:1;">
+            <select class="session-dropdown" style="width:100%; font-weight:800; font-size:0.9rem; padding:8px;" onchange="window.activeMobileAttClass=this.value; renderTeacherAttendanceMobile(document.getElementById('contentBody'));">
+              ${schoolClasses.map(c => `<option value="${c}" ${c === activeClass ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('')}
+            </select>
+          </div>
+          <div style="display:flex; gap:8px;">
+            <span class="badge badge-success" style="font-size:0.8rem; font-weight:800;">P: ${presentCount}</span>
+            <span class="badge badge-danger" style="font-size:0.8rem; font-weight:800;">A: ${absentCount}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- STUDENTS ATTENDANCE LIST -->
+      <div style="padding:14px; display:flex; flex-direction:column; gap:8px;">
+        ${students.map((s, idx) => {
+          const roll = s.currentRollNo || s.rollNo || (idx + 1);
+          const currentStatus = dayRecords[s.admissionNo] || 'P';
+
+          return `
+            <div style="background:#1e293b; border:1px solid #334155; border-radius:12px; padding:12px 14px; display:flex; justify-content:space-between; align-items:center;">
+              <div>
+                <div style="font-weight:800; color:#ffffff; font-size:0.95rem;">${String(roll).padStart(2, '0')}. ${escapeHtml(s.name)}</div>
+                <div style="font-size:0.78rem; color:#94a3b8;">Adm: ${s.admissionNo}</div>
+              </div>
+
+              <div style="display:flex; gap:6px;">
+                <button onclick="setMobileAttendanceStatus('${s.admissionNo}', 'P')" style="width:40px; height:40px; border-radius:8px; border:none; font-weight:900; cursor:pointer; ${currentStatus === 'P' ? 'background:#10b981; color:#fff;' : 'background:#0f172a; color:#94a3b8; border:1px solid #334155;'}">P</button>
+                <button onclick="setMobileAttendanceStatus('${s.admissionNo}', 'A')" style="width:40px; height:40px; border-radius:8px; border:none; font-weight:900; cursor:pointer; ${currentStatus === 'A' ? 'background:#ef4444; color:#fff;' : 'background:#0f172a; color:#94a3b8; border:1px solid #334155;'}">A</button>
+              </div>
+            </div>
+          `;
+        }).join('')}
+      </div>
+
+      <!-- BOTTOM SAVE -->
+      <div style="position:fixed; bottom:0; left:0; right:0; background:#0f172a; border-top:2px solid #334155; padding:12px 16px;">
+        <button onclick="saveMobileAttendance()" class="btn btn-primary" style="width:100%; height:48px; font-weight:900; font-size:1rem; border-radius:12px; background:#0284c7; border:none;">
+          <i class="fa-solid fa-floppy-disk"></i> Save Attendance &amp; Sync
+        </button>
+      </div>
+
+    </div>
+  `;
+}
+
+async function setMobileAttendanceStatus(adm, status) {
+  const todayStr = new Date().toISOString().split('T')[0];
+  const attendanceDate = window.activeMobileAttDate || todayStr;
+  const student = (SchoolData.students || []).find(s => String(s.admissionNo) === String(adm));
+  if (!student) return;
+  if (!student.attendanceLogs) student.attendanceLogs = {};
+  const previous = student.attendanceLogs[attendanceDate] || {};
+  const now = new Date();
+  const timeStr = now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
+  student.attendanceLogs[attendanceDate] = {
+    ...previous,
+    status: status === 'A' ? 'Absent' : 'Present',
+    inTime: status === 'A' ? '--:--' : (previous.inTime && previous.inTime !== '--:--' ? previous.inTime : timeStr),
+    outTime: status === 'A' ? '--:--' : (previous.outTime || '--:--'),
+    markedByTeacher: true,
+    markedAt: now.toISOString(),
+    source: 'teacher-mobile',
+    _attendanceClientUpdatedAt: now.toISOString()
+  };
+  try {
+    await queueAttendanceCloudSave([buildAttendanceDeltaRecord(student, attendanceDate)]);
+  } catch (error) {
+    showNotification(`Attendance remains on this device but could not enter the cloud queue: ${error.message}`, 'warning');
+  }
+  renderTeacherAttendanceMobile(document.getElementById('contentBody'));
+}
+
+async function saveMobileAttendance() {
+  const button = document.querySelector('button[onclick="saveMobileAttendance()"]');
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving to cloud…';
+  }
+  try {
+    if (window.ERPOutbox?.flushNow) {
+      await window.ERPOutbox.flushNow('saveAttendanceDelta');
+      const status = getAttendanceCloudStatus();
+      showNotification(status.failed || status.pending
+        ? 'Attendance remains safely queued and will retry automatically.'
+        : 'Attendance saved and synced.', status.failed ? 'warning' : (status.pending ? 'info' : 'success'));
+    } else if (window._attendanceCompatibilityDirty) {
+      await persistErpCloudSave('Attendance saved and synced.', { skipMergePull: true });
+      window._attendanceCompatibilityDirty = false;
+    } else {
+      showNotification('No pending attendance changes.', 'info');
+    }
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> Save Attendance &amp; Sync';
+    }
+  }
+}
+
+// Strict Lazy Loading Observer
+if (typeof window !== 'undefined') {
+  window.addEventListener('DOMContentLoaded', () => {
+    if (!window._strictLazyPhotoObserver) {
+      window._strictLazyPhotoObserver = new IntersectionObserver((entries, observer) => {
+        entries.forEach(entry => {
+          if (entry.isIntersecting) {
+            const img = entry.target;
+            const src = img.getAttribute('data-strict-lazy-src');
+            if (src) {
+              img.src = src;
+              img.removeAttribute('data-strict-lazy-src');
+              observer.unobserve(img);
+            }
+          }
+        });
+      }, { rootMargin: '100px' });
+      
+      const setupLazyImages = () => {
+        document.querySelectorAll('img[data-strict-lazy-src]').forEach(img => {
+          window._strictLazyPhotoObserver.observe(img);
+        });
+      };
+      
+      const mutationObserver = new MutationObserver(mutations => {
+        let hasNewNodes = false;
+        for (let m of mutations) {
+          if (m.addedNodes.length) { hasNewNodes = true; break; }
+        }
+        if (hasNewNodes) setupLazyImages();
+      });
+      mutationObserver.observe(document.body, { childList: true, subtree: true });
+      setupLazyImages();
+    }
+  });
+}
+
