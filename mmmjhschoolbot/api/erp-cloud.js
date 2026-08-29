@@ -9,6 +9,8 @@
  */
 
 const crypto = require('crypto');
+const createErpV2 = require('./erp-v2');
+const erpLean = require('../lib/erpLean');
 
 function json(res, status, body) {
   res.statusCode = status;
@@ -1031,11 +1033,14 @@ async function findStaffByTelegramChatId(chatId) {
   return hit ? publicStaffUser(hit) : null;
 }
 
-async function listNativeStudents(schoolId) {
+async function listNativeStudents(schoolId, options) {
   const sid = encodeURIComponent(schoolId || schoolIdDefault());
+  const select = options?.includePayload
+    ? 'admission_no,name,current_class,current_section,parent_name,parent_phone,nfc_uid,school_bot_chat_id,telegram_user_name,status,payload,updated_at'
+    : erpLean.nativeStudentSelect();
   const rows = await supabaseRequest(
     'GET',
-    `erp_students?school_id=eq.${sid}&select=admission_no,name,current_class,current_section,parent_name,parent_phone,nfc_uid,school_bot_chat_id,telegram_user_name,status,payload,updated_at&order=admission_no.asc&limit=5000`
+    `erp_students?school_id=eq.${sid}&select=${select}&order=admission_no.asc&limit=5000`
   );
   return Array.isArray(rows) ? rows : [];
 }
@@ -1123,7 +1128,7 @@ function applyNativeFeeSessionsToPayload(payload, sessions) {
 }
 
 async function rebuildPayloadFromNative(schoolId, basePayload) {
-  const nativeRows = await listNativeStudents(schoolId);
+  const nativeRows = await listNativeStudents(schoolId, { includePayload: true });
   const students = [];
   nativeRows.forEach((row) => {
     const student = studentFromNativeRow(row);
@@ -1263,8 +1268,18 @@ async function readSnapshotVersion(schoolId) {
   return Array.isArray(rows) && rows.length ? rows[0] : null;
 }
 
+function stripEmbeddedPhotosFromPayload(payload) {
+  if (!payload || !Array.isArray(payload.students)) return payload;
+  payload.students = payload.students.map((student) => erpLean.stripStudentPhotos(student));
+  if (payload.schoolProfile) payload.schoolProfile = erpLean.stripProfileImages(payload.schoolProfile);
+  return payload;
+}
+
 async function writeSnapshot(schoolId, payload, savedBy) {
   payload = await preserveSnapshotStaffPasswords(schoolId, payload);
+  if (String(process.env.ERP_STRIP_PHOTOS_ON_WRITE || '').trim() === '1') {
+    payload = stripEmbeddedPhotosFromPayload(payload);
+  }
   const row = {
     school_id: schoolId,
     payload,
@@ -1320,7 +1335,9 @@ function cloudConfigBody(req) {
     requiresSecret,
     native: configured,
     siteTrusted,
-    feesNative: configured
+    feesNative: configured,
+    v2: configured,
+    leanPull: true
   };
   return {
     ok: true,
@@ -1330,6 +1347,8 @@ function cloudConfigBody(req) {
     native: configured,
     siteTrusted,
     feesNative: configured,
+    v2: configured,
+    leanPull: true,
     cloudSync
   };
 }
@@ -1338,17 +1357,34 @@ async function handleCloudConfig(req, res) {
   return json(res, 200, cloudConfigBody(req));
 }
 
+const erpV2 = createErpV2({
+  json,
+  supabaseRequest,
+  readSnapshot,
+  readSnapshotVersion,
+  writeSnapshot,
+  snapshotForBrowser,
+  requireErpSession,
+  authorize,
+  schoolIdDefault,
+  writeAuditLog,
+  listNativeStudents,
+  listNativePayments
+});
+
+const LEGACY_CLOUD_ACTIONS = [
+  'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments',
+  'rebuildSnapshot', 'wipeRoster', 'authLogin', 'authLogout', 'authSession', 'authChangePassword',
+  'authAdminResetPassword', 'authAudit', 'tcIssue', 'tcGet', 'tcList', 'tcVerify', 'tcRevoke'
+];
+
 async function route(req, res, action) {
   const act = String(action || req.query?.action || '').trim();
   if (act === 'cloudConfig') {
     await handleCloudConfig(req, res);
     return true;
   }
-  if ([
-    'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments',
-    'rebuildSnapshot', 'wipeRoster', 'authLogin', 'authLogout', 'authSession', 'authChangePassword',
-    'authAdminResetPassword', 'authAudit', 'tcIssue', 'tcGet', 'tcList', 'tcVerify', 'tcRevoke'
-  ].includes(act)) {
+  if (createErpV2.V2_ACTIONS.has(act) || LEGACY_CLOUD_ACTIONS.includes(act)) {
     await erpCloudHandler(req, res);
     return true;
   }
@@ -1391,6 +1427,18 @@ async function erpCloudHandler(req, res) {
     }
 
     const schoolId = String(req.query.schoolId || req.body?.schoolId || schoolIdDefault()).trim() || schoolIdDefault();
+
+    if (createErpV2.V2_ACTIONS.has(action)) {
+      if (action === 'saveMarksDelta' || action === 'marksRealtimeConfig') {
+        const handled = await erpV2.route(req, res, action, schoolId);
+        if (handled) return;
+      } else if (!authorize(req)) {
+        return json(res, 403, { ok: false, error: 'Invalid cloud sync secret.' });
+      } else {
+        const handled = await erpV2.route(req, res, action, schoolId);
+        if (handled) return;
+      }
+    }
 
     // These actions have their own authentication rules. Public verification is
     // token-scoped; login is restricted to the official site; all others require
@@ -1517,16 +1565,68 @@ async function erpCloudHandler(req, res) {
     }
 
     if (req.method === 'GET') {
-      // Do NOT auto-rebuild deleted/empty rosters from native leftovers.
-      // Empty snapshot is a valid fresh-start state. Use rebuildSnapshot only if asked.
-      let snapshot = await readSnapshot(schoolId);
-      if (snapshot && snapshot.payload && snapshotStudentCount(snapshot) > 0) {
-        try {
-          const payments = await listNativePayments(schoolId);
-          snapshot.payload = applyNativePaymentsToPayload(snapshot.payload, payments);
-        } catch (err) {
-          console.error('[ERP-CLOUD] native payment overlay failed:', err.message);
+      const wantFull = String(req.query.full || '') === '1' || String(req.query.lean || '') === '0';
+      if (!wantFull) {
+        const rpc = await erpV2.tryLeanBootRpc(schoolId);
+        if (rpc && Array.isArray(rpc.students)) {
+          const payload = {
+            version: rpc.version || '2.1',
+            savedAt: rpc.savedAt || '',
+            activeSession: rpc.activeSession || '',
+            classes: rpc.classes || [],
+            subjects: rpc.subjects || {},
+            staffUsers: rpc.staffUsers || [],
+            teachers: rpc.teachers || [],
+            schoolProfile: erpLean.stripProfileImages(rpc.schoolProfile),
+            examSubjectConfigs: rpc.examSubjectConfigs || {},
+            periodSettings: rpc.periodSettings || {},
+            sessions: rpc.sessions || {},
+            students: rpc.students,
+            lean: true,
+            photosOmitted: true
+          };
+          return json(res, 200, {
+            ok: true,
+            configured: true,
+            schoolId,
+            snapshot: snapshotForBrowser({
+              school_id: schoolId,
+              payload,
+              saved_at: rpc.savedAt || '',
+              version: rpc.version || '2.1'
+            }),
+            studentCount: Number(rpc.studentCount || rpc.students.length || 0),
+            native: true,
+            feesNative: true,
+            lean: true,
+            photosOmitted: true,
+            source: 'rpc'
+          });
         }
+        const snapshot = await readSnapshot(schoolId);
+        const leanBody = erpLean.leanPayload(snapshot?.payload || {}, { page: 1, pageSize: 5000 });
+        return json(res, 200, {
+          ok: true,
+          configured: true,
+          schoolId,
+          snapshot: snapshotForBrowser({
+            ...(snapshot || {}),
+            payload: { ...leanBody, students: (snapshot?.payload?.students || []).map((s) => erpLean.directoryStudent(s)) }
+          }),
+          studentCount: snapshotStudentCount(snapshot),
+          native: true,
+          feesNative: true,
+          lean: true,
+          photosOmitted: true,
+          source: 'snapshot-stripped',
+          paymentsOverlaySkipped: true
+        });
+      }
+      // Explicit backup/full snapshot. Photos are still stripped from the
+      // browser response. Avoid overlaying every payment row.
+      const snapshot = await readSnapshot(schoolId);
+      if (snapshot?.payload?.students) {
+        snapshot.payload.students = snapshot.payload.students.map((student) => erpLean.stripStudentPhotos(student));
       }
       return json(res, 200, {
         ok: true,
@@ -1535,7 +1635,9 @@ async function erpCloudHandler(req, res) {
         snapshot: snapshotForBrowser(snapshot) || null,
         studentCount: snapshotStudentCount(snapshot),
         native: true,
-        feesNative: true
+        feesNative: true,
+        photosOmitted: true,
+        paymentsOverlaySkipped: true
       });
     }
 
@@ -1547,6 +1649,19 @@ async function erpCloudHandler(req, res) {
       }
       if (!Array.isArray(payload.students)) {
         return json(res, 400, { ok: false, error: 'payload.students array is required.' });
+      }
+      const expectedSavedAt = String(body.expectedSavedAt || '').trim();
+      if (expectedSavedAt) {
+        const current = await readSnapshotVersion(schoolId);
+        const actual = String(current?.saved_at || '').trim();
+        if (actual && actual !== expectedSavedAt) {
+          return json(res, 409, {
+            ok: false,
+            conflict: true,
+            savedAt: actual,
+            error: 'Cloud data changed on another device. Refresh before saving again.'
+          });
+        }
       }
       // Intentional empty = fresh start: clear native leftovers so old 824 cannot return
       let wipedNative = null;
