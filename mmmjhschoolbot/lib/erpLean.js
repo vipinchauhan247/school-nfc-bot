@@ -72,6 +72,12 @@ function directoryStudent(student) {
   out.currentSection = String(stripped.currentSection || stripped.section || '').trim();
   out.hasPhoto = !!stripped.hasPhoto;
   out.photoUrl = stripped.photoUrl || '';
+  const dobRaw = stripped.dob || stripped.dateOfBirth || stripped.date_of_birth || '';
+  const isoDob = String(dobRaw).match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (isoDob) {
+    out.dob = `${isoDob[1]}-${isoDob[2]}-${isoDob[3]}`;
+    out.dateOfBirth = out.dob;
+  }
   return out;
 }
 

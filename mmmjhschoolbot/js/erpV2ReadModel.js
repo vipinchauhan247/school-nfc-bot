@@ -118,7 +118,16 @@
         [['currentSection', 'section'], sectionName],
         [['rollNo'], row?.roll_no ?? row?.rollNo],
         [['gender'], row?.gender],
-        [['dateOfBirth', 'dob'], row?.date_of_birth ?? row?.dateOfBirth],
+        [['dateOfBirth', 'dob'], (function mapDob(value) {
+          const raw = String(value || '').trim();
+          const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+          if (iso) return `${iso[3]}/${iso[2]}/${iso[1]}`;
+          const broken = raw.match(/^(\d{1,2})T[\d:.]+Z\/(\d{1,2})\/(\d{4})$/i);
+          if (broken) {
+            return `${broken[1].padStart(2, '0')}/${broken[2].padStart(2, '0')}/${broken[3]}`;
+          }
+          return raw;
+        })(row?.date_of_birth ?? row?.dateOfBirth ?? row?.dob)],
         [['status'], row?.status],
         [['parentName'], row?.parent_name ?? row?.parentName],
         [['parentPhone'], row?.parent_phone ?? row?.parentPhone],

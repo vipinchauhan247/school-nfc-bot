@@ -7,7 +7,8 @@
     "start": "node render-server.js",
     "check": "node --check render-server.js && node --check api/mmmjhs-bot.js && node --check api/erp-cloud.js && node --check api/erp-v2.js && node --check lib/erpLean.js && node --check js/cloudSync.js && node --check js/erpOutbox.js && node --check js/erpV2ReadModel.js && node --check js/erpMarksRealtime.js && node --check js/app.js",
     "test": "node test/egress-v2.test.js",
-    "test:marks-sync": "node test/marks-sync.test.js"
+    "test:marks-sync": "node test/marks-sync.test.js",
+    "test:dob": "node test/dob-format.test.js"
   },
   "engines": {
     "node": ">=18"

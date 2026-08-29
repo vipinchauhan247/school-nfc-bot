@@ -1102,7 +1102,7 @@ function getReportCardStudentInfoHtml(student, meta = {}) {
       <div style="font-size:0.9rem; color:#1e293b; min-width:220px; flex:1;">
         <div><strong>Father:</strong> ${escapeHtml(student.parentName || '—')}</div>
         <div><strong>Mother:</strong> ${escapeHtml(student.motherName || 'N/A')}</div>
-        <div><strong>DOB:</strong> <strong style="color:#0284c7;">${escapeHtml(formatDobToDDMMYYYY(student.dob))}</strong>${caste ? ` | <strong>Caste:</strong> ${escapeHtml(caste)}` : ''}</div>
+        <div><strong>DOB:</strong> <strong style="color:#0284c7;">${escapeHtml(formatStudentDob(student))}</strong>${caste ? ` | <strong>Caste:</strong> ${escapeHtml(caste)}` : ''}</div>
         ${shortAddress ? `<div><strong>Address:</strong> ${escapeHtml(shortAddress)}</div>` : ''}
         ${attendanceLine ? `<div><strong>${escapeHtml(attendanceLine)}</strong></div>` : ''}
         ${classTeacherName ? `<div><strong>Class Teacher:</strong> ${escapeHtml(classTeacherName)}</div>` : ''}
@@ -1251,9 +1251,25 @@ if (!SchoolData.directoryEntityVersions || typeof SchoolData.directoryEntityVers
 if (!SchoolData.directoryMutationIds || typeof SchoolData.directoryMutationIds !== 'object') SchoolData.directoryMutationIds = {};
 if (!SchoolData.directoryTombstones || typeof SchoolData.directoryTombstones !== 'object') SchoolData.directoryTombstones = {};
 
+function padDatePart(value) {
+  return String(value || '').padStart(2, '0');
+}
+
+function studentDobRaw(student) {
+  if (student == null) return '';
+  if (typeof student !== 'object') return student;
+  return student.dob || student.dateOfBirth || student.date_of_birth || '';
+}
+
+function formatStudentDob(student) {
+  return formatDobToDDMMYYYY(studentDobRaw(student));
+}
+
 function formatDobToDDMMYYYY(dobStr) {
   if (!dobStr || dobStr === 'N/A') return 'N/A';
   const str = String(dobStr).trim();
+  if (!str || str === 'N/A') return 'N/A';
+
   if (/^\d{5}$/.test(str)) {
     const serial = parseInt(str, 10);
     if (serial > 25000 && serial < 80000) {
@@ -1265,17 +1281,30 @@ function formatDobToDDMMYYYY(dobStr) {
       return `${dd}/${mm}/${yyyy}`;
     }
   }
-  if (str.includes('/')) return str;
-  if (str.includes('-')) {
-    const parts = str.split('-');
-    if (parts.length === 3) {
-      if (parts[0].length === 4) {
-        return `${parts[2]}/${parts[1]}/${parts[0]}`;
-      } else if (parts[2].length === 4) {
-        return `${parts[0]}/${parts[1]}/${parts[2]}`;
-      }
-    }
+
+  // Lean/cloud ISO dates were split on '-' as 2012-12-19T00:00:00.000Z →
+  // 19T00:00:00.000Z/12/2012. Repair that and any raw ISO datetime.
+  const corruptedIso = str.match(/^(\d{1,2})T[\d:.]+Z\/(\d{1,2})\/(\d{4})$/i);
+  if (corruptedIso) {
+    return `${padDatePart(corruptedIso[1])}/${padDatePart(corruptedIso[2])}/${corruptedIso[3]}`;
   }
+
+  const dmySlash = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (dmySlash) {
+    return `${padDatePart(dmySlash[1])}/${padDatePart(dmySlash[2])}/${dmySlash[3]}`;
+  }
+
+  const iso = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) {
+    return `${iso[3]}/${iso[2]}/${iso[1]}`;
+  }
+
+  const dmyDash = str.match(/^(\d{1,2})-(\d{1,2})-(\d{4})$/);
+  if (dmyDash) {
+    return `${padDatePart(dmyDash[1])}/${padDatePart(dmyDash[2])}/${dmyDash[3]}`;
+  }
+
+  if (str.includes('/') && !/T\d{2}:/.test(str)) return str;
   return str;
 }
 
@@ -1338,37 +1367,14 @@ function dateOfBirthInWords(dobStr) {
 
 function formatDobForDateInput(dobStr) {
   if (!dobStr || dobStr === 'N/A') return '';
-  const str = String(dobStr).trim();
-  if (/^\d{5}$/.test(str)) {
-    const serial = parseInt(str, 10);
-    if (serial > 25000 && serial < 80000) {
-      const date = new Date((serial - 25569) * 86400 * 1000);
-      const yyyy = date.getUTCFullYear();
-      const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
-      const dd = String(date.getUTCDate()).padStart(2, '0');
-      return `${yyyy}-${mm}-${dd}`;
-    }
+  const formatted = formatDobToDDMMYYYY(dobStr);
+  const dmy = String(formatted || '').match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (dmy) {
+    return `${dmy[3]}-${padDatePart(dmy[2])}-${padDatePart(dmy[1])}`;
   }
-  if (str.includes('/')) {
-    const parts = str.split('/');
-    if (parts.length === 3 && parts[2].length === 4) {
-      const dd = parts[0].padStart(2, '0');
-      const mm = parts[1].padStart(2, '0');
-      return `${parts[2]}-${mm}-${dd}`;
-    }
-  }
-  if (str.includes('-')) {
-    const parts = str.split('-');
-    if (parts.length === 3) {
-      if (parts[0].length === 4) return str;
-      if (parts[2].length === 4) {
-        const dd = parts[0].padStart(2, '0');
-        const mm = parts[1].padStart(2, '0');
-        return `${parts[2]}-${mm}-${dd}`;
-      }
-    }
-  }
-  return str;
+  const iso = String(dobStr).trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  return '';
 }
 
 function parseSimpleCsvRows(text) {
@@ -6572,7 +6578,7 @@ function buildAdmitCardHtml(student, term, schedule, options = {}) {
           </tr>
           <tr>
             <td><span>Father's Name</span><strong>${escapeHtml(student.parentName || '')}</strong></td>
-            <td><span>Date of Birth</span><strong>${escapeHtml(typeof formatDobToDDMMYYYY === 'function' ? formatDobToDDMMYYYY(student.dob) : (student.dob || '—'))}</strong></td>
+            <td><span>Date of Birth</span><strong>${escapeHtml(typeof formatStudentDob === 'function' ? formatStudentDob(student) : (student.dob || student.dateOfBirth || '—'))}</strong></td>
           </tr>
           <tr>
             <td colspan="2"><span>Class &amp; Section</span><strong>${escapeHtml(student.currentClass || '')} - ${escapeHtml(student.currentSection || '')}</strong></td>
@@ -11212,7 +11218,7 @@ function exportStudentsToExcel(classFilter) {
       csvEscape(detail.class || s.currentClass || ''),
       csvEscape(detail.section || s.currentSection || ''),
       csvEscape(s.address || ''),
-      csvEscape(formatDobToDDMMYYYY(s.dob) || ''),
+      csvEscape(formatStudentDob(s) || ''),
       csvEscape(s.gender || ''),
       csvEscape(s.parentPhone || ''),
       csvEscape(s.parentEmail || ''),
@@ -11332,7 +11338,7 @@ function renderStudentsPage(container) {
                     ${getStudentDirectoryPhotoHtml(s, 36)}
                     <div>
                       <strong style="color:var(--text-main);">${s.name}</strong><br>
-                      <small style="color:var(--text-muted);">${s.gender} | <strong style="color:var(--accent-primary);">DOB: ${formatDobToDDMMYYYY(s.dob)}</strong></small>
+                      <small style="color:var(--text-muted);">${s.gender} | <strong style="color:var(--accent-primary);">DOB: ${formatStudentDob(s)}</strong></small>
                     </div>
                   </td>
                   <td><span class="adm-no-chip">${s.admissionNo}</span></td>
@@ -12393,7 +12399,7 @@ function openEditStudentModal(admissionNo) {
             </div>
             <div>
               <label style="font-size:0.82rem; font-weight:700; color:#374151;">Date of Birth (DOB)</label>
-              <input type="date" id="editStudDob" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" value="${formatDobForDateInput(student.dob)}">
+              <input type="date" id="editStudDob" class="session-dropdown" style="width:100%; padding:10px; margin-top:4px;" value="${formatDobForDateInput(studentDobRaw(student))}">
             </div>
             <div>
               <label style="font-size:0.82rem; font-weight:700; color:#374151;">Parent Mobile Phone *</label>
@@ -12494,7 +12500,9 @@ async function saveEditedStudentDetails(admissionNo) {
   student.name = name;
   student.parentName = father;
   student.motherName = mother;
-  student.dob = dob ? formatDobToDDMMYYYY(dob) : student.dob;
+  student.dob = dob ? formatDobToDDMMYYYY(dob) : formatStudentDob(student);
+  if (!student.dob || student.dob === 'N/A') student.dob = studentDobRaw(student);
+  student.dateOfBirth = student.dob;
   student.parentPhone = phone || student.parentPhone;
   setStudentSchoolChatId(student, telegram || '');
   student.pen = pen || '';
@@ -12795,16 +12803,8 @@ function downloadSampleStudentCsvTemplate() {
 
 function formatAdmissionDateDisplay(raw) {
   if (!raw || raw === 'N/A') return '';
-  const str = String(raw).trim();
-  if (str.includes('/')) return str;
-  if (str.includes('-')) {
-    const parts = str.split('-');
-    if (parts.length === 3) {
-      if (parts[0].length === 4) return `${parts[2]}/${parts[1]}/${parts[0]}`;
-      return `${parts[0]}/${parts[1]}/${parts[2]}`;
-    }
-  }
-  return str;
+  const formatted = formatDobToDDMMYYYY(raw);
+  return formatted === 'N/A' ? '' : formatted;
 }
 
 function hasCsvValue(value) {
@@ -14393,7 +14393,7 @@ function openClassStudentsModal(className, targetSection = null) {
                   </td>
                   <td><span class="adm-no-chip">${s.admissionNo}</span></td>
                   <td><span class="badge badge-purple">${s.currentClass || className} - ${s.currentSection || s.section || 'A'}</span></td>
-                  <td><strong style="color:var(--accent-primary);">DOB: ${formatDobToDDMMYYYY(s.dob)}</strong></td>
+                  <td><strong style="color:var(--accent-primary);">DOB: ${formatStudentDob(s)}</strong></td>
                   <td style="color:var(--text-main);">${s.parentName}</td>
                   <td style="color:var(--text-main);">${s.parentPhone}</td>
                   <td>
@@ -23725,8 +23725,8 @@ function getTransferCertificateDetailsHtml(student, issuedCertificate = null) {
     ['Mother Name', student.motherName || '________________'],
     ['Class / Section', `${classLabel} - ${sec}`],
     ['Address', address],
-    ['Date of Birth', formatDobToDDMMYYYY(student.dob) || 'As per record'],
-    ['Date of Birth in Words', dateOfBirthInWords(student.dob)],
+    ['Date of Birth', formatStudentDob(student) || 'As per record'],
+    ['Date of Birth in Words', dateOfBirthInWords(studentDobRaw(student))],
     ['Date of Leaving', leavingDate],
     ['Reason for Leaving', leavingReason],
     ['Conduct & Character', 'Good'],
@@ -23847,7 +23847,7 @@ function generateCertificate(admissionNo, certType, issuedCertificate = null) {
               <div style="border:1px solid #cbd5e1; padding:8px; border-radius:8px;"><small style="color:#64748b;">Student</small><div contenteditable="true" style="font-weight:900;">${student.name}</div></div>
               <div style="border:1px solid #cbd5e1; padding:8px; border-radius:8px;"><small style="color:#64748b;">Admission No</small><div contenteditable="true" style="font-weight:900;">${student.admissionNo}</div></div>
               <div style="border:1px solid #cbd5e1; padding:8px; border-radius:8px;"><small style="color:#64748b;">Class / Section</small><div contenteditable="true" style="font-weight:900;">${student.currentClass || student.class || 'LKG'} - ${student.currentSection || student.section || 'A'}</div></div>
-              <div style="border:1px solid #cbd5e1; padding:8px; border-radius:8px;"><small style="color:#64748b;">Date of Birth</small><div contenteditable="true" style="font-weight:900;">${formatDobToDDMMYYYY(student.dob) || 'As per record'}</div></div>
+              <div style="border:1px solid #cbd5e1; padding:8px; border-radius:8px;"><small style="color:#64748b;">Date of Birth</small><div contenteditable="true" style="font-weight:900;">${formatStudentDob(student) || 'As per record'}</div></div>
             </div>
             <div contenteditable="true" style="position:relative; z-index:1; font-family:Georgia, 'Times New Roman', serif; font-size:20px; line-height:1.9; color:#111827; text-align:justify; margin:30px 22px 20px; padding:18px; border-left:5px solid #d4af37; background:rgba(255,255,255,0.76);">
               ${certText}
@@ -24834,7 +24834,7 @@ function openStudentProfile(admissionNo) {
               <div style="margin-top:6px; color:#c7d2fe; font-size:0.88rem; display:flex; gap:16px; flex-wrap:wrap;">
                 <span><i class="fa-solid fa-graduation-cap" style="color:#a5b4fc;"></i> <strong>${cls} - ${sec}</strong></span>
                 <span><i class="fa-solid fa-venus-mars" style="color:#a5b4fc;"></i> ${student.gender || 'Student'}</span>
-                <span><i class="fa-solid fa-calendar-days" style="color:#a5b4fc;"></i> DOB: <strong>${formatDobToDDMMYYYY(student.dob)}</strong></span>
+                <span><i class="fa-solid fa-calendar-days" style="color:#a5b4fc;"></i> DOB: <strong>${formatStudentDob(student)}</strong></span>
               </div>
 
               ${attPercentage !== null ? `<div style="margin-top:8px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
