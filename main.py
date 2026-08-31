@@ -71,11 +71,16 @@ def warm():
     """
     Call before school gate / recess (or via UptimeRobot every 5 min).
     Reloads student cache so first taps stay fast.
+    On Vercel, background threads may not finish — load sync when cache is empty.
     """
-    threading.Thread(
-        target=nfc_gate.refresh_student_cache, kwargs={"force": True}, daemon=True
-    ).start()
     cache = nfc_gate.cache_status()
+    if not cache.get("cards"):
+        nfc_gate.refresh_student_cache(force=True)
+        cache = nfc_gate.cache_status()
+    else:
+        threading.Thread(
+            target=nfc_gate.refresh_student_cache, kwargs={"force": True}, daemon=True
+        ).start()
     return jsonify(
         {
             "ok": True,
