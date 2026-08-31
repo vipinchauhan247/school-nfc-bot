@@ -4,7 +4,8 @@
  * NFC:  PN532 (I2C)
  * OLED: SSD1306 128x64 (I2C, address 0x3C)
  *
- * Server: @Vipinbellbot on Render — GET /nfc?uid=XXXX
+ * Server: @Vipinbellbot on Vercel — GET /nfc?uid=XXXX
+ *          https://school-nfc-bot.vercel.app/nfc?uid=...
  * Response (plain text):
  *   SUCCESS:Name:IN:HH:mm:ss
  *   SUCCESS:Name:OUT:HH:mm:ss
@@ -34,8 +35,8 @@
 const char* WIFI_SSID     = "YOUR_WIFI_NAME";
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
-// @Vipinbellbot Render URL (no trailing slash)
-const char* SERVER_BASE   = "https://school-nfc-bot.onrender.com";
+// @Vipinbellbot Vercel URL (no trailing slash; /nfc is appended in code)
+const char* SERVER_BASE   = "https://school-nfc-bot.vercel.app";
 
 // Optional: call /warm on boot so first morning tap is fast
 const bool WARM_ON_BOOT   = true;
