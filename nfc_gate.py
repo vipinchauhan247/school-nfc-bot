@@ -12,6 +12,7 @@ Attendance memory is reconciled from the Sheet so deleted rows clear DUPLICATE.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from datetime import datetime
@@ -23,6 +24,10 @@ import bot
 IST = ZoneInfo("Asia/Kolkata")
 CACHE_TTL_SEC = 120
 IN_CUTOFF_HOUR = 11  # before 11:00 = IN, else OUT
+
+
+def _is_vercel() -> bool:
+    return bool(os.environ.get("VERCEL"))
 
 _lock = threading.Lock()
 _students_by_uid: Dict[str, dict] = {}
@@ -237,23 +242,34 @@ def _reconcile_duplicate(uid: str, admission: str, day: str, scan_type: str) -> 
         print(f"[NFC] reconcile error: {e}")
 
 
+def _telegram_admin_new_card(uid: str) -> None:
+    bot.send_telegram_message(
+        bot.ADMIN_CHAT_ID,
+        "🆕 <b>New Unregistered NFC Card Scanned!</b>\n\n"
+        f"<b>Card UID:</b> <code>{bot.escape_html(uid)}</code>\n\n"
+        "To link this card to a student, reply:\n"
+        f"👉 <code>/link {bot.escape_html(uid)} &lt;Admission No&gt;</code>",
+    )
+
+
 def _background_admin_new_card(uid: str) -> None:
     try:
-        refresh_student_cache(force=True)
-        with _lock:
-            if uid in _students_by_uid:
-                print(f"[NFC] UID {uid} appeared after refresh — skip admin alert")
-                return
-        bot.send_telegram_message(
-            bot.ADMIN_CHAT_ID,
-            "🆕 <b>New Unregistered NFC Card Scanned!</b>\n\n"
-            f"<b>Card UID:</b> <code>{bot.escape_html(uid)}</code>\n\n"
-            "To link this card to a student, reply:\n"
-            f"👉 <code>/link {bot.escape_html(uid)} &lt;Admission No&gt;</code>",
-        )
+        _telegram_admin_new_card(uid)
         bot.apps_script_get({"uid": uid}, timeout=45)
+        if not _is_vercel():
+            threading.Thread(
+                target=refresh_student_cache, kwargs={"force": True}, daemon=True
+            ).start()
     except Exception as e:
         print(f"[NFC] new-card notify error: {e}")
+
+
+def _background_admin_new_card_sheet(uid: str) -> None:
+    """Apps Script log for new card (after Telegram already sent)."""
+    try:
+        bot.apps_script_get({"uid": uid}, timeout=45)
+    except Exception as e:
+        print(f"[NFC] new-card sheet log error: {e}")
 
 
 def process_nfc_tap(raw_uid: str) -> str:
@@ -276,7 +292,18 @@ def process_nfc_tap(raw_uid: str) -> str:
         return "ERROR"
 
     if not student:
-        threading.Thread(target=_background_admin_new_card, args=(uid,), daemon=True).start()
+        if _is_vercel():
+            try:
+                _telegram_admin_new_card(uid)
+            except Exception as e:
+                print(f"[NFC] new-card telegram error: {e}")
+            threading.Thread(
+                target=_background_admin_new_card_sheet, args=(uid,), daemon=True
+            ).start()
+        else:
+            threading.Thread(
+                target=_background_admin_new_card, args=(uid,), daemon=True
+            ).start()
         return "INVALID CARD"
 
     now = _now_ist()
@@ -291,7 +318,6 @@ def process_nfc_tap(raw_uid: str) -> str:
         existing = bucket.get("in") if scan_type == "IN" else bucket.get("out")
 
     if existing:
-        # Sheet may have been cleared — reconcile in background; tap again in a few seconds
         threading.Thread(
             target=_reconcile_duplicate,
             args=(uid, admission, day, scan_type),
