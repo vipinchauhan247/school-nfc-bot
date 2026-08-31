@@ -100,7 +100,7 @@ def refresh_student_cache(force: bool = False) -> bool:
     with _lock:
         if not force and _students_by_uid and (now - _cache_loaded_at) < CACHE_TTL_SEC:
             return True
-        if _cache_loading:
+        if _cache_loading and not force:
             return bool(_students_by_uid)
         _cache_loading = True
 
@@ -135,7 +135,7 @@ def refresh_student_cache(force: bool = False) -> bool:
         print(f"[NFC] cache refreshed: {len(by_adm)} students, {len(by_uid)} cards")
         # Keep DUPLICATE memory aligned with Attendance tab
         refresh_attendance_from_sheet()
-        return True
+        return bool(by_adm)
     except Exception as e:
         _last_refresh_error = str(e)
         print(f"[NFC] cache refresh error: {e}")
