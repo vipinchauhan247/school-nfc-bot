@@ -39,6 +39,11 @@ const char* SERVER_BASE = "https://school-nfc-bot.vercel.app";
 
 Do **not** monitor `/nfc` in UptimeRobot (fake taps).
 
-## Cold start
+## After Git connect on Vercel
+
+1. **Deployments** tab — wait for a build from `main` (Ready = green).
+2. Open `/warm` — must show *"Warming NFC student + attendance cache..."* (not *"no warm cache required"*).
+3. If still old text: **Deployments → Redeploy** latest `main`, or **Create Deployment** → branch `main`.
+
 
 First request after long idle may still take ~2–3s (serverless boot). UptimeRobot every 5 min minimizes this. If cache is empty, OLED shows `ERROR` once — tap again after `/warm` completes.

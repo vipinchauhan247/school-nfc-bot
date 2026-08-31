@@ -1,5 +1,5 @@
 """
-MMM School NFC Bot — Render 24/7 (@Vipinbellbot only).
+MMM School NFC Bot — Render 24/7 or Vercel (@Vipinbellbot only).
 
 Telegram: POST /bot_webhook
 NFC box:  GET  /nfc?uid=XXXX   (fast OLED reply; Sheet/Telegram in background)
@@ -19,14 +19,25 @@ from config import SCHOOL_NAME, PORT, BOT_TOKEN
 app = Flask(__name__)
 
 
+def _public_base_url() -> str:
+    vercel = os.environ.get("VERCEL_URL", "").strip()
+    if vercel:
+        return f"https://{vercel}"
+    render = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+    if render:
+        return render.rstrip("/")
+    return request.url_root.rstrip("/")
+
+
 @app.route("/")
 def index():
+    platform = "Vercel" if os.environ.get("VERCEL") else "Render"
     return (
         "<h1>MMM School NFC Bot</h1>"
-        "<p>@Vipinbellbot — 24/7 on Render</p>"
+        f"<p>@Vipinbellbot — fast NFC on {platform}</p>"
         "<ul>"
         "<li><a href='/health'>/health</a> — status check</li>"
-        "<li><a href='/warm'>/warm</a> — wake server + reload card cache (use before 8 AM / 2 PM)</li>"
+        "<li><a href='/warm'>/warm</a> — reload card cache (UptimeRobot every 5 min)</li>"
         "<li><a href='/setup'>/setup</a> — connect Telegram webhook (open once after deploy)</li>"
         "<li><code>/nfc?uid=CARDUID</code> — fast NFC gate for ESP8266</li>"
         "</ul>",
@@ -37,6 +48,15 @@ def index():
 @app.route("/health")
 def health():
     cache = nfc_gate.cache_status()
+    if os.environ.get("VERCEL"):
+        return jsonify(
+            {
+                "ok": True,
+                "platform": "vercel",
+                "service": "@Vipinbellbot NFC webhook",
+                "cache": cache,
+            }
+        )
     return (
         f"OK - @Vipinbellbot active on Render | "
         f"students={cache.get('students')} cards={cache.get('cards')} "
@@ -49,16 +69,19 @@ def health():
 @app.route("/warm")
 def warm():
     """
-    Call this before school gate / recess (or via UptimeRobot every 5 min).
-    Wakes Render and reloads student cache so first taps stay fast.
+    Call before school gate / recess (or via UptimeRobot every 5 min).
+    Reloads student cache so first taps stay fast.
     """
-    threading.Thread(target=nfc_gate.refresh_student_cache, kwargs={"force": True}, daemon=True).start()
+    threading.Thread(
+        target=nfc_gate.refresh_student_cache, kwargs={"force": True}, daemon=True
+    ).start()
     cache = nfc_gate.cache_status()
     return jsonify(
         {
             "ok": True,
             "message": "Warming NFC cache in background",
             "cache": cache,
+            "platform": "vercel" if os.environ.get("VERCEL") else "render",
         }
     )
 
@@ -97,14 +120,14 @@ def telegram_webhook():
 
 @app.route("/setup")
 def setup():
-    """Open once after deploy: https://school-nfc-bot.onrender.com/setup"""
-    base = os.environ.get("RENDER_EXTERNAL_URL", request.url_root.rstrip("/"))
+    """Open once after deploy to register Telegram webhook."""
+    base = _public_base_url()
     if not BOT_TOKEN:
-        return "Set BOT_TOKEN in Render Environment first.", 500
+        return "Set BOT_TOKEN in Environment first.", 500
     ok = bot.register_webhook(base)
     if ok:
         return f"Webhook OK: {base}/bot_webhook", 200
-    return "Webhook failed — check Render logs.", 500
+    return "Webhook failed — check deployment logs.", 500
 
 
 def keep_alive():
@@ -148,5 +171,5 @@ if __name__ == "__main__":
         threading.Thread(target=warm_nfc_cache, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, debug=False)
 else:
-    # Gunicorn / Render import path
+    # Gunicorn / Render / Vercel import path — warm cache on cold start
     threading.Thread(target=warm_nfc_cache, daemon=True).start()
