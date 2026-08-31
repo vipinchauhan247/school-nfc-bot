@@ -30,6 +30,7 @@ _students_by_adm: Dict[str, dict] = {}
 _attendance_today: Dict[str, dict] = {}  # admission -> {"date", "in", "out"}
 _cache_loaded_at = 0.0
 _cache_loading = False
+_last_refresh_error = ""
 
 
 def _now_ist() -> datetime:
@@ -90,7 +91,11 @@ def refresh_attendance_from_sheet() -> bool:
 
 def refresh_student_cache(force: bool = False) -> bool:
     """Load students from Apps Script. Call from background / startup only."""
-    global _cache_loaded_at, _cache_loading, _students_by_uid, _students_by_adm
+    global _cache_loaded_at, _cache_loading, _students_by_uid, _students_by_adm, _last_refresh_error
+    if not bot.APPS_SCRIPT_URL:
+        _last_refresh_error = "APPS_SCRIPT_URL not set in environment"
+        print(f"[NFC] {_last_refresh_error}")
+        return False
     now = time.time()
     with _lock:
         if not force and _students_by_uid and (now - _cache_loaded_at) < CACHE_TTL_SEC:
@@ -124,11 +129,15 @@ def refresh_student_cache(force: bool = False) -> bool:
                 _students_by_uid = by_uid
                 _students_by_adm = by_adm
                 _cache_loaded_at = time.time()
+                _last_refresh_error = ""
+            else:
+                _last_refresh_error = "get_all_uids returned no students (check Apps Script)"
         print(f"[NFC] cache refreshed: {len(by_adm)} students, {len(by_uid)} cards")
         # Keep DUPLICATE memory aligned with Attendance tab
         refresh_attendance_from_sheet()
         return True
     except Exception as e:
+        _last_refresh_error = str(e)
         print(f"[NFC] cache refresh error: {e}")
         return False
     finally:
@@ -302,4 +311,5 @@ def cache_status() -> dict:
             "cards": len(_students_by_uid),
             "age_sec": int(time.time() - _cache_loaded_at) if _cache_loaded_at else None,
             "attendance_rows": len(_attendance_today),
+            "last_error": _last_refresh_error or None,
         }

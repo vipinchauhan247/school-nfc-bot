@@ -14,7 +14,7 @@ from flask import Flask, request, Response, jsonify
 
 import bot
 import nfc_gate
-from config import SCHOOL_NAME, PORT, BOT_TOKEN
+from config import SCHOOL_NAME, PORT, BOT_TOKEN, APPS_SCRIPT_URL
 
 app = Flask(__name__)
 
@@ -54,6 +54,8 @@ def health():
                 "ok": True,
                 "platform": "vercel",
                 "service": "@Vipinbellbot NFC webhook",
+                "botConfigured": bool(BOT_TOKEN),
+                "appsScriptConfigured": bool(APPS_SCRIPT_URL),
                 "cache": cache,
             }
         )
@@ -74,17 +76,33 @@ def warm():
     On Vercel, background threads may not finish — load sync when cache is empty.
     """
     cache = nfc_gate.cache_status()
+    refresh_ok = False
     if not cache.get("cards"):
-        nfc_gate.refresh_student_cache(force=True)
+        refresh_ok = nfc_gate.refresh_student_cache(force=True)
         cache = nfc_gate.cache_status()
     else:
         threading.Thread(
             target=nfc_gate.refresh_student_cache, kwargs={"force": True}, daemon=True
         ).start()
+        refresh_ok = True
+
+    cards = cache.get("cards") or 0
+    if cards:
+        message = "NFC cache loaded"
+    elif not APPS_SCRIPT_URL:
+        message = "Cache empty — add APPS_SCRIPT_URL in Vercel Environment Variables"
+    elif not refresh_ok:
+        message = "Cache refresh failed — see cache.last_error"
+    else:
+        message = "Cache still empty after refresh — check Apps Script get_all_uids"
+
     return jsonify(
         {
-            "ok": True,
-            "message": "Warming NFC cache in background",
+            "ok": cards > 0,
+            "message": message,
+            "botConfigured": bool(BOT_TOKEN),
+            "appsScriptConfigured": bool(APPS_SCRIPT_URL),
+            "cacheRefreshOk": refresh_ok,
             "cache": cache,
             "platform": "vercel" if os.environ.get("VERCEL") else "render",
         }
