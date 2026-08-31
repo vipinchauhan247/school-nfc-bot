@@ -47,8 +47,11 @@ def _normalize_uid(raw: str) -> str:
 
 
 def _safe_name(name: str) -> str:
-    """OLED-safe ASCII; keep readable."""
-    clean = "".join(ch for ch in str(name or "Student") if 32 <= ord(ch) <= 126).strip()
+    """OLED-safe ASCII; no colons (ESP parses SUCCESS:Name:IN:time)."""
+    clean = "".join(
+        ch for ch in str(name or "Student")
+        if 32 <= ord(ch) <= 126 and ch != ":"
+    ).strip()
     return (clean or "Student")[:40]
 
 

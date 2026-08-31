@@ -120,9 +120,13 @@ def nfc_tap():
     )
     if not uid and request.form:
         uid = request.form.get("uid", "")
-    text = nfc_gate.process_nfc_tap(uid)
+    try:
+        text = nfc_gate.process_nfc_tap(uid)
+    except Exception as e:
+        print(f"[NFC] process error uid={uid}: {e}")
+        text = "ERROR"
     print(f"[NFC] uid={uid} -> {text}")
-    return Response(text, status=200, mimetype="text/plain")
+    return Response(text.strip(), status=200, mimetype="text/plain")
 
 
 @app.route("/bot_webhook", methods=["POST"])
