@@ -4,3 +4,4 @@ __pycache__/
 school.db
 *.db
 node_modules/
+.vercel
