@@ -3,3 +3,4 @@ __pycache__/
 .env
 school.db
 *.db
+node_modules/

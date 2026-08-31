@@ -162,6 +162,18 @@ def _bump_nfc_cache():
         nfc_gate.invalidate_student_cache()
     except Exception:
         pass
+    # Vercel serverless: Node NFC cache is separate from Python webhook memory.
+    base = (
+        os.environ.get("PUBLIC_BASE_URL", "").strip()
+        or os.environ.get("VERCEL_URL", "").strip()
+    )
+    if base and not base.startswith("http"):
+        base = f"https://{base}"
+    if base:
+        try:
+            requests.get(base.rstrip("/") + "/warm", timeout=8)
+        except Exception as e:
+            print(f"[NFC] warm ping after cache bump: {e}")
 
 
 def chat_linked_to_admission(chat_id, admission_no):

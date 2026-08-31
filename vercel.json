@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "rewrites": [
+    { "source": "/nfc", "destination": "/api/nfc" },
+    { "source": "/warm", "destination": "/api/warm" },
+    { "source": "/health", "destination": "/api/health" },
+    { "source": "/bot_webhook", "destination": "/api/bot_webhook" },
+    { "source": "/setup", "destination": "/api/setup" },
+    { "source": "/", "destination": "/api/index" }
+  ],
+  "functions": {
+    "api/nfc.js": { "maxDuration": 10 },
+    "api/warm.js": { "maxDuration": 10 },
+    "api/bot_webhook.py": { "maxDuration": 30 }
+  },
+  "headers": [
+    {
+      "source": "/(nfc|warm|health|bot_webhook|setup)",
+      "headers": [{ "key": "Cache-Control", "value": "no-store" }]
+    }
+  ]
+}
