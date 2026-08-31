@@ -654,6 +654,11 @@ void sendAttendanceToGoogleSheets(String uidStr) {
       playSoundInvalidCard();
       delay(2500);
       renderReadyScreen();
+    } else if (responseText == "ERROR") {
+      showMessageCompact("SERVER BUSY", "Cache loading", "Tap again in 5 sec");
+      playSoundDuplicate();
+      delay(2500);
+      renderReadyScreen();
     } else {
       Serial.println("[HTTP] Rejected malformed response; attendance not confirmed.");
       showMessageCompact("SERVER ERROR", "Invalid response", "Not confirmed");

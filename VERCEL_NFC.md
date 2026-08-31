@@ -1,5 +1,7 @@
 # Vercel NFC gate (fast taps)
 
+**Full reference:** see [`NFC_FAST_RESPONSE_GUIDE.md`](NFC_FAST_RESPONSE_GUIDE.md) (architecture, 1–2 s design, all fixes).
+
 Render free tier sleeps; this bot is deployed on **Vercel** with the same fast-path design as `nfc_gate.py`:
 
 1. **`/nfc`** — instant reply from in-memory cache (target &lt; 1s on a warm instance)
@@ -42,7 +44,7 @@ Do **not** monitor `/nfc` in UptimeRobot (fake taps).
 ## After Git connect on Vercel
 
 1. **Deployments** tab — wait for a build from `main` (Ready = green).
-2. Open `/warm` — must show *"Warming NFC student + attendance cache..."* (not *"no warm cache required"*).
+2. Open `/warm` — must show *"Warming NFC cache in background"* with a `cache` object (not *"no warm cache required"*).
 3. If still old text: **Deployments → Redeploy** latest `main`, or **Create Deployment** → branch `main`.
 
 
