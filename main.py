@@ -194,5 +194,6 @@ if __name__ == "__main__":
         threading.Thread(target=warm_nfc_cache, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, debug=False)
 else:
-    # Gunicorn / Render / Vercel import path — warm cache on cold start
-    threading.Thread(target=warm_nfc_cache, daemon=True).start()
+    # Render: warm cache on boot. Vercel: use /warm (UptimeRobot) — avoid race on import.
+    if not os.environ.get("VERCEL"):
+        threading.Thread(target=warm_nfc_cache, daemon=True).start()
