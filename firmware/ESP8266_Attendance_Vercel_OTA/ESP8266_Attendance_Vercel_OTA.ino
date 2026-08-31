@@ -541,7 +541,7 @@ bool parseDuplicateResponse(const String& response, String& studentName, String&
 }
 
 bool isValidatedServerResponse(const String& response) {
-  if (response == "INVALID CARD") return true;
+  if (response == "INVALID CARD" || response == "ERROR") return true;
   String studentName, typeStr, timeStr;
   if (parseSuccessResponse(response, studentName, typeStr, timeStr)) return true;
   return parseDuplicateResponse(response, studentName, timeStr);
