@@ -238,4 +238,287 @@ Registered card should return `SUCCESS:...` in ~1–2 s on the box when cache is
 
 ---
 
+## Reference code (use this to rebuild fast NFC)
+
+**Full live files in repo (always use these, do not rewrite from memory):**
+
+| File | Path |
+|------|------|
+| Fast gate logic | `nfc_gate.py` |
+| Flask routes | `main.py` |
+| Telegram + Sheet API | `bot.py` |
+| Config / env | `config.py` |
+| Vercel deploy | `vercel.json` |
+| ESP firmware | `firmware/ESP8266_Attendance_Vercel_OTA/ESP8266_Attendance_Vercel_OTA.ino` |
+
+**Rule:** `/nfc` must **never** call `apps_script_get()` and wait before returning text to the ESP.  
+Sheet + Telegram = **after** reply (thread on Render; see Vercel notes below).
+
+---
+
+### 1. `nfc_gate.py` — in-memory cache (globals)
+
+```python
+IST = ZoneInfo("Asia/Kolkata")
+CACHE_TTL_SEC = 120          # refresh roster from Sheet every 2 min (background)
+IN_CUTOFF_HOUR = 11          # before 11:00 IST = IN, else OUT
+
+_students_by_uid: Dict[str, dict] = {}   # NFC UID -> student row
+_students_by_adm: Dict[str, dict] = {}   # admission -> student row
+_attendance_today: Dict[str, dict] = {}  # admission -> {date, in, out}
+_cache_loaded_at = 0.0
+_cache_loading = False
+
+def _normalize_uid(raw: str) -> str:
+    return str(raw or "").replace(" ", "").replace(":", "").replace("-", "").upper()
+
+def _safe_name(name: str) -> str:
+    # No colons — ESP parses SUCCESS:Name:IN:HH:mm:ss
+    clean = "".join(ch for ch in str(name or "Student") if 32 <= ord(ch) <= 126 and ch != ":")
+    return (clean.strip() or "Student")[:40]
+```
+
+---
+
+### 2. `nfc_gate.py` — load cache (only on `/warm`, boot, or background — **not** on every tap)
+
+```python
+def refresh_student_cache(force: bool = False) -> bool:
+    if not bot.APPS_SCRIPT_URL:
+        return False
+    with _lock:
+        if not force and _students_by_uid and (time.time() - _cache_loaded_at) < CACHE_TTL_SEC:
+            return True
+        if _cache_loading and not force:
+            return bool(_students_by_uid)
+        _cache_loading = True
+    try:
+        rows = bot.get_all_students()  # Apps Script action=get_all_uids
+        by_uid, by_adm = {}, {}
+        for row in rows or []:
+            adm = bot.normalize_admission(row.get("admissionNo", ""))
+            if not adm:
+                continue
+            student = {
+                "admissionNo": adm,
+                "name": str(row.get("name") or "").strip() or f"Student {adm}",
+                "nfcUid": _normalize_uid(row.get("nfcUid", "")),
+                ...
+            }
+            by_adm[adm.lower()] = student
+            if student["nfcUid"]:
+                by_uid[student["nfcUid"]] = student
+        with _lock:
+            if by_adm:  # never wipe good cache on failed fetch
+                _students_by_uid = by_uid
+                _students_by_adm = by_adm
+                _cache_loaded_at = time.time()
+        refresh_attendance_from_sheet()  # action=today_attendance
+        return bool(by_adm)
+    finally:
+        with _lock:
+            _cache_loading = False
+```
+
+---
+
+### 3. `nfc_gate.py` — **`process_nfc_tap`** (this is what makes 1–2 s taps)
+
+```python
+def process_nfc_tap(raw_uid: str) -> str:
+  uid = _normalize_uid(raw_uid)
+  if not uid:
+      return "INVALID CARD"
+
+  _schedule_cache_refresh(force=False)  # background only, never blocks tap
+
+  with _lock:
+      student = _students_by_uid.get(uid)
+      cache_empty = not _students_by_uid
+
+  if cache_empty:
+      _schedule_cache_refresh(force=True)
+      return "ERROR"   # ESP: tap again after /warm
+
+  if not student:
+      # Vercel: Telegram MUST run before HTTP response ends
+      if _is_vercel():
+          try:
+              _telegram_admin_new_card(uid)
+          except Exception as e:
+              print(f"[NFC] new-card telegram error: {e}")
+          threading.Thread(target=_background_admin_new_card_sheet, args=(uid,), daemon=True).start()
+      else:
+          threading.Thread(target=_background_admin_new_card, args=(uid,), daemon=True).start()
+      return "INVALID CARD"
+
+  now = _now_ist()
+  day = now.strftime("%Y-%m-%d")
+  time_str = now.strftime("%H:%M:%S")
+  scan_type = "IN" if now.hour < IN_CUTOFF_HOUR else "OUT"
+  name = _safe_name(student.get("name") or "Student")
+  admission = bot.normalize_admission(student.get("admissionNo", ""))
+
+  bucket = _attendance_bucket(admission, day)
+  with _lock:
+      existing = bucket.get("in") if scan_type == "IN" else bucket.get("out")
+
+  if existing:
+      threading.Thread(target=_reconcile_duplicate, args=(uid, admission, day, scan_type), daemon=True).start()
+      return f"DUPLICATE:{name}:{existing}"
+
+  _mark_local(admission, day, scan_type, time_str)
+  threading.Thread(target=_background_sheet_sync, args=(uid,), daemon=True).start()
+  return f"SUCCESS:{name}:{scan_type}:{time_str}"   # OLED gets this in ~1s
+```
+
+---
+
+### 4. `nfc_gate.py` — background Sheet + parent Telegram (after SUCCESS)
+
+```python
+def _background_sheet_sync(uid: str) -> None:
+    # Apps Script ?uid=... writes Attendance row + sends parent Telegram
+    result = bot.apps_script_get({"uid": uid}, timeout=45)
+    refresh_attendance_from_sheet()
+```
+
+On **Vercel**, this thread may not finish after the response. Registered taps still show SUCCESS fast;  
+Sheet/Telegram may lag until instance stays alive briefly. **Do not** move this before `return SUCCESS`  
+or taps become 10–20 s again.
+
+---
+
+### 5. `bot.py` — Apps Script helpers (used by cache, not by fast tap path)
+
+```python
+def apps_script_get(params, timeout=25):
+    if not APPS_SCRIPT_URL:
+        return None
+    resp = requests.get(APPS_SCRIPT_URL, params=params, timeout=timeout, allow_redirects=True)
+    try:
+        return resp.json()
+    except Exception:
+        return {"raw": (resp.text or "").strip(), "ok": resp.ok}
+
+def get_all_students():
+    data = apps_script_get({"action": "get_all_uids"}, timeout=45)
+    return data if isinstance(data, list) else []
+```
+
+**Apps Script must support:**
+
+| Param | Purpose |
+|-------|---------|
+| `action=get_all_uids` | Load Students sheet → cache |
+| `action=today_attendance` | Today's IN/OUT for DUPLICATE memory |
+| `uid=XXXX` | Record tap + parent Telegram |
+| `action=peek_uid` | Reconcile DUPLICATE after sheet delete |
+
+---
+
+### 6. `main.py` — Flask routes
+
+```python
+@app.route("/nfc", methods=["GET", "POST"])
+def nfc_tap():
+    uid = request.args.get("uid") or request.args.get("UID") or ""
+    try:
+        text = nfc_gate.process_nfc_tap(uid)
+    except Exception as e:
+        print(f"[NFC] process error uid={uid}: {e}")
+        text = "ERROR"
+    return Response(text.strip(), status=200, mimetype="text/plain")  # NOT json
+
+@app.route("/warm")
+def warm():
+    cache = nfc_gate.cache_status()
+    if not cache.get("cards"):
+        # Vercel: must load sync when empty (threads don't survive)
+        nfc_gate.refresh_student_cache(force=True)
+        cache = nfc_gate.cache_status()
+    else:
+        threading.Thread(target=nfc_gate.refresh_student_cache, kwargs={"force": True}, daemon=True).start()
+    return jsonify({"ok": cache.get("cards", 0) > 0, "cache": cache, ...})
+```
+
+---
+
+### 7. `vercel.json` — deploy Flask + `nfc_gate.py` (do not use mixed Node `api/nfc.js`)
+
+```json
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "main.py",
+      "use": "@vercel/python",
+      "config": { "maxLambdaSize": "15mb", "maxDuration": 60 }
+    }
+  ],
+  "routes": [{ "src": "/(.*)", "dest": "main.py" }]
+}
+```
+
+`requirements.txt` must include: `flask`, `requests`
+
+---
+
+### 8. ESP8266 — URL and response parsing
+
+```cpp
+const char* ATTENDANCE_SERVER_URL = "https://school-nfc-bot.vercel.app/nfc";
+// Request: ATTENDANCE_SERVER_URL + "?uid=" + uidStr
+
+bool parseSuccessResponse(const String& response, String& studentName, String& typeStr, String& timeStr) {
+  if (!response.startsWith("SUCCESS:")) return false;
+  int inPos = response.indexOf(":IN:");
+  int outPos = response.indexOf(":OUT:");
+  // Parse using :IN: or :OUT: markers (names may contain other characters)
+  ...
+}
+
+bool isValidatedServerResponse(const String& response) {
+  if (response == "INVALID CARD" || response == "ERROR") return true;
+  ...
+}
+```
+
+---
+
+### 9. Rebuild checklist (new server / new host)
+
+1. Copy `nfc_gate.py`, `main.py`, `bot.py`, `config.py`, `vercel.json`, `requirements.txt`.
+2. Set env: `BOT_TOKEN`, `APPS_SCRIPT_URL`, `ADMIN_CHAT_ID`.
+3. Deploy Flask — **never** replace `/nfc` with direct Apps Script proxy.
+4. Point UptimeRobot at `/warm` every 5 min.
+5. Confirm `/warm` shows `cards` > 0.
+6. Test: `curl "https://YOUR_HOST/nfc?uid=TEST"` → `INVALID CARD` in &lt;1 s when warm.
+7. Flash ESP with `ATTENDANCE_SERVER_URL` pointing to `YOUR_HOST/nfc`.
+
+---
+
+### 10. What NOT to do (causes 10–20 s taps)
+
+```python
+# BAD — blocks ESP on every tap
+def nfc_tap():
+    result = bot.apps_script_get({"uid": uid}, timeout=45)
+    return result["raw"]
+
+# BAD — no cache
+def nfc_tap():
+    student = bot.find_student_by_uid_slow(uid)  # hits Sheet every time
+```
+
+```javascript
+// BAD — Vercel Node without persistent cache
+export default async function handler(req, res) {
+  const r = await fetch(APPS_SCRIPT_URL + "?uid=" + uid);  // 5–15 s every tap
+  res.end(await r.text());
+}
+```
+
+---
+
 *Last updated: August 2026 — MMM JHS NFC gate on Vercel.*
