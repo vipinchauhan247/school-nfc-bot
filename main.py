@@ -14,19 +14,19 @@ from flask import Flask, request, Response, jsonify
 
 import bot
 import nfc_gate
-from config import SCHOOL_NAME, PORT, BOT_TOKEN, APPS_SCRIPT_URL
+from config import SCHOOL_NAME, PORT, BOT_TOKEN, APPS_SCRIPT_URL, public_base_url
 
 app = Flask(__name__)
 
 
 def _public_base_url() -> str:
-    vercel = os.environ.get("VERCEL_URL", "").strip()
-    if vercel:
-        return f"https://{vercel}"
-    render = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
-    if render:
-        return render.rstrip("/")
-    return request.url_root.rstrip("/")
+    configured = public_base_url()
+    if configured:
+        return configured
+    try:
+        return request.url_root.rstrip("/")
+    except Exception:
+        return ""
 
 
 @app.route("/")
@@ -96,6 +96,18 @@ def warm():
     else:
         message = "Cache still empty after refresh — check Apps Script get_all_uids"
 
+    webhook = {"ok": False, "url": ""}
+    base = _public_base_url()
+    if BOT_TOKEN and base:
+        try:
+            webhook = {
+                "ok": bot.register_webhook(base),
+                "url": base.rstrip("/") + "/bot_webhook",
+            }
+        except Exception as e:
+            webhook = {"ok": False, "url": "", "error": str(e)}
+            print(f"[WARM] webhook register error: {e}")
+
     return jsonify(
         {
             "ok": cards > 0,
@@ -104,6 +116,7 @@ def warm():
             "appsScriptConfigured": bool(APPS_SCRIPT_URL),
             "cacheRefreshOk": refresh_ok,
             "cache": cache,
+            "webhook": webhook,
             "platform": "vercel" if os.environ.get("VERCEL") else "render",
         }
     )
@@ -127,6 +140,33 @@ def nfc_tap():
         text = "ERROR"
     print(f"[NFC] uid={uid} -> {text}")
     return Response(text.strip(), status=200, mimetype="text/plain")
+
+
+@app.route("/nfc_bg", methods=["GET", "POST"])
+def nfc_background():
+    """
+    Separate Vercel invocation for Sheet write + parent Telegram.
+    /nfc returns first so the OLED stays fast; this route finishes the work.
+    """
+    payload = request.get_json(silent=True) or {}
+    kind = (
+        request.args.get("kind")
+        or payload.get("kind")
+        or "sync"
+    )
+    uid = (
+        request.args.get("uid")
+        or payload.get("uid")
+        or ""
+    )
+    extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
+    if request.args.get("admission"):
+        extra = dict(extra)
+        extra.setdefault("admission", request.args.get("admission"))
+        extra.setdefault("day", request.args.get("day") or "")
+        extra.setdefault("scan_type", request.args.get("scan_type") or "IN")
+    result = nfc_gate.run_nfc_background(str(kind), str(uid), extra)
+    return jsonify({"ok": result == "ok", "result": result}), 200
 
 
 @app.route("/bot_webhook", methods=["POST"])
@@ -177,7 +217,7 @@ def keep_alive():
 
 def auto_setup_webhook():
     time.sleep(3)
-    base = os.environ.get("RENDER_EXTERNAL_URL", "")
+    base = _public_base_url()
     if base and BOT_TOKEN:
         bot.register_webhook(base)
 
