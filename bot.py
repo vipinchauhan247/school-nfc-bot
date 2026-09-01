@@ -7,7 +7,7 @@ import re
 import os
 import time
 import requests
-from config import TELEGRAM_API, SCHOOL_NAME, BOT_TOKEN
+from config import TELEGRAM_API, SCHOOL_NAME, BOT_TOKEN, public_base_url
 
 try:
     from config import APPS_SCRIPT_URL, ADMIN_CHAT_ID
@@ -162,13 +162,8 @@ def _bump_nfc_cache():
         nfc_gate.invalidate_student_cache()
     except Exception:
         pass
-    # Vercel serverless: Node NFC cache is separate from Python webhook memory.
-    base = (
-        os.environ.get("PUBLIC_BASE_URL", "").strip()
-        or os.environ.get("VERCEL_URL", "").strip()
-    )
-    if base and not base.startswith("http"):
-        base = f"https://{base}"
+    # Vercel serverless: start a new invocation so the roster reload survives.
+    base = public_base_url()
     if base:
         try:
             requests.get(base.rstrip("/") + "/warm", timeout=8)
@@ -640,13 +635,12 @@ def handle_telegram_update(update):
 
 
 def register_webhook(public_base_url):
-    """Point Telegram to this Render service (instant push, no polling)."""
+    """Point Telegram at this service's /bot_webhook (instant push, no polling)."""
     if not BOT_TOKEN or not public_base_url:
-        print("[BOT] Skip webhook — BOT_TOKEN or RENDER URL missing")
+        print("[BOT] Skip webhook — BOT_TOKEN or public URL missing")
         return False
     webhook_url = public_base_url.rstrip("/") + "/bot_webhook"
     try:
-        # Clear old webhook first
         resp = requests.get(
             f"{TELEGRAM_API}/setWebhook",
             params={"url": webhook_url, "drop_pending_updates": False},
@@ -658,3 +652,22 @@ def register_webhook(public_base_url):
     except Exception as e:
         print(f"[BOT] setWebhook error: {e}")
         return False
+
+
+def webhook_info():
+    """Return Telegram getWebhookInfo (url only; never the bot token)."""
+    if not TELEGRAM_API:
+        return {"ok": False, "error": "BOT_TOKEN missing"}
+    try:
+        resp = requests.get(f"{TELEGRAM_API}/getWebhookInfo", timeout=15)
+        data = resp.json() if resp.ok else {}
+        info = data.get("result") or {}
+        return {
+            "ok": bool(data.get("ok")),
+            "url": info.get("url") or "",
+            "pending": info.get("pending_update_count"),
+            "last_error": info.get("last_error_message") or None,
+        }
+    except Exception as e:
+        print(f"[BOT] getWebhookInfo error: {e}")
+        return {"ok": False, "error": str(e)}

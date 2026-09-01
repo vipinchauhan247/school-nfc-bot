@@ -16,14 +16,20 @@ import os
 import threading
 import time
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+import requests
+
 import bot
+from config import public_base_url
 
 IST = ZoneInfo("Asia/Kolkata")
 CACHE_TTL_SEC = 120
 IN_CUTOFF_HOUR = 11  # before 11:00 = IN, else OUT
+# Start the follow-up lambda, then stop waiting for its body (Apps Script is slow).
+FOLLOWUP_CONNECT_TIMEOUT = 1.0
+FOLLOWUP_READ_TIMEOUT = 0.05
 
 
 def _is_vercel() -> bool:
@@ -53,6 +59,124 @@ def _safe_name(name: str) -> str:
         if 32 <= ord(ch) <= 126 and ch != ":"
     ).strip()
     return (clean or "Student")[:40]
+
+
+def _row_to_student(row: dict, uid_fallback: str = "") -> Optional[dict]:
+    if not isinstance(row, dict):
+        return None
+    adm = bot.normalize_admission(row.get("admissionNo") or row.get("admission") or "")
+    uid = _normalize_uid(row.get("nfcUid") or uid_fallback)
+    if not adm and not uid:
+        return None
+    if not adm:
+        adm = uid or "unknown"
+    return {
+        "admissionNo": adm,
+        "name": str(row.get("name") or "").strip() or f"Student {adm}",
+        "className": str(row.get("className") or "").strip(),
+        "nfcUid": uid,
+        "telegramChatId": bot.normalize_chat_id(row.get("telegramChatId", "")),
+    }
+
+
+def _remember_student(student: dict) -> None:
+    if not student:
+        return
+    adm = bot.normalize_admission(student.get("admissionNo", "")).lower()
+    uid = _normalize_uid(student.get("nfcUid", ""))
+    with _lock:
+        if adm:
+            _students_by_adm[adm] = student
+        if uid:
+            _students_by_uid[uid] = student
+
+
+def _student_from_peek(peek, uid: str):
+    """
+    Returns:
+      ("found", student) | ("missing", None) | ("error", None)
+    """
+    if not isinstance(peek, dict):
+        return ("error", None)
+    if peek.get("found") is False:
+        return ("missing", None)
+    row = peek.get("student") if isinstance(peek.get("student"), dict) else None
+    student = _row_to_student(row, uid_fallback=uid) if row else None
+    if not student and (peek.get("admissionNo") or peek.get("name") or peek.get("nfcUid")):
+        student = _row_to_student(peek, uid_fallback=uid)
+    if student:
+        if not student.get("nfcUid"):
+            student["nfcUid"] = uid
+        return ("found", student)
+    if peek.get("found") is True:
+        return (
+            "found",
+            {
+                "admissionNo": bot.normalize_admission(
+                    peek.get("admissionNo") or peek.get("admission") or uid
+                )
+                or uid,
+                "name": str(peek.get("name") or "Student").strip() or "Student",
+                "className": str(peek.get("className") or "").strip(),
+                "nfcUid": uid,
+                "telegramChatId": bot.normalize_chat_id(peek.get("telegramChatId", "")),
+            },
+        )
+    return ("error", None)
+
+
+def _apply_peek_attendance(peek, admission: str) -> None:
+    if not isinstance(peek, dict) or not admission:
+        return
+    att = peek.get("attendance") if isinstance(peek.get("attendance"), dict) else {}
+    day = str(
+        (att.get("date") if att else None)
+        or peek.get("date")
+        or _now_ist().strftime("%Y-%m-%d")
+    )
+    in_time = str((att.get("inTime") or att.get("in") or "")).strip()
+    out_time = str((att.get("outTime") or att.get("out") or "")).strip()
+    if not in_time and not out_time:
+        return
+    key = bot.normalize_admission(admission).lower()
+    with _lock:
+        _attendance_today[key] = {"date": day, "in": in_time, "out": out_time}
+
+
+def _resolve_student(uid: str) -> Tuple[str, Optional[dict]]:
+    """
+    Cache-first student lookup. If this Vercel instance has no roster yet,
+    peek this UID from Apps Script instead of returning ERROR.
+    Returns ("found"|"missing"|"unknown", student_or_none).
+    """
+    with _lock:
+        student = _students_by_uid.get(uid)
+        cache_has_cards = bool(_students_by_uid)
+
+    if student:
+        return ("found", student)
+    if cache_has_cards:
+        return ("missing", None)
+
+    peek = bot.apps_script_get({"action": "peek_uid", "uid": uid}, timeout=6)
+    status, peeked = _student_from_peek(peek, uid)
+    if status == "found" and peeked:
+        _remember_student(peeked)
+        _apply_peek_attendance(peek, peeked.get("admissionNo", ""))
+        return ("found", peeked)
+    if status == "missing":
+        return ("missing", None)
+
+    # Peek failed — load the full roster once (same as /warm).
+    refresh_student_cache(force=True)
+    with _lock:
+        student = _students_by_uid.get(uid)
+        cache_has_cards = bool(_students_by_uid)
+    if student:
+        return ("found", student)
+    if cache_has_cards:
+        return ("missing", None)
+    return ("unknown", None)
 
 
 def _apply_today_attendance_map(payload: dict) -> None:
@@ -117,19 +241,10 @@ def refresh_student_cache(force: bool = False) -> bool:
         by_uid: Dict[str, dict] = {}
         by_adm: Dict[str, dict] = {}
         for row in rows or []:
-            if not isinstance(row, dict):
+            student = _row_to_student(row)
+            if not student:
                 continue
-            adm = bot.normalize_admission(row.get("admissionNo", ""))
-            if not adm:
-                continue
-            student = {
-                "admissionNo": adm,
-                "name": str(row.get("name") or "").strip() or f"Student {adm}",
-                "className": str(row.get("className") or "").strip(),
-                "nfcUid": _normalize_uid(row.get("nfcUid", "")),
-                "telegramChatId": bot.normalize_chat_id(row.get("telegramChatId", "")),
-            }
-            by_adm[adm.lower()] = student
+            by_adm[student["admissionNo"].lower()] = student
             if student["nfcUid"]:
                 by_uid[student["nfcUid"]] = student
         with _lock:
@@ -275,10 +390,73 @@ def _background_admin_new_card_sheet(uid: str) -> None:
         print(f"[NFC] new-card sheet log error: {e}")
 
 
+def run_nfc_background(kind: str, uid: str, extra: Optional[dict] = None) -> str:
+    """Sheet + Telegram work that must finish after the OLED reply."""
+    uid = _normalize_uid(uid)
+    extra = extra or {}
+    try:
+        if kind == "sync":
+            _background_sheet_sync(uid)
+            return "ok"
+        if kind == "new_card":
+            _background_admin_new_card(uid)
+            return "ok"
+        if kind == "new_card_sheet":
+            _background_admin_new_card_sheet(uid)
+            return "ok"
+        if kind == "reconcile":
+            _reconcile_duplicate(
+                uid,
+                extra.get("admission") or "",
+                extra.get("day") or _now_ist().strftime("%Y-%m-%d"),
+                extra.get("scan_type") or "IN",
+            )
+            return "ok"
+        print(f"[NFC] unknown background kind={kind}")
+        return "unknown"
+    except Exception as e:
+        print(f"[NFC] background kind={kind} uid={uid} error: {e}")
+        return "error"
+
+
+def _invoke_followup(kind: str, uid: str, extra: Optional[dict] = None) -> None:
+    """
+    Start a NEW Vercel invocation so Apps Script/Telegram survive after /nfc returns.
+    Connect, then drop the body — the child keeps running independently.
+    """
+    base = public_base_url()
+    if not base:
+        print("[NFC] followup skipped — no public base URL")
+        return
+    url = base.rstrip("/") + "/nfc_bg"
+    payload = {"kind": kind, "uid": uid, "extra": extra or {}}
+    try:
+        requests.post(
+            url,
+            json=payload,
+            timeout=(FOLLOWUP_CONNECT_TIMEOUT, FOLLOWUP_READ_TIMEOUT),
+            headers={"User-Agent": "MMM-NFC-Followup/1.0"},
+        )
+    except requests.Timeout:
+        # Child accepted the request; we do not wait for Apps Script.
+        pass
+    except Exception as e:
+        print(f"[NFC] followup invoke error: {e}")
+
+
+def _after_response(kind: str, uid: str, extra: Optional[dict] = None) -> None:
+    if _is_vercel():
+        _invoke_followup(kind, uid, extra)
+        return
+    threading.Thread(
+        target=run_nfc_background, args=(kind, uid, extra), daemon=True
+    ).start()
+
+
 def process_nfc_tap(raw_uid: str) -> str:
     """
     Fast path for ESP OLED. Always returns plain text (no JSON).
-    Must not block on Google Apps Script.
+    Must not block on Google Apps Script when the card cache is already warm.
     """
     uid = _normalize_uid(raw_uid)
     if not uid:
@@ -286,27 +464,18 @@ def process_nfc_tap(raw_uid: str) -> str:
 
     _schedule_cache_refresh(force=False)
 
-    with _lock:
-        student = _students_by_uid.get(uid)
-        cache_empty = not _students_by_uid
-
-    if cache_empty:
-        _schedule_cache_refresh(force=True)
+    status, student = _resolve_student(uid)
+    if status == "unknown":
         return "ERROR"
-
-    if not student:
+    if status != "found" or not student:
         if _is_vercel():
             try:
                 _telegram_admin_new_card(uid)
             except Exception as e:
                 print(f"[NFC] new-card telegram error: {e}")
-            threading.Thread(
-                target=_background_admin_new_card_sheet, args=(uid,), daemon=True
-            ).start()
+            _after_response("new_card_sheet", uid)
         else:
-            threading.Thread(
-                target=_background_admin_new_card, args=(uid,), daemon=True
-            ).start()
+            _after_response("new_card", uid)
         return "INVALID CARD"
 
     now = _now_ist()
@@ -321,15 +490,15 @@ def process_nfc_tap(raw_uid: str) -> str:
         existing = bucket.get("in") if scan_type == "IN" else bucket.get("out")
 
     if existing:
-        threading.Thread(
-            target=_reconcile_duplicate,
-            args=(uid, admission, day, scan_type),
-            daemon=True,
-        ).start()
+        _after_response(
+            "reconcile",
+            uid,
+            {"admission": admission, "day": day, "scan_type": scan_type},
+        )
         return f"DUPLICATE:{name}:{existing}"
 
     _mark_local(admission, day, scan_type, time_str)
-    threading.Thread(target=_background_sheet_sync, args=(uid,), daemon=True).start()
+    _after_response("sync", uid)
     return f"SUCCESS:{name}:{scan_type}:{time_str}"
 
 
