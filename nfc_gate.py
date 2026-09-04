@@ -363,31 +363,25 @@ def _reconcile_duplicate(uid: str, admission: str, day: str, scan_type: str) -> 
 def _telegram_admin_new_card(uid: str) -> None:
     bot.send_telegram_message(
         bot.ADMIN_CHAT_ID,
-        "🆕 <b>New Unregistered NFC Card Scanned!</b>\n\n"
-        f"<b>Card UID:</b> <code>{bot.escape_html(uid)}</code>\n\n"
-        "To link this card to a student, reply:\n"
-        f"👉 <code>/link {bot.escape_html(uid)} &lt;Admission No&gt;</code>",
+        "🆕 <b>New Unregistered NFC Card Tapped!</b>\n\n"
+        f"<b>Card UID from NFC box:</b> <code>{bot.escape_html(uid)}</code>\n\n"
+        "Reply on @Vipinbellbot with Admission No:\n"
+        f"👉 <code>/link {bot.escape_html(uid)} ADMISSION_NO</code>\n\n"
+        f"<i>Example:</i> <code>/link {bot.escape_html(uid)} 1658</code>\n\n"
+        "Parents link Chat ID separately with:\n"
+        "<code>/register ADMISSION_NO</code>",
     )
 
 
 def _background_admin_new_card(uid: str) -> None:
     try:
         _telegram_admin_new_card(uid)
-        bot.apps_script_get({"uid": uid}, timeout=45)
         if not _is_vercel():
             threading.Thread(
                 target=refresh_student_cache, kwargs={"force": True}, daemon=True
             ).start()
     except Exception as e:
         print(f"[NFC] new-card notify error: {e}")
-
-
-def _background_admin_new_card_sheet(uid: str) -> None:
-    """Apps Script log for new card (after Telegram already sent)."""
-    try:
-        bot.apps_script_get({"uid": uid}, timeout=45)
-    except Exception as e:
-        print(f"[NFC] new-card sheet log error: {e}")
 
 
 def run_nfc_background(kind: str, uid: str, extra: Optional[dict] = None) -> str:
@@ -400,9 +394,6 @@ def run_nfc_background(kind: str, uid: str, extra: Optional[dict] = None) -> str
             return "ok"
         if kind == "new_card":
             _background_admin_new_card(uid)
-            return "ok"
-        if kind == "new_card_sheet":
-            _background_admin_new_card_sheet(uid)
             return "ok"
         if kind == "reconcile":
             _reconcile_duplicate(
@@ -473,7 +464,6 @@ def process_nfc_tap(raw_uid: str) -> str:
                 _telegram_admin_new_card(uid)
             except Exception as e:
                 print(f"[NFC] new-card telegram error: {e}")
-            _after_response("new_card_sheet", uid)
         else:
             _after_response("new_card", uid)
         return "INVALID CARD"

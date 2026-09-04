@@ -20,10 +20,17 @@ def send_telegram_message(chat_id, text, parse_mode="HTML"):
     if not TELEGRAM_API:
         print("[BOT] BOT_TOKEN missing — cannot send message")
         return None
+    message_text = str(text or "")
+    school_text = escape_html(SCHOOL_NAME)
+    if school_text and school_text not in message_text:
+        if str(parse_mode or "").upper() == "HTML":
+            message_text = f"🏫 <b>{school_text}</b>\n\n{message_text}"
+        else:
+            message_text = f"🏫 {SCHOOL_NAME}\n\n{message_text}"
     try:
         resp = requests.post(
             f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode},
+            json={"chat_id": chat_id, "text": message_text, "parse_mode": parse_mode},
             timeout=15,
         )
         data = resp.json()

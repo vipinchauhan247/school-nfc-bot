@@ -5,11 +5,39 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import nfc_gate
+import bot
 from config import public_base_url
 
 
 IST = ZoneInfo("Asia/Kolkata")
 MORNING = datetime(2026, 9, 1, 8, 30, 0, tzinfo=IST)
+
+
+class TelegramSchoolHeaderTests(unittest.TestCase):
+    def test_school_header_is_added_to_regular_messages(self):
+        with patch.object(bot, "TELEGRAM_API", "https://telegram.invalid/bot"), patch.object(
+            bot.requests, "post"
+        ) as post:
+            post.return_value.json.return_value = {"ok": True}
+            bot.send_telegram_message("123", "📊 <b>Student Status</b>")
+
+        payload = post.call_args.kwargs["json"]
+        self.assertTrue(
+            payload["text"].startswith(
+                "🏫 <b>Madan Mohan Malviya Junior High School</b>\n\n"
+            )
+        )
+
+    def test_existing_school_header_is_not_duplicated(self):
+        message = "🏫 <b>Madan Mohan Malviya Junior High School</b>\n\nWelcome"
+        with patch.object(bot, "TELEGRAM_API", "https://telegram.invalid/bot"), patch.object(
+            bot.requests, "post"
+        ) as post:
+            post.return_value.json.return_value = {"ok": True}
+            bot.send_telegram_message("123", message)
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["text"].count("Madan Mohan Malviya Junior High School"), 1)
 
 
 def _reset_cache():
@@ -78,14 +106,15 @@ class NfcGateTests(unittest.TestCase):
         peek = {"ok": True, "found": False}
         with patch.object(nfc_gate, "_schedule_cache_refresh"), patch.object(
             nfc_gate, "_is_vercel", return_value=True
-        ), patch.object(nfc_gate, "_telegram_admin_new_card"), patch.object(
+        ), patch.object(nfc_gate, "_telegram_admin_new_card") as notify, patch.object(
             nfc_gate, "_after_response"
         ) as after, patch.object(
             nfc_gate.bot, "apps_script_get", return_value=peek
         ):
             result = nfc_gate.process_nfc_tap("DEADBEEF01")
         self.assertEqual(result, "INVALID CARD")
-        self.assertEqual(after.call_args[0][0], "new_card_sheet")
+        notify.assert_called_once_with("DEADBEEF01")
+        after.assert_not_called()
 
     def test_empty_cache_peek_and_refresh_fail_is_error(self):
         with patch.object(nfc_gate, "_schedule_cache_refresh"), patch.object(
