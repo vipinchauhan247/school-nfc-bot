@@ -171,6 +171,16 @@ class FlaskRouteTests(unittest.TestCase):
         run.assert_called_once_with("sync", "D7FE3B63", {})
         self.assertTrue(resp.get_json()["ok"])
 
+    def test_health_exposes_release_marker(self):
+        resp = self.client.get("/health")
+        self.assertEqual(resp.status_code, 200)
+        if resp.is_json:
+            self.assertEqual(
+                resp.get_json()["release"], "school-header-single-alert-20260904"
+            )
+        else:
+            self.assertIn("release=school-header-single-alert-20260904", resp.get_data(as_text=True))
+
 
 if __name__ == "__main__":
     unittest.main()

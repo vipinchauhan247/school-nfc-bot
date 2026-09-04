@@ -17,6 +17,7 @@ import nfc_gate
 from config import SCHOOL_NAME, PORT, BOT_TOKEN, APPS_SCRIPT_URL, public_base_url
 
 app = Flask(__name__)
+RELEASE_VERSION = "school-header-single-alert-20260904"
 
 
 def _public_base_url() -> str:
@@ -54,6 +55,7 @@ def health():
                 "ok": True,
                 "platform": "vercel",
                 "service": "@Vipinbellbot NFC webhook",
+                "release": RELEASE_VERSION,
                 "botConfigured": bool(BOT_TOKEN),
                 "appsScriptConfigured": bool(APPS_SCRIPT_URL),
                 "cache": cache,
@@ -61,6 +63,7 @@ def health():
         )
     return (
         f"OK - @Vipinbellbot active on Render | "
+        f"release={RELEASE_VERSION} "
         f"students={cache.get('students')} cards={cache.get('cards')} "
         f"cache_age_sec={cache.get('age_sec')} "
         f"attendance_rows={cache.get('attendance_rows')}",
