@@ -17,7 +17,7 @@ import nfc_gate
 from config import SCHOOL_NAME, PORT, BOT_TOKEN, APPS_SCRIPT_URL, public_base_url
 
 app = Flask(__name__)
-RELEASE_VERSION = "school-header-single-alert-20260904"
+RELEASE_VERSION = "single-card-link-message-20260904"
 
 
 def _public_base_url() -> str:

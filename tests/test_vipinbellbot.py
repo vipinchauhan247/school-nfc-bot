@@ -40,6 +40,40 @@ class TelegramSchoolHeaderTests(unittest.TestCase):
         self.assertEqual(payload["text"].count("Madan Mohan Malviya Junior High School"), 1)
 
 
+class CardLinkNotificationTests(unittest.TestCase):
+    def test_successful_link_does_not_send_second_python_message(self):
+        update = {
+            "message": {
+                "chat": {"id": 123},
+                "from": {"first_name": "Admin"},
+                "text": "/link 53C402A4540001 2452",
+            }
+        }
+        with patch.object(bot, "link_card_on_sheet", return_value=True) as link, patch.object(
+            bot, "send_telegram_message"
+        ) as send:
+            bot.handle_telegram_update(update)
+
+        link.assert_called_once_with("2452", "53C402A4540001")
+        send.assert_not_called()
+
+    def test_failed_link_still_sends_one_error_message(self):
+        update = {
+            "message": {
+                "chat": {"id": 123},
+                "from": {"first_name": "Admin"},
+                "text": "/link 53C402A4540001 2452",
+            }
+        }
+        with patch.object(bot, "link_card_on_sheet", return_value=False), patch.object(
+            bot, "send_telegram_message"
+        ) as send:
+            bot.handle_telegram_update(update)
+
+        send.assert_called_once()
+        self.assertIn("Card link failed", send.call_args.args[1])
+
+
 def _reset_cache():
     with nfc_gate._lock:
         nfc_gate._students_by_uid.clear()
@@ -176,10 +210,10 @@ class FlaskRouteTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         if resp.is_json:
             self.assertEqual(
-                resp.get_json()["release"], "school-header-single-alert-20260904"
+                resp.get_json()["release"], "single-card-link-message-20260904"
             )
         else:
-            self.assertIn("release=school-header-single-alert-20260904", resp.get_data(as_text=True))
+            self.assertIn("release=single-card-link-message-20260904", resp.get_data(as_text=True))
 
 
 if __name__ == "__main__":

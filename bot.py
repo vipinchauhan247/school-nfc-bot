@@ -504,14 +504,10 @@ def handle_telegram_update(update):
     if cmd == "link":
         if arg1 and arg2 and looks_like_nfc_uid(arg1):
             ok = link_card_on_sheet(arg2, arg1)
-            if ok:
-                send_telegram_message(
-                    chat_id,
-                    f"✅ <b>NFC Card Linked!</b>\n\n"
-                    f"Admission: <code>{escape_html(arg2)}</code>\n"
-                    f"Card UID: <code>{escape_html(arg1.upper())}</code>",
-                )
-            else:
+            # Apps Script sends the single detailed success confirmation after
+            # it writes the UID. Sending another message here caused duplicate
+            # Telegram replies for every successful /link command.
+            if not ok:
                 send_telegram_message(
                     chat_id,
                     f"❌ Card link failed for admission <code>{escape_html(arg2)}</code>.",
