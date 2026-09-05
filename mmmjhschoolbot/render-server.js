@@ -125,6 +125,12 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (parsedUrl.pathname === '/api/latest-tap') {
+    res.writeHead(204, { 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' });
+    res.end();
+    return;
+  }
+
   if (parsedUrl.pathname === '/api/mmmjhs-bot' || parsedUrl.pathname === '/api/erp-cloud') {
     try {
       req.query = Object.fromEntries(parsedUrl.searchParams.entries());

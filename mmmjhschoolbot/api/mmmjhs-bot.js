@@ -1189,7 +1189,15 @@ module.exports = async function handler(req, res) {
     const action = String(req.query?.action || '').trim();
 
     // Cloud-native + snapshot compat (Supabase). Never touches @Vipinbellbot.
-    if (erpCloud && ['cloudConfig', 'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments', 'rebuildSnapshot', 'wipeRoster', 'authLogin', 'authLogout', 'authSession', 'authChangePassword', 'authAdminResetPassword', 'authAudit', 'tcIssue', 'tcGet', 'tcList', 'tcVerify', 'tcRevoke'].includes(action)) {
+    const CLOUD_ACTIONS = [
+      'cloudConfig', 'cloudPull', 'cloudVersion', 'health', 'cloudPush', 'nativeStudents', 'nativeMigrate', 'nativePayments',
+      'rebuildSnapshot', 'wipeRoster', 'authLogin', 'authLogout', 'authSession', 'authChangePassword',
+      'authAdminResetPassword', 'authAudit', 'tcIssue', 'tcGet', 'tcList', 'tcVerify', 'tcRevoke',
+      'getBootV2', 'v2Boot', 'getStudentsV2', 'v2Students', 'getMarksV2', 'v2Marks', 'getMarksDelta',
+      'saveMarksDelta', 'getAttendanceV2', 'getExamSchedulesV2', 'getFeeLedgerV2', 'getPhotoV2', 'v2Photo',
+      'marksRealtimeConfig', 'cloudPullLean'
+    ];
+    if (erpCloud && CLOUD_ACTIONS.includes(action)) {
       if (typeof erpCloud.route === 'function') {
         const handled = await erpCloud.route(req, res, action);
         if (handled !== false) return;
