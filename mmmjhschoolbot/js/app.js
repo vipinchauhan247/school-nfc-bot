@@ -18343,6 +18343,12 @@ function isPrimaryTimetableClass(className) {
   return /^(nursery|lkg|ukg)(\s|$)/.test(n) || /^class\s*[123](\s|$)/.test(n);
 }
 
+function getTimetableClassBaseName(className) {
+  const raw = String(className || '').trim();
+  const stripped = raw.replace(/\s+[A-Za-z]$/, '').trim();
+  return stripped || raw;
+}
+
 function getTimetableSubjectChoices(className) {
   const seen = new Set();
   const choices = [];
@@ -18355,14 +18361,20 @@ function getTimetableSubjectChoices(className) {
     choices.push(label);
   };
 
-  if (isPrimaryTimetableClass(className)) {
+  if (isPrimaryTimetableClass(className) || isPrimaryTimetableClass(getTimetableClassBaseName(className))) {
     push('All Subjects');
   }
 
-  const fromDirectory = (typeof getSubjectsForClass === 'function')
-    ? getSubjectsForClass(className)
-    : [];
-  (fromDirectory || []).forEach((s) => push(s && (s.name || s.code)));
+  const namesToTry = [className];
+  const base = getTimetableClassBaseName(className);
+  if (base && base !== className) namesToTry.push(base);
+
+  namesToTry.forEach((name) => {
+    const fromDirectory = (typeof getSubjectsForClass === 'function')
+      ? getSubjectsForClass(name)
+      : [];
+    (fromDirectory || []).forEach((s) => push(s && (s.name || s.code)));
+  });
 
   return choices;
 }

@@ -54,6 +54,18 @@ function getSubjectsForClass(className) {
   if (n.startsWith('ukg') || n.startsWith('nursery') || n.startsWith('lkg') || /^class\s*[123]/.test(n)) {
     return [{ name: 'ENGLISH', code: 'ENG' }, { name: 'HINDI', code: 'HIN' }];
   }
+  if (n === 'class 6 a') {
+    return [{ name: 'ENGLISH', code: 'ENG' }, { name: 'HINDI', code: 'HIN' }];
+  }
+  if (n === 'class 6') {
+    return [
+      { name: 'ENGLISH', code: 'ENG' },
+      { name: 'HINDI', code: 'HIN' },
+      { name: 'MATHEMATICS', code: 'MAT' },
+      { name: 'SOCIAL STUDIES', code: 'SST' },
+      { name: 'SCIENCE', code: 'SCI' }
+    ];
+  }
   return [
     { name: 'ENGLISH', code: 'ENG' },
     { name: 'HINDI', code: 'HIN' },
@@ -91,6 +103,11 @@ const class6 = sandbox.getTimetableSubjectChoices('Class 6');
 assert.ok(class6.includes('HINDI'));
 assert.ok(class6.includes('SOCIAL STUDIES'));
 assert.ok(!class6.includes('All Subjects'));
+
+const class6A = sandbox.getTimetableSubjectChoices('Class 6 A');
+assert.ok(class6A.includes('SOCIAL STUDIES'), 'sectioned class names must inherit base-class subjects');
+assert.ok(class6A.includes('SCIENCE'));
+assert.ok(!class6A.includes('All Subjects'));
 
 const ukg = sandbox.getTimetableSubjectChoices('UKG A');
 assert.strictEqual(ukg[0], 'All Subjects');
