@@ -5,7 +5,7 @@
   "description": "MMM Junior High School ERP with 24/7 @mmmjhschoolbot backend",
   "scripts": {
     "start": "node render-server.js",
-    "check": "node --check render-server.js && node --check api/mmmjhs-bot.js && node --check js/app.js"
+    "check": "node --check render-server.js && node --check api/mmmjhs-bot.js && node --check js/app.js && node tests/timetable-subject-select.test.js"
   },
   "engines": {
     "node": ">=18"
