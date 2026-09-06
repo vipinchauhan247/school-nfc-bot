@@ -29,11 +29,28 @@ const helperSrc = extractBlock(
 );
 
 const SchoolData = {
+  subjects: [
+    { id: 'sub_eng', code: 'ENG', name: 'English', classes: ['ALL CLASSES'] },
+    { id: 'sub_hin', code: 'HIN', name: 'Hindi', classes: ['ALL CLASSES'] },
+    { id: 'sub_mat', code: 'MAT', name: 'Mathematics', classes: ['ALL CLASSES'] },
+    { id: 'sub_sst', code: 'SST', name: 'Social Studies', classes: ['Class 6', 'Class 7', 'Class 8'] },
+    { id: 'sub_sci', code: 'SCI', name: 'Science', classes: ['Class 6', 'Class 7', 'Class 8'] }
+  ],
   teachers: [
-    { id: 't-shivani', name: 'Mrs. Shivani', subjectMappings: [{ class: 'Class 6', section: 'ALL', subjectName: 'S.St' }], assignedSubject: 'S.St' }
+    {
+      id: 't-shivani',
+      name: 'Mrs. Shivani',
+      subjectMappings: [{ subjectCode: 'SST', subjectName: 'S.St', class: 'Class 6', classes: ['Class 6'], section: 'ALL' }],
+      classesTaught: ['Class 6'],
+      assignedSubject: 'S.St'
+    },
+    { id: 't-priya', name: 'Miss Priya', subjectMappings: [], classesTaught: [] },
+    { id: 't-babita', name: 'Mrs. Babita Verma', subjectMappings: [], classesTaught: [] }
   ],
   staffUsers: [
-    { id: 't-shivani', name: 'Mrs. Shivani', subjectMappings: [{ class: 'Class 6', section: 'ALL', subjectName: 'S.St' }], assignedSubject: 'S.St' }
+    { id: 't-shivani', name: 'Mrs. Shivani', subjectMappings: [{ subjectCode: 'SST', subjectName: 'S.St', class: 'Class 6', classes: ['Class 6'], section: 'ALL' }], assignedSubject: 'S.St' },
+    { id: 't-priya', name: 'Miss Priya', subjectMappings: [] },
+    { id: 't-babita', name: 'Mrs. Babita Verma', subjectMappings: [] }
   ],
   classTimetables: {
     'Class 6': {
@@ -84,10 +101,44 @@ function escapeHtml(value) {
     .replace(/'/g, '&#039;');
 }
 
+function normalizeSubjectCodeBase(value) {
+  return String(value || '').trim().toLowerCase().replace(/[\s_]+/g, '').replace(/-\d+$/g, '');
+}
+function isUniversalSubjectClass(cls) {
+  const c = String(cls || '').trim().toUpperCase();
+  return !c || c === 'ALL' || c === 'ALL CLASSES';
+}
+function mappingAppliesToClass(mapping, activeClass) {
+  if (!activeClass) return true;
+  if (!mapping) return false;
+  if (isUniversalSubjectClass(mapping.class)) return true;
+  if (Array.isArray(mapping.classes) && mapping.classes.length) {
+    if (mapping.classes.some((c) => isUniversalSubjectClass(c))) return true;
+    const want = String(activeClass).trim().toLowerCase();
+    return mapping.classes.some((c) => String(c).trim().toLowerCase() === want);
+  }
+  return String(mapping.class || '').trim().toLowerCase() === String(activeClass).trim().toLowerCase();
+}
+function getDirectorySubjectsUnique() {
+  return SchoolData.subjects;
+}
+function findStaffUserForTeacher(teacher) {
+  return (SchoolData.staffUsers || []).find((s) => s.id === teacher.id) || null;
+}
+function applyTeacherMappingsToSubjectsDirectory() {
+  return false;
+}
+
 const sandbox = {
   SchoolData,
   getSubjectsForClass,
   escapeHtml,
+  normalizeSubjectCodeBase,
+  isUniversalSubjectClass,
+  mappingAppliesToClass,
+  getDirectorySubjectsUnique,
+  findStaffUserForTeacher,
+  applyTeacherMappingsToSubjectsDirectory,
   console
 };
 vm.createContext(sandbox);
@@ -137,33 +188,57 @@ assert.ok(tableHtml.includes('tt-teacher-select'));
 assert.ok(tableHtml.includes('BREAK'));
 assert.ok(!tableHtml.includes('tt-subject-input'));
 
-const frozen = sandbox.freezeTeacherDirectoryMappings();
-SchoolData.teachers[0].subjectMappings = [{ class: 'Nursery', subjectName: 'All Subjects' }];
-SchoolData.staffUsers[0].assignedSubject = 'All Subjects';
-sandbox.restoreTeacherDirectoryMappingsIfMutated(frozen);
-assert.strictEqual(SchoolData.teachers[0].subjectMappings[0].subjectName, 'S.St');
-assert.strictEqual(SchoolData.staffUsers[0].assignedSubject, 'S.St');
+const split = sandbox.splitTimetableClassAndSection('Class 6 A');
+assert.strictEqual(split.className, 'Class 6');
+assert.strictEqual(split.section, 'A');
+
+const hindiAdd = sandbox.addTeacherDirectoryMappingFromTimetable('t-priya', 'HINDI', 'Class 6 A', 'Miss Priya');
+assert.ok(hindiAdd && hindiAdd.added === 1);
+assert.strictEqual(SchoolData.teachers[1].subjectMappings.length, 1);
+assert.strictEqual(SchoolData.teachers[1].subjectMappings[0].subjectName, 'Hindi');
+assert.strictEqual(SchoolData.teachers[1].subjectMappings[0].class, 'Class 6');
+assert.strictEqual(SchoolData.teachers[1].subjectMappings[0].section, 'A');
+assert.strictEqual(SchoolData.staffUsers[1].subjectMappings.length, 1);
+
+const shivaniBefore = JSON.stringify(SchoolData.teachers[0].subjectMappings);
+const shivaniHindi = sandbox.addTeacherDirectoryMappingFromTimetable('t-shivani', 'Hindi', 'Class 6 A', 'Mrs. Shivani');
+assert.ok(shivaniHindi && shivaniHindi.added === 1);
+assert.ok(SchoolData.teachers[0].subjectMappings.some((m) => m.subjectName === 'S.St' || m.subjectCode === 'SST'));
+assert.ok(SchoolData.teachers[0].subjectMappings.some((m) => String(m.subjectName).toLowerCase() === 'hindi'));
+assert.notStrictEqual(JSON.stringify(SchoolData.teachers[0].subjectMappings), shivaniBefore);
+
+const shivaniDup = sandbox.addTeacherDirectoryMappingFromTimetable('t-shivani', 'S.St', 'Class 6 A', 'Mrs. Shivani');
+assert.strictEqual(shivaniDup, null, 'existing S.St Class 6 ALL must not be duplicated');
+
+const otherTeacherUnchanged = SchoolData.teachers[1].subjectMappings.length;
+sandbox.addTeacherDirectoryMappingFromTimetable('t-shivani', 'SCIENCE', 'Class 6 A', 'Mrs. Shivani');
+assert.strictEqual(SchoolData.teachers[1].subjectMappings.length, otherTeacherUnchanged, 'other teachers stay untouched');
+
+const babita = sandbox.addTeacherDirectoryMappingFromTimetable('t-babita', 'All Subjects', 'UKG A', 'Mrs. Babita Verma');
+assert.ok(babita && babita.added >= 2);
+assert.ok(SchoolData.teachers[2].subjectMappings.some((m) => String(m.subjectName).toLowerCase() === 'english'));
+assert.ok(SchoolData.teachers[2].subjectMappings.every((m) => m.class === 'UKG' && m.section === 'A'));
+assert.ok(!SchoolData.teachers[0].subjectMappings.some((m) => m.class === 'UKG'));
 
 const saveFn = src.slice(src.indexOf('async function saveClassTimetableFromUI'), src.indexOf('function downloadTimetableExcelTemplate'));
 assert.ok(saveFn.includes('timetable-subject-select'));
-assert.ok(saveFn.includes('freezeTeacherDirectoryMappings'));
+assert.ok(saveFn.includes('applyTimetableDirectoryMappingsForPairs'));
+assert.ok(saveFn.includes('collectUniqueTimetableTeacherSubjects'));
 assert.ok(!saveFn.includes('tt-subject-input'));
-assert.ok(!/teachers\[.*\]\.subjectMappings\s*=/.test(saveFn));
-assert.ok(!/staffUsers\[.*\]\.subjectMappings\s*=/.test(saveFn));
+assert.ok(!saveFn.includes('freezeTeacherDirectoryMappings'));
 
 const importBlock = src.slice(src.indexOf('async function handleTimetableExcelUpload'), src.indexOf('function renderTimetableTeacherPage'));
-assert.ok(importBlock.includes('restoreTeacherDirectoryMappingsIfMutated'));
+assert.ok(importBlock.includes('applyTimetableDirectoryMappingsForClasses'));
 assert.ok(!importBlock.includes('staff.subjectMappings = subArray'));
-assert.ok(!importBlock.includes("persistDirectoryDelta({ scope: 'staff'"));
 
 const versions = {
   index: fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8'),
   sw: fs.readFileSync(path.join(__dirname, '..', 'sw.js'), 'utf8')
 };
-assert.ok(versions.index.includes("window.__ERP_BUILD_VERSION = '20260906_v268'"));
-assert.ok(versions.index.includes('Build: v268'));
-assert.ok(versions.index.includes('js/app.js?v=20260906_v268'));
-assert.ok(versions.index.includes('/sw.js?v=20260906_v268'));
-assert.ok(versions.sw.includes("CACHE_NAME = 'mmmjhs-pwa-20260906-v268'"));
+assert.ok(versions.index.includes("window.__ERP_BUILD_VERSION = '20260906_v269'"));
+assert.ok(versions.index.includes('Build: v269'));
+assert.ok(versions.index.includes('js/app.js?v=20260906_v269'));
+assert.ok(versions.index.includes('/sw.js?v=20260906_v269'));
+assert.ok(versions.sw.includes("CACHE_NAME = 'mmmjhs-pwa-20260906-v269'"));
 
 console.log('timetable-subject-select tests passed');

@@ -18417,6 +18417,243 @@ function freezeTeacherDirectoryMappings() {
   };
 }
 
+function splitTimetableClassAndSection(className) {
+  const raw = String(className || '').trim();
+  const match = raw.match(/^(.*)\s+([A-Za-z])$/);
+  if (match && match[1].trim()) {
+    return { className: match[1].trim(), section: match[2].toUpperCase() };
+  }
+  return { className: raw, section: 'ALL' };
+}
+
+function timetableSubjectAliasKeys(label, code) {
+  const keys = new Set();
+  const nameKey = normalizeTimetableSubjectKey(label);
+  const codeKey = (typeof normalizeSubjectCodeBase === 'function')
+    ? normalizeSubjectCodeBase(code || label)
+    : String(code || label || '').trim().toLowerCase();
+  if (nameKey) keys.add(nameKey);
+  if (codeKey) keys.add(codeKey);
+  const blob = `${nameKey} ${codeKey}`;
+  if (/\b(sst|socialstudies|socialscience|socialsci)\b/.test(blob)) {
+    ['sst', 'socialstudies', 'socialscience', 'socialsci'].forEach((k) => keys.add(k));
+  }
+  if (/\b(mat|math|maths|mathematics)\b/.test(blob)) {
+    ['mat', 'math', 'maths', 'mathematics'].forEach((k) => keys.add(k));
+  }
+  if (/\b(eng|english)\b/.test(blob)) {
+    ['eng', 'english'].forEach((k) => keys.add(k));
+  }
+  if (/\b(hin|hindi)\b/.test(blob)) {
+    ['hin', 'hindi'].forEach((k) => keys.add(k));
+  }
+  if (/\b(sci|science)\b/.test(blob) && !/\bsocial/.test(blob)) {
+    ['sci', 'science'].forEach((k) => keys.add(k));
+  }
+  if (/\b(san|snk|sanskrit)\b/.test(blob)) {
+    ['san', 'snk', 'sanskrit'].forEach((k) => keys.add(k));
+  }
+  if (/\b(com|computer|computers)\b/.test(blob)) {
+    ['com', 'computer', 'computers'].forEach((k) => keys.add(k));
+  }
+  if (/\b(gk|generalknowledge)\b/.test(blob)) {
+    ['gk', 'generalknowledge'].forEach((k) => keys.add(k));
+  }
+  return keys;
+}
+
+function findDirectorySubjectByTimetableLabel(label) {
+  const wanted = timetableSubjectAliasKeys(label, label);
+  const list = (typeof getDirectorySubjectsUnique === 'function')
+    ? getDirectorySubjectsUnique()
+    : ((SchoolData.subjects || []).filter((s) => s && (s.name || s.code)));
+  return (list || []).find((s) => {
+    const have = timetableSubjectAliasKeys(s.name, s.code);
+    for (const key of wanted) {
+      if (have.has(key)) return true;
+    }
+    return false;
+  }) || null;
+}
+
+function resolveTimetableSubjectToDirectory(subjectLabel, className) {
+  const label = String(subjectLabel || '').trim();
+  if (!label) return [];
+  if (normalizeTimetableSubjectKey(label) === 'allsubjects') {
+    return getTimetableSubjectChoices(className)
+      .filter((name) => normalizeTimetableSubjectKey(name) !== 'allsubjects')
+      .map((name) => findDirectorySubjectByTimetableLabel(name))
+      .filter(Boolean);
+  }
+  const found = findDirectorySubjectByTimetableLabel(label);
+  return found ? [found] : [];
+}
+
+function findTeacherRecordForTimetableAssignment(teacherId, teacherName) {
+  const id = String(teacherId || '').trim();
+  const nameKey = String(teacherName || '').trim().toLowerCase();
+  const teachers = Array.isArray(SchoolData.teachers) ? SchoolData.teachers : [];
+  const staff = Array.isArray(SchoolData.staffUsers) ? SchoolData.staffUsers : [];
+  let teacher = id ? teachers.find((t) => String(t.id) === id) : null;
+  let user = id ? staff.find((s) => String(s.id) === id) : null;
+  if (!teacher && user) {
+    teacher = teachers.find((t) =>
+      t.id === user.assignedTeacherId ||
+      String(t.name || '').trim().toLowerCase() === String(user.name || '').trim().toLowerCase()
+    ) || null;
+  }
+  if (!user && teacher && typeof findStaffUserForTeacher === 'function') {
+    user = findStaffUserForTeacher(teacher);
+  }
+  if (!teacher && nameKey) {
+    teacher = teachers.find((t) => String(t.name || '').trim().toLowerCase() === nameKey) || null;
+  }
+  if (!user && nameKey) {
+    user = staff.find((s) => String(s.name || '').trim().toLowerCase() === nameKey) || null;
+  }
+  return { teacher: teacher || null, staff: user || null };
+}
+
+function teacherAlreadyHasDirectoryMapping(mappings, subject, className, section) {
+  const wantSec = String(section || 'ALL').toUpperCase();
+  return (mappings || []).some((m) => {
+    const have = timetableSubjectAliasKeys(m.subjectName, m.subjectCode);
+    const want = timetableSubjectAliasKeys(subject.name, subject.code);
+    let sameSubject = false;
+    for (const key of want) {
+      if (have.has(key)) { sameSubject = true; break; }
+    }
+    if (!sameSubject) return false;
+    const applies = (typeof mappingAppliesToClass === 'function')
+      ? mappingAppliesToClass(m, className)
+      : String(m.class || '').trim().toLowerCase() === String(className || '').trim().toLowerCase();
+    if (!applies) return false;
+    const haveSec = String(m.section || 'ALL').toUpperCase();
+    return haveSec === 'ALL' || wantSec === 'ALL' || haveSec === wantSec;
+  });
+}
+
+function addTeacherDirectoryMappingFromTimetable(teacherId, subjectLabel, timetableClassName, teacherName) {
+  if (!teacherId && !teacherName) return null;
+  const label = String(subjectLabel || '').trim();
+  if (!label) return null;
+
+  const found = findTeacherRecordForTimetableAssignment(teacherId, teacherName);
+  if (!found.teacher && !found.staff) return null;
+
+  const split = splitTimetableClassAndSection(timetableClassName);
+  const subjects = resolveTimetableSubjectToDirectory(label, timetableClassName);
+  if (!subjects.length) return null;
+
+  const target = found.teacher || found.staff;
+  if (!Array.isArray(target.subjectMappings)) target.subjectMappings = [];
+
+  let added = 0;
+  subjects.forEach((sub) => {
+    if (teacherAlreadyHasDirectoryMapping(target.subjectMappings, sub, split.className, split.section)) return;
+    target.subjectMappings.push({
+      subjectCode: sub.code,
+      subjectName: sub.name,
+      class: split.className,
+      classes: [split.className],
+      section: split.section || 'ALL'
+    });
+    added += 1;
+  });
+  if (!added) return null;
+
+  if (found.teacher && found.staff) {
+    found.staff.subjectMappings = found.teacher.subjectMappings;
+  } else if (found.teacher) {
+    found.teacher.subjectMappings = target.subjectMappings;
+  } else if (found.staff) {
+    found.staff.subjectMappings = target.subjectMappings;
+  }
+
+  const taught = new Set([
+    ...((found.teacher && found.teacher.classesTaught) || []),
+    ...((found.staff && found.staff.assignedClasses) || [])
+  ].filter(Boolean));
+  if (split.className) taught.add(split.className);
+  const taughtList = Array.from(taught);
+  if (found.teacher) found.teacher.classesTaught = taughtList;
+  if (found.staff) {
+    found.staff.assignedClasses = taughtList;
+    const codes = (target.subjectMappings || []).map((m) => m.subjectCode || m.subjectName).filter(Boolean);
+    if (codes.length) found.staff.assignedSubject = Array.from(new Set(codes)).join('/');
+  }
+
+  if (found.teacher && typeof applyTeacherMappingsToSubjectsDirectory === 'function') {
+    applyTeacherMappingsToSubjectsDirectory(found.teacher, found.teacher.subjectMappings);
+  }
+
+  return { teacher: found.teacher, staff: found.staff, added };
+}
+
+function collectUniqueTimetableTeacherSubjects(table, selectedClass) {
+  const pairs = [];
+  const seen = new Set();
+  if (!table) return pairs;
+  const tSelects = table.querySelectorAll('.tt-teacher-select');
+  tSelects.forEach((tSel) => {
+    const teacherId = String(tSel.value || '').trim();
+    if (!teacherId) return;
+    const period = tSel.dataset.period;
+    const day = tSel.dataset.day;
+    const sSel = table.querySelector(`.timetable-subject-select[data-day="${day}"][data-period="${period}"]`);
+    const subject = String(sSel?.value || '').trim();
+    if (!subject) return;
+    const key = `${teacherId}||${normalizeTimetableSubjectKey(subject)}||${selectedClass}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const teacherName = tSel.options?.[tSel.selectedIndex]?.text || '';
+    pairs.push({ teacherId, teacherName, subject, className: selectedClass });
+  });
+  return pairs;
+}
+
+function applyTimetableDirectoryMappingsForPairs(pairs) {
+  const teacherUpserts = [];
+  const staffUpserts = [];
+  let added = 0;
+  (pairs || []).forEach((pair) => {
+    const result = addTeacherDirectoryMappingFromTimetable(
+      pair.teacherId,
+      pair.subject,
+      pair.className,
+      pair.teacherName
+    );
+    if (!result || !result.added) return;
+    added += result.added;
+    if (result.teacher && !teacherUpserts.some((t) => t.id === result.teacher.id)) teacherUpserts.push(result.teacher);
+    if (result.staff && !staffUpserts.some((s) => s.id === result.staff.id)) staffUpserts.push(result.staff);
+  });
+  return { added, teacherUpserts, staffUpserts };
+}
+
+function applyTimetableDirectoryMappingsForClasses(classNames) {
+  const pairs = [];
+  const seen = new Set();
+  (classNames || []).forEach((className) => {
+    const days = SchoolData.classTimetables?.[className] || {};
+    Object.values(days).forEach((periods) => {
+      Object.values(periods || {}).forEach((cell) => {
+        if (!cell || !cell.teacherId || !cell.subject) return;
+        const key = `${cell.teacherId}||${normalizeTimetableSubjectKey(cell.subject)}||${className}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        pairs.push({
+          teacherId: cell.teacherId,
+          teacherName: cell.teacherName || '',
+          subject: cell.subject,
+          className
+        });
+      });
+    });
+  });
+  return applyTimetableDirectoryMappingsForPairs(pairs);
+}
+
 function restoreTeacherDirectoryMappingsIfMutated(frozen) {
   if (!frozen) return;
   const restore = (entries) => {
@@ -18567,6 +18804,9 @@ function renderTimetableClassPage(container) {
         <h3 id="ttDisplayTitle"><i class="fa-solid fa-table" style="color:var(--accent-primary)"></i> Weekly Matrix: ${selectedClass}</h3>
         <span class="badge badge-success"><i class="fa-solid fa-check"></i> ${periodSettings.filter(p => !p.isBreak).length} Academic Periods / Day</span>
       </div>
+      <p style="font-size:0.82rem; color:#94a3b8; margin:0 0 14px 0;">
+        Saving a teacher + subject here also adds that mapping in Teachers Directory for this class/section. Existing directory mappings are kept; nothing is overwritten.
+      </p>
 
       <div class="data-table-container" style="overflow-x:auto;">
         ${renderClassTimetableMatrixTable(selectedClass, periodSettings, teachers)}
@@ -18765,10 +19005,6 @@ async function saveClassTimetableFromUI(selectedClass) {
   const table = document.getElementById('classTimetableMatrixTable');
   if (!table) return;
 
-  // SAFETY: timetable save never rewrites Teacher Directory subjectMappings.
-  // Those stay authoritative in openTeacherSubjectAssignmentsModal().
-  const frozenTeacherMappings = freezeTeacherDirectoryMappings();
-
   ensureSchoolDataTimetableMatrices();
   const teachersList = getAvailableTeachersList();
   const tchMap = new Map(teachersList.map(t => [t.id, t]));
@@ -18797,7 +19033,6 @@ async function saveClassTimetableFromUI(selectedClass) {
       };
 
       if (teacherId) {
-        // Teacher-view occupancy only. Never write teachers[].subjectMappings.
         SchoolData.teacherPeriodMatrices[teacherId] = SchoolData.teacherPeriodMatrices[teacherId] || { assignments: {} };
         SchoolData.teacherPeriodMatrices[teacherId].assignments = SchoolData.teacherPeriodMatrices[teacherId].assignments || {};
         SchoolData.teacherPeriodMatrices[teacherId].assignments[`${dayKey}_P${periodNo}`] = {
@@ -18808,10 +19043,10 @@ async function saveClassTimetableFromUI(selectedClass) {
     });
   });
 
-  restoreTeacherDirectoryMappingsIfMutated(frozenTeacherMappings);
-
-  // Each class section (LKG A, LKG B, Class 6 A, Class 6 B, etc.) has its own independent timetable.
-  // We do NOT copy selectedClass schedule onto other sections.
+  // Add only the teacher+subject+class rows from this save. Never replace a teacher's full directory list.
+  const mappingResult = applyTimetableDirectoryMappingsForPairs(
+    collectUniqueTimetableTeacherSubjects(table, selectedClass)
+  );
 
   try {
     await persistConfigurationDelta('classTimetables', 'school', SchoolData.classTimetables, null);
@@ -18820,11 +19055,23 @@ async function saveClassTimetableFromUI(selectedClass) {
     } catch (e) {
       console.warn('[ERP-CLOUD] teacherPeriodMatrices sync warning:', e.message);
     }
-    restoreTeacherDirectoryMappingsIfMutated(frozenTeacherMappings);
+    if (mappingResult.added && (mappingResult.teacherUpserts.length || mappingResult.staffUpserts.length)) {
+      try {
+        await persistDirectoryDelta({
+          scope: 'teacherMappings',
+          teacherUpserts: mappingResult.teacherUpserts,
+          staffUpserts: mappingResult.staffUpserts
+        }, null);
+      } catch (e) {
+        console.warn('[ERP-CLOUD] teacher directory mapping sync warning:', e.message);
+      }
+    }
     saveSchoolDataToStorage({ skipCloudPush: true });
-    showNotification(`Master Timetable for ${selectedClass} updated. Cloud confirmed.`, 'success');
+    const extra = mappingResult.added
+      ? ` ${mappingResult.added} teacher directory mapping(s) added.`
+      : '';
+    showNotification(`Master Timetable for ${selectedClass} updated.${extra} Cloud confirmed.`, 'success');
   } catch (error) {
-    restoreTeacherDirectoryMappingsIfMutated(frozenTeacherMappings);
     showNotification(`Saved locally, cloud sync error: ${error.message}`, 'warning');
   }
 }
@@ -18928,7 +19175,7 @@ async function handleTimetableExcelUpload(inputEl) {
       }
 
       ensureSchoolDataTimetableMatrices();
-      const frozenTeacherMappings = freezeTeacherDirectoryMappings();
+      const importedClassNames = new Set();
       const teachersList = getAvailableTeachersList();
       // Normalize: lowercase, strip honorifics (Mrs./Mr./Ms./Dr./Smt./Shri.), strip non-alphanumeric
       const norm = (str) => String(str || '').toLowerCase().replace(/^(mrs?\.?\s*|ms\.?\s*|dr\.?\s*|shri\.?\s*|smt\.?\s*)/i, '').replace(/[^a-z0-9]/g, '');
@@ -19031,6 +19278,7 @@ async function handleTimetableExcelUpload(inputEl) {
         const primaryClassTeacher = classTeacherRaw ? findTeacher(classTeacherRaw) : null;
 
         SchoolData.classTimetables[className] = SchoolData.classTimetables[className] || {};
+        if (className) importedClassNames.add(className);
         classesImported++;
 
         // Process columns 2 through end (Periods 1 to 9)
@@ -19125,15 +19373,25 @@ async function handleTimetableExcelUpload(inputEl) {
         }
       }
 
-      // SAFETY: Excel import writes classTimetables only — never Teacher Directory mappings.
-      restoreTeacherDirectoryMappingsIfMutated(frozenTeacherMappings);
+      const mappingResult = applyTimetableDirectoryMappingsForClasses(Array.from(importedClassNames));
 
       await persistConfigurationDelta('classTimetables', 'school', SchoolData.classTimetables, 'Excel master timetable imported.');
       await persistConfigurationDelta('teacherPeriodMatrices', 'school', SchoolData.teacherPeriodMatrices, 'Excel teacher matrices updated.');
-      restoreTeacherDirectoryMappingsIfMutated(frozenTeacherMappings);
+      if (mappingResult.added && (mappingResult.teacherUpserts.length || mappingResult.staffUpserts.length)) {
+        try {
+          await persistDirectoryDelta({
+            scope: 'teacherMappings',
+            teacherUpserts: mappingResult.teacherUpserts,
+            staffUpserts: mappingResult.staffUpserts
+          }, null);
+        } catch (e) {
+          console.warn('[ERP-CLOUD] teacher directory mapping sync warning:', e.message);
+        }
+      }
       saveSchoolDataToStorage({ skipCloudPush: true });
 
       let msg = `🎉 Imported timetable for ${classesImported} classes, ${totalPeriodsMapped} period slots mapped!`;
+      if (mappingResult.added) msg += ` ${mappingResult.added} teacher directory mapping(s) added.`;
       if (unmatchedTeachers.size > 0) {
         msg += ` ⚠️ Could not match: ${[...unmatchedTeachers].join(', ')} — check spelling in Teachers Directory.`;
       }

@@ -22,7 +22,7 @@
   <!-- FontAwesome Icons -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <script>
-    window.__ERP_BUILD_VERSION = '20260906_v268';
+    window.__ERP_BUILD_VERSION = '20260906_v269';
     (function() {
       const CURRENT_VERSION = window.__ERP_BUILD_VERSION;
       const lastVersion = localStorage.getItem('MMM_ERP_APP_BUILD_VERSION');
@@ -30,7 +30,7 @@
       function syncVersionBadge() {
         const b = document.getElementById('erpAppVersionBadge');
         if (b) {
-          const v = String(window.__ERP_BUILD_VERSION || 'v268').split('_').pop();
+          const v = String(window.__ERP_BUILD_VERSION || 'v269').split('_').pop();
           b.textContent = 'Build: ' + v;
         }
       }
@@ -431,7 +431,7 @@
 
           <!-- USER PROFILE CARD & LOGOUT -->
           <div style="display:flex; align-items:center; gap:8px;">
-            <span id="erpAppVersionBadge" style="font-size:0.75rem; padding:4px 9px; border-radius:999px; background:rgba(99,102,241,0.2); border:1px solid #6366f1; color:#a5b4fc; font-weight:800; cursor:pointer;" onclick="forceErpAppCacheReset()" title="Click to force reload latest ERP build">Build: v268</span>
+            <span id="erpAppVersionBadge" style="font-size:0.75rem; padding:4px 9px; border-radius:999px; background:rgba(99,102,241,0.2); border:1px solid #6366f1; color:#a5b4fc; font-weight:800; cursor:pointer;" onclick="forceErpAppCacheReset()" title="Click to force reload latest ERP build">Build: v269</span>
             <div class="user-profile-header" style="cursor:pointer;" onclick="openAccountMenu()" title="My account">
               <div class="user-avatar" id="headerUserAvatar" aria-hidden="true">SA</div>
               <div class="user-info">
@@ -563,14 +563,14 @@
 <script src="js/erpOutbox.js?v=20260902_v254"></script>
 <script src="js/erpV2ReadModel.js?v=20260902_v254"></script>
 <script src="js/erpMarksBroadcast.js?v=20260902_v254"></script>
-<script src="js/app.js?v=20260906_v268"></script>
+<script src="js/app.js?v=20260906_v269"></script>
 <script src="js/cloudSync.js?v=20260902_v254"></script>
 
 <!-- PWA Service Worker Registration -->
 <script>
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', function() {
-      navigator.serviceWorker.register('/sw.js?v=20260906_v268')
+      navigator.serviceWorker.register('/sw.js?v=20260906_v269')
         .then(function(reg) {
           reg.update();
           console.log('PWA Service Worker active:', reg.scope);

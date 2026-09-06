@@ -1,5 +1,5 @@
 // PWA Service Worker for MMM School ERP
-const CACHE_NAME = 'mmmjhs-pwa-20260906-v268';
+const CACHE_NAME = 'mmmjhs-pwa-20260906-v269';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
