@@ -1,5 +1,7 @@
 # NFC Fast Response (1–2 seconds) — Architecture & Fixes
 
+**Codex / deploy playbook:** [`FAST_NFC_INSTRUCTIONS.md`](FAST_NFC_INSTRUCTIONS.md) (golden rule, verify commands, what not to do).
+
 Reference for **@Vipinbellbot** / `school-nfc-bot.vercel.app` and ESP8266 NFC boxes.
 
 ---

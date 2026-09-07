@@ -1,6 +1,7 @@
 # Vercel NFC gate (fast taps)
 
-**Full reference:** see [`NFC_FAST_RESPONSE_GUIDE.md`](NFC_FAST_RESPONSE_GUIDE.md) (architecture, 1–2 s design, all fixes).
+**Instructions:** [`FAST_NFC_INSTRUCTIONS.md`](FAST_NFC_INSTRUCTIONS.md)  
+**Full reference:** [`NFC_FAST_RESPONSE_GUIDE.md`](NFC_FAST_RESPONSE_GUIDE.md)
 
 Render free tier sleeps; this bot is deployed on **Vercel** with the same fast-path design as `nfc_gate.py`:
 
